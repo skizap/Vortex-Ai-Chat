@@ -1,0 +1,16 @@
+# Vortex-Ai-Chat build and data locations
+/target
+**/target
+Cargo.lock.orig
+crates/vortex-server/ui-dist/*
+!crates/vortex-server/ui-dist/.gitkeep
+
+# Local environment / secrets
+.env
+*.local.toml
+
+# Runtime data (never commit databases, caches, workspaces)
+*.db
+*.db-shm
+*.db-wal
+.vortex-data/

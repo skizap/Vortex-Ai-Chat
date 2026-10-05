@@ -1,0 +1,32 @@
+[package]
+name = "vortex-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Vortex-Ai-Chat browser UI (Leptos CSR, compiled to WebAssembly)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vortex-types = { workspace = true }
+leptos = { version = "0.8", features = ["csr"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "EventSource",
+    "MessageEvent",
+    "Event",
+    "EventTarget",
+    "Window",
+    "Document",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+] }
+gloo-net = "0.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ammonia = "4"
+chrono = { workspace = true }
