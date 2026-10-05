@@ -25,7 +25,11 @@ impl Paths {
         std::fs::create_dir_all(&config_dir)?;
         std::fs::create_dir_all(&data_dir)?;
         std::fs::create_dir_all(&cache_dir)?;
-        Ok(Self { config_dir, data_dir, cache_dir })
+        Ok(Self {
+            config_dir,
+            data_dir,
+            cache_dir,
+        })
     }
 
     pub fn database(&self) -> PathBuf {
@@ -76,7 +80,10 @@ mod tests {
         std::env::set_var("VORTEX_TEST_HOME", dir.path());
         let home = std::env::var_os("HOME");
         // Only validate the override branch itself.
-        std::env::set_var("VORTEX_CONFIG_DIR", dir.path().join("cfg").to_str().unwrap());
+        std::env::set_var(
+            "VORTEX_CONFIG_DIR",
+            dir.path().join("cfg").to_str().unwrap(),
+        );
         let p = env_override("VORTEX_CONFIG_DIR", ".config").unwrap();
         assert!(p.ends_with("cfg"));
         std::env::remove_var("VORTEX_CONFIG_DIR");

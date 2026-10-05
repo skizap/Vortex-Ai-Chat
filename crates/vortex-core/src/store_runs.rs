@@ -78,8 +78,7 @@ impl Db {
         Ok(self
             .with_conn(move |c| {
                 let usage = usage.map(|u| serde_json::to_string(&u).unwrap_or_default());
-                let plan = plan
-                    .map(|p| serde_json::to_string(&p).unwrap_or_else(|_| "[]".into()));
+                let plan = plan.map(|p| serde_json::to_string(&p).unwrap_or_else(|_| "[]".into()));
                 let n = c.execute(
                     "UPDATE runs SET status = ?2, error = ?3, updated_at = ?6,
                      usage_json = COALESCE(?4, usage_json),

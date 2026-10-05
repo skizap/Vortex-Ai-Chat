@@ -37,7 +37,11 @@ impl Db {
                 )?;
                 let rows = st
                     .query_map(rusqlite::params![conversation_id], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(rows)
@@ -73,9 +77,15 @@ mod tests {
     #[tokio::test]
     async fn approvals_lifecycle() {
         let db = Db::open(format!("/tmp/vortex-test-{}.db", uuid::Uuid::new_v4())).unwrap();
-        db.add_approval("a1".into(), "r1".into(), "agent".into(), "t".into(), "p".into())
-            .await
-            .unwrap();
+        db.add_approval(
+            "a1".into(),
+            "r1".into(),
+            "agent".into(),
+            "t".into(),
+            "p".into(),
+        )
+        .await
+        .unwrap();
         assert_eq!(db.list_approvals(true).await.unwrap().len(), 1);
         db.resolve_approval("a1".into(), ApprovalStatus::Denied)
             .await
@@ -89,7 +99,12 @@ mod tests {
     async fn checkpoints_roundtrip() {
         let db = Db::open(format!("/tmp/vortex-test-{}.db", uuid::Uuid::new_v4())).unwrap();
         let id = db
-            .add_checkpoint("c1".into(), "r1".into(), "/tmp/x.txt".into(), Some("old".into()))
+            .add_checkpoint(
+                "c1".into(),
+                "r1".into(),
+                "/tmp/x.txt".into(),
+                Some("old".into()),
+            )
             .await
             .unwrap();
         let (path, original) = db.get_checkpoint(id).await.unwrap().unwrap();

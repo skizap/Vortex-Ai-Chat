@@ -15,7 +15,9 @@ pub use dto::{
     RunInfo, StoredMessage, ToolCallRecord,
 };
 pub use events::{PlanStep, RunEvent, RunStatus, StepStatus};
-pub use settings::{AgentSettings, PermissionProfile, SearchSettings, Settings, Theme, ToolSettings};
+pub use settings::{
+    AgentSettings, PermissionProfile, SearchSettings, Settings, Theme, ToolSettings,
+};
 
 /// Interaction modes shown in the UI. Each mode changes which tools the
 /// backend will expose to the model for a given run.

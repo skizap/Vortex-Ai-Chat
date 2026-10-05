@@ -98,9 +98,18 @@ impl Db {
     pub async fn delete_conversation(&self, id: String) -> Result<bool> {
         Ok(self
             .with_conn(move |c| {
-                c.execute("DELETE FROM messages WHERE conversation_id = ?1", rusqlite::params![id])?;
-                c.execute("DELETE FROM runs WHERE conversation_id = ?1", rusqlite::params![id])?;
-                Ok(c.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![id])? > 0)
+                c.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                c.execute(
+                    "DELETE FROM runs WHERE conversation_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(c.execute(
+                    "DELETE FROM conversations WHERE id = ?1",
+                    rusqlite::params![id],
+                )? > 0)
             })
             .await?)
     }

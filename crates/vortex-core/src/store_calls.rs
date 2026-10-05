@@ -41,8 +41,7 @@ impl Db {
                             id: r.get(0)?,
                             run_id: r.get(1)?,
                             tool: r.get(2)?,
-                            args: serde_json::from_str(&args)
-                                .unwrap_or(serde_json::Value::Null),
+                            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
                             ok: r.get::<_, i64>(4)? != 0,
                             summary: r.get(5)?,
                             created_at: r.get(6)?,
@@ -83,7 +82,10 @@ mod tests {
                 completion_tokens: 6,
                 total_tokens: 11,
             }),
-            plan: vec![PlanStep { title: "step".into(), status: StepStatus::Pending }],
+            plan: vec![PlanStep {
+                title: "step".into(),
+                status: StepStatus::Pending,
+            }],
             depth: 0,
             created_at: now(),
             updated_at: now(),

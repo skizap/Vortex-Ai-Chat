@@ -15,7 +15,13 @@ impl Db {
                 c.execute(
                     "INSERT INTO messages (conversation_id, role, content, tool_calls, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![conversation_id, msg.role.as_str(), msg.content, tool_calls, now()],
+                    rusqlite::params![
+                        conversation_id,
+                        msg.role.as_str(),
+                        msg.content,
+                        tool_calls,
+                        now()
+                    ],
                 )?;
                 Ok(c.last_insert_rowid())
             })
@@ -38,7 +44,8 @@ impl Db {
                             role: serde_json::from_value(serde_json::Value::String(role))
                                 .unwrap_or(Role::Assistant),
                             content: r.get(2)?,
-                            tool_calls: serde_json::from_str::<Vec<ToolCall>>(&tc).unwrap_or_default(),
+                            tool_calls: serde_json::from_str::<Vec<ToolCall>>(&tc)
+                                .unwrap_or_default(),
                             created_at: r.get(4)?,
                         })
                     })?
@@ -54,7 +61,11 @@ impl Db {
         Ok(self
             .with_conn(|c| {
                 let row: Option<String> = c
-                    .query_row("SELECT value FROM settings WHERE key = 'settings'", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT value FROM settings WHERE key = 'settings'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .map(Some)
                     .or_else(|e| {
                         if e == rusqlite::Error::QueryReturnedNoRows {

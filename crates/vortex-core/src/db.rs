@@ -25,7 +25,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let db = Self { conn: Arc::new(Mutex::new(conn)) };
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -34,7 +36,9 @@ impl Db {
     pub async fn with_conn<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&rusqlite::Connection) -> std::result::Result<T, rusqlite::Error> + Send + 'static,
+        F: FnOnce(&rusqlite::Connection) -> std::result::Result<T, rusqlite::Error>
+            + Send
+            + 'static,
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {

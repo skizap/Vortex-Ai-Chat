@@ -47,17 +47,45 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), tool_calls: Vec::new(), tool_call_id: None, tool_name: None }
+        Self {
+            role: Role::System,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into(), tool_calls: Vec::new(), tool_call_id: None, tool_name: None }
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_calls: Vec::new(), tool_call_id: None, tool_name: None }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
     }
     /// A tool result message returned to the model.
-    pub fn tool_result(tool_call_id: impl Into<String>, name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: content.into(), tool_calls: Vec::new(), tool_call_id: Some(tool_call_id.into()), tool_name: Some(name.into()) }
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(name.into()),
+        }
     }
 }
 

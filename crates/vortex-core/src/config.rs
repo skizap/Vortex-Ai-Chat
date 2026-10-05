@@ -42,7 +42,10 @@ pub struct LanConfig {
 
 impl Default for LanConfig {
     fn default() -> Self {
-        Self { enabled: false, token: String::new() }
+        Self {
+            enabled: false,
+            token: String::new(),
+        }
     }
 }
 
@@ -108,8 +111,9 @@ impl AppConfig {
             cfg.server.host = v;
         }
         if let Ok(v) = std::env::var("VORTEX_PORT") {
-            cfg.server.port =
-                v.parse().map_err(|_| CoreError::Config("VORTEX_PORT must be a port number".into()))?;
+            cfg.server.port = v
+                .parse()
+                .map_err(|_| CoreError::Config("VORTEX_PORT must be a port number".into()))?;
         }
         if let Ok(v) = std::env::var("VORTEX_OPENROUTER_BASE_URL") {
             if !v.trim().is_empty() {
@@ -170,13 +174,17 @@ impl AppConfig {
 /// Minimal `.env` loader: KEY=VALUE lines, `#` comments, no interpolation.
 /// Never overwrites variables that are already set in the environment.
 fn load_dotenv() {
-    let Ok(text) = std::fs::read_to_string(".env") else { return };
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let k = k.trim();
         if k.is_empty() || std::env::var_os(k).is_some() {
             continue;
