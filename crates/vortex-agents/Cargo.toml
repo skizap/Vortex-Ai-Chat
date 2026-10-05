@@ -9,6 +9,7 @@ license.workspace = true
 vortex-types = { workspace = true }
 vortex-core = { workspace = true }
 vortex-llm = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
