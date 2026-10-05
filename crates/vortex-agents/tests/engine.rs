@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use vortex_agents::engine::{self, Engine};
+use vortex_agents::engine::Engine;
 use vortex_agents::{Hub, PreviewRegistry, Scheduler};
 use vortex_llm::llm::{CompletionRequest, CompletionResponse, LlmClient, LlmEvent};
 use vortex_types::{Mode, RunStatus, Settings, Usage};

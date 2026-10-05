@@ -127,7 +127,7 @@ fn content_type(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::preview::PreviewRegistry;
+    
 
     #[tokio::test]
     async fn static_preview_serves_confined_files() {
