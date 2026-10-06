@@ -92,11 +92,7 @@ pub async fn get_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    let stored = state
-        .db
-        .get_messages(id)
-        .await
-        .unwrap_or_default();
+    let stored = state.db.get_messages(id).await.unwrap_or_default();
     Json(stored).into_response()
 }
 
@@ -152,12 +148,19 @@ pub async fn post_chat(
         })
         .collect();
 
-    if let Err(e) = state.db.add_message(id.clone(), ChatMessage::user(content)).await {
+    if let Err(e) = state
+        .db
+        .add_message(id.clone(), ChatMessage::user(content))
+        .await
+    {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     let _ = state.db.touch_conversation(id.clone()).await;
 
-    let run_id = state.engine.start_chat_run(&id, mode, history, content).await;
+    let run_id = state
+        .engine
+        .start_chat_run(&id, mode, history, content)
+        .await;
     Json(serde_json::json!({"run_id": run_id})).into_response()
 }
 

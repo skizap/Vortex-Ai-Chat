@@ -127,7 +127,6 @@ fn content_type(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[tokio::test]
     async fn static_preview_serves_confined_files() {

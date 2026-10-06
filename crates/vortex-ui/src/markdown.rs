@@ -27,9 +27,11 @@ pub fn render_markdown(md: &str) -> String {
                 in_code = true;
                 code_text.clear();
                 code_lang = match kind {
-                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
-                        info.split([' ', '\t', ',']).next().unwrap_or("").to_string()
-                    }
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info
+                        .split([' ', '\t', ','])
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
                     pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 };
             }
@@ -80,7 +82,10 @@ pub fn render_markdown(md: &str) -> String {
             Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let dest = dest_url.as_ref();
-                if dest.starts_with("http://") || dest.starts_with("https://") || dest.starts_with('#') {
+                if dest.starts_with("http://")
+                    || dest.starts_with("https://")
+                    || dest.starts_with('#')
+                {
                     out.push_str(&format!(
                         "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">",
                         esc(dest)
@@ -155,4 +160,3 @@ fn theme_set() -> &'static syntect::highlighting::ThemeSet {
     static TS: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
     TS.get_or_init(syntect::highlighting::ThemeSet::load_defaults)
 }
-

@@ -23,7 +23,11 @@ pub struct DemoMockLlm {
 impl DemoMockLlm {
     pub fn new(script: &str) -> Self {
         Self {
-            script: if script.is_empty() { "echo".to_string() } else { script.to_string() },
+            script: if script.is_empty() {
+                "echo".to_string()
+            } else {
+                script.to_string()
+            },
             turn_counter: Mutex::new(0),
         }
     }
@@ -60,7 +64,11 @@ impl LlmClient for DemoMockLlm {
             *c += 1;
             t
         };
-        let usage = Some(Usage { prompt_tokens: 12, completion_tokens: 20, total_tokens: 32 });
+        let usage = Some(Usage {
+            prompt_tokens: 12,
+            completion_tokens: 20,
+            total_tokens: 32,
+        });
 
         if self.script == "tools" && turn == 0 {
             let query = Self::last_user_message(&req.messages);
@@ -92,7 +100,12 @@ impl LlmClient for DemoMockLlm {
             let _ = events.try_send(LlmEvent::TextDelta(word.to_string()));
             tokio::time::sleep(std::time::Duration::from_millis(3)).await;
         }
-        Ok(CompletionResponse { content, tool_calls: Vec::new(), usage, finish_reason: "stop".to_string() })
+        Ok(CompletionResponse {
+            content,
+            tool_calls: Vec::new(),
+            usage,
+            finish_reason: "stop".to_string(),
+        })
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>, LlmError> {

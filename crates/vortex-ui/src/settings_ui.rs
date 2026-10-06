@@ -45,10 +45,7 @@ fn SettingsForm(s: S) -> impl IntoView {
                     ctx.settings.set(Some(saved));
                     crate::state::apply_theme(s.theme);
                     flash.set(true);
-                    set_timeout(
-                        move || flash.set(false),
-                        std::time::Duration::from_secs(2),
-                    );
+                    set_timeout(move || flash.set(false), std::time::Duration::from_secs(2));
                 }
                 Err(e) => ctx.set_toast(format!("could not save settings: {e}")),
             }
@@ -171,7 +168,6 @@ fn ToolsPanel(draft: RwSignal<S>) -> impl IntoView {
     }
 }
 
-
 #[component]
 fn AgentsPanel(draft: RwSignal<S>) -> impl IntoView {
     view! {
@@ -274,4 +270,3 @@ fn toggle(
         </div>
     }
 }
-

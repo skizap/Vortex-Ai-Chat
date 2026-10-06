@@ -8,9 +8,6 @@ use leptos::task::spawn_local;
 #[component]
 pub fn Sidebar() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
-    let ctx_new = ctx.clone();
-    let ctx_search = ctx.clone();
-    let ctx_ws = ctx.clone();
 
     view! {
         <aside class="sidebar">
@@ -18,7 +15,7 @@ pub fn Sidebar() -> impl IntoView {
                 <h1 class="brand">"Vortex"</h1>
                 <button class="btn primary"
                     on:click=move |_| {
-                        let ctx = ctx_new.clone();
+                        let ctx = ctx;
                         spawn_local(async move {
                             let mode = ctx.mode.get_untracked();
                             match api::create_conversation("New chat", mode).await {
@@ -42,7 +39,7 @@ pub fn Sidebar() -> impl IntoView {
                 on:input=move |ev| {
                     let q = event_target_value(&ev);
                     ctx.search.set(q.clone());
-                    let ctx = ctx_search.clone();
+                    let ctx = ctx;
                     spawn_local(async move {
                         if let Ok(list) = api::conversations(&q).await {
                             ctx.conversations.set(list);
@@ -122,11 +119,10 @@ pub fn Sidebar() -> impl IntoView {
 #[component]
 fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
-    let ctx_open = ctx.clone();
     view! {
         <button class="conv-open" title=title.clone()
             on:click=move |_| {
-                let ctx = ctx_open.clone();
+                let ctx = ctx;
                 ctx.current.set(Some(conv_id.clone()));
                 ctx.stream_text.set(String::new());
                 ctx.plan.set(Vec::new());
@@ -197,7 +193,7 @@ fn WorkspacePicker() -> impl IntoView {
                 prop:value=move || ctx.settings.get().and_then(|s| s.workspace.clone()).unwrap_or_default()
                 on:change=move |ev| {
                     let path = event_target_value(&ev);
-                    let ctx = ctx_ws.clone();
+
                     spawn_local(async move {
                         match api::check_workspace(&path).await {
                             Ok(root) => {
@@ -229,4 +225,3 @@ fn WorkspacePicker() -> impl IntoView {
         </div>
     }
 }
-

@@ -56,7 +56,10 @@ impl AppState {
 }
 
 /// Uniform JSON error body: `{"error": "..."}`. Never contains secrets.
-pub fn err_json(status: axum::http::StatusCode, message: impl Into<String>) -> axum::response::Response {
+pub fn err_json(
+    status: axum::http::StatusCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
     let body = serde_json::json!({ "error": message.into() });
     axum::Json(body).into_response_with_status(status)
 }

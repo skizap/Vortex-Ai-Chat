@@ -6,8 +6,8 @@ pub mod api;
 pub mod chat;
 pub mod markdown;
 pub mod settings_ui;
-pub mod sse;
 pub mod sidebar;
+pub mod sse;
 pub mod state;
 pub mod tasks;
 
@@ -29,11 +29,15 @@ pub fn App() -> impl IntoView {
                 crate::state::apply_theme(s.theme);
                 ctx_boot.settings.set(Some(s));
             }
-            Err(e) => ctx_boot.error_banner.set(Some(format!("could not load settings: {e}"))),
+            Err(e) => ctx_boot
+                .error_banner
+                .set(Some(format!("could not load settings: {e}"))),
         }
         match api::health().await {
             Ok(c) => ctx_boot.capabilities.set(Some(c)),
-            Err(e) => ctx_boot.error_banner.set(Some(format!("server unreachable: {e}"))),
+            Err(e) => ctx_boot
+                .error_banner
+                .set(Some(format!("server unreachable: {e}"))),
         }
         if let Ok(convs) = api::conversations("").await {
             ctx_boot.conversations.set(convs);
@@ -160,4 +164,3 @@ fn ThemeToggle() -> impl IntoView {
         </button>
     }
 }
-

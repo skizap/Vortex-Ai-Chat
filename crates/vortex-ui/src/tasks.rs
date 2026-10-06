@@ -98,8 +98,6 @@ pub fn TasksView() -> impl IntoView {
 #[component]
 fn ApprovalCard(approval: ApprovalInfo) -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
-    let ctx_deny = ctx.clone();
-    let ctx_approve = ctx.clone();
     view! {
         <div class="approval-card">
             <div class="approval-head">
@@ -219,4 +217,3 @@ fn PreviewList() -> impl IntoView {
         </ul>
     }
 }
-
