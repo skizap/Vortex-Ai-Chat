@@ -28,29 +28,28 @@ impl Db {
     }
 
     pub async fn list_tool_calls(&self, run_id: String) -> Result<Vec<ToolCallRecord>> {
-        Ok(self
-            .with_conn(move |c| {
-                let mut st = c.prepare(
-                    "SELECT id, run_id, tool, args_json, ok, summary, created_at
+        self.with_conn(move |c| {
+            let mut st = c.prepare(
+                "SELECT id, run_id, tool, args_json, ok, summary, created_at
                      FROM tool_calls WHERE run_id = ?1 ORDER BY created_at",
-                )?;
-                let rows = st
-                    .query_map(rusqlite::params![run_id], |r| {
-                        let args: String = r.get(3)?;
-                        Ok(ToolCallRecord {
-                            id: r.get(0)?,
-                            run_id: r.get(1)?,
-                            tool: r.get(2)?,
-                            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
-                            ok: r.get::<_, i64>(4)? != 0,
-                            summary: r.get(5)?,
-                            created_at: r.get(6)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?)
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![run_id], |r| {
+                    let args: String = r.get(3)?;
+                    Ok(ToolCallRecord {
+                        id: r.get(0)?,
+                        run_id: r.get(1)?,
+                        tool: r.get(2)?,
+                        args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
+                        ok: r.get::<_, i64>(4)? != 0,
+                        summary: r.get(5)?,
+                        created_at: r.get(6)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 }
 

@@ -201,9 +201,10 @@ async fn six_subagents_run_concurrently_plus_coordinator() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
         match events.try_recv() {
-            Ok(vortex_types::RunEvent::RunFinished { status, .. })
-                if status == RunStatus::Completed =>
-            {
+            Ok(vortex_types::RunEvent::RunFinished {
+                status: RunStatus::Completed,
+                ..
+            }) => {
                 finished_root = true;
                 break;
             }
@@ -337,9 +338,14 @@ async fn subagent_never_exceeds_parent_toolset() {
 
 fn settings_with_workspace() -> (Settings, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.workspace = Some(dir.path().to_string_lossy().to_string());
-    settings.agents.max_concurrent = 6;
+    let settings = Settings {
+        workspace: Some(dir.path().to_string_lossy().to_string()),
+        agents: vortex_types::AgentSettings {
+            max_concurrent: 6,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     (settings, dir)
 }
 

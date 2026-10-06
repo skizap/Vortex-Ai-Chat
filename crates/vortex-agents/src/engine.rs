@@ -136,6 +136,9 @@ pub struct RunSpec {
 }
 
 impl Engine {
+    /// Composition root: every subsystem is a shared handle. Arguments are
+    /// grouped into [`Engine`] by design (single composition point).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         llm: Arc<dyn LlmClient>,
         registry: Arc<ToolRegistry>,

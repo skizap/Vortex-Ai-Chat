@@ -8,78 +8,73 @@ impl Db {
     // ---- messages ---------------------------------------------------------
 
     pub async fn add_message(&self, conversation_id: String, msg: ChatMessage) -> Result<i64> {
-        Ok(self
-            .with_conn(move |c| {
-                let tool_calls =
-                    serde_json::to_string(&msg.tool_calls).unwrap_or_else(|_| "[]".into());
-                c.execute(
-                    "INSERT INTO messages (conversation_id, role, content, tool_calls, created_at)
+        self.with_conn(move |c| {
+            let tool_calls = serde_json::to_string(&msg.tool_calls).unwrap_or_else(|_| "[]".into());
+            c.execute(
+                "INSERT INTO messages (conversation_id, role, content, tool_calls, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        conversation_id,
-                        msg.role.as_str(),
-                        msg.content,
-                        tool_calls,
-                        now()
-                    ],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
-            .await?)
+                rusqlite::params![
+                    conversation_id,
+                    msg.role.as_str(),
+                    msg.content,
+                    tool_calls,
+                    now()
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
     }
 
     pub async fn get_messages(&self, conversation_id: String) -> Result<Vec<StoredMessage>> {
-        Ok(self
-            .with_conn(move |c| {
-                let mut st = c.prepare(
-                    "SELECT id, role, content, tool_calls, created_at
+        self.with_conn(move |c| {
+            let mut st = c.prepare(
+                "SELECT id, role, content, tool_calls, created_at
                      FROM messages WHERE conversation_id = ?1 ORDER BY id",
-                )?;
-                let rows = st
-                    .query_map(rusqlite::params![conversation_id], |r| {
-                        let role: String = r.get(1)?;
-                        let tc: String = r.get(3)?;
-                        Ok(StoredMessage {
-                            id: r.get(0)?,
-                            role: serde_json::from_value(serde_json::Value::String(role))
-                                .unwrap_or(Role::Assistant),
-                            content: r.get(2)?,
-                            tool_calls: serde_json::from_str::<Vec<ToolCall>>(&tc)
-                                .unwrap_or_default(),
-                            created_at: r.get(4)?,
-                        })
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?)
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![conversation_id], |r| {
+                    let role: String = r.get(1)?;
+                    let tc: String = r.get(3)?;
+                    Ok(StoredMessage {
+                        id: r.get(0)?,
+                        role: serde_json::from_value(serde_json::Value::String(role))
+                            .unwrap_or(Role::Assistant),
+                        content: r.get(2)?,
+                        tool_calls: serde_json::from_str::<Vec<ToolCall>>(&tc).unwrap_or_default(),
+                        created_at: r.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     // ---- settings ---------------------------------------------------------
 
     pub async fn load_settings(&self) -> Result<Settings> {
-        Ok(self
-            .with_conn(|c| {
-                let row: Option<String> = c
-                    .query_row(
-                        "SELECT value FROM settings WHERE key = 'settings'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map(Some)
-                    .or_else(|e| {
-                        if e == rusqlite::Error::QueryReturnedNoRows {
-                            Ok(None)
-                        } else {
-                            Err(e)
-                        }
-                    })?;
-                match row {
-                    Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
-                    None => Ok(Settings::default()),
-                }
-            })
-            .await?)
+        self.with_conn(|c| {
+            let row: Option<String> = c
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'settings'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| {
+                    if e == rusqlite::Error::QueryReturnedNoRows {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                })?;
+            match row {
+                Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+                None => Ok(Settings::default()),
+            }
+        })
+        .await
     }
 
     pub async fn save_settings(&self, settings: &Settings) -> Result<()> {

@@ -40,14 +40,14 @@ impl Tool for ListFilesTool {
         }
         let mut entries: Vec<String> = Vec::new();
         let max = 500;
-        let mut it = walkdir::WalkDir::new(&dir)
+        let it = walkdir::WalkDir::new(&dir)
             .max_depth(2)
             .into_iter()
             .filter_entry(|e| {
                 let n = e.file_name().to_string_lossy();
                 n != ".git" && n != "node_modules"
             });
-        while let Some(entry) = it.next() {
+        for entry in it {
             let Ok(entry) = entry else { continue };
             let rel_path = entry
                 .path()

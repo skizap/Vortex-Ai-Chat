@@ -51,67 +51,63 @@ impl Db {
     }
 
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
-        Ok(self
-            .with_conn(|c| {
-                let mut st = c.prepare(
-                    "SELECT id, title, mode, workspace, created_at, updated_at
+        self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT id, title, mode, workspace, created_at, updated_at
                      FROM conversations ORDER BY updated_at DESC",
-                )?;
-                let rows = st
-                    .query_map([], row_to_conversation)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?)
+            )?;
+            let rows = st
+                .query_map([], row_to_conversation)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     pub async fn search_conversations(&self, q: String) -> Result<Vec<ConversationSummary>> {
-        Ok(self
-            .with_conn(move |c| {
-                let mut st = c.prepare(
-                    "SELECT DISTINCT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at
+        self.with_conn(move |c| {
+            let mut st = c.prepare(
+                "SELECT DISTINCT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at
                      FROM conversations c
                      LEFT JOIN messages m ON m.conversation_id = c.id
                      WHERE c.title LIKE ?1 OR m.content LIKE ?1
                      ORDER BY c.updated_at DESC",
-                )?;
-                let like = format!("%{q}%");
-                let rows = st
-                    .query_map(rusqlite::params![like], row_to_conversation)?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?)
+            )?;
+            let like = format!("%{q}%");
+            let rows = st
+                .query_map(rusqlite::params![like], row_to_conversation)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     pub async fn rename_conversation(&self, id: String, title: String) -> Result<bool> {
-        Ok(self
-            .with_conn(move |c| {
-                Ok(c.execute(
-                    "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, title, now()],
-                )? > 0)
-            })
-            .await?)
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![id, title, now()],
+            )? > 0)
+        })
+        .await
     }
 
     pub async fn delete_conversation(&self, id: String) -> Result<bool> {
-        Ok(self
-            .with_conn(move |c| {
-                c.execute(
-                    "DELETE FROM messages WHERE conversation_id = ?1",
-                    rusqlite::params![id],
-                )?;
-                c.execute(
-                    "DELETE FROM runs WHERE conversation_id = ?1",
-                    rusqlite::params![id],
-                )?;
-                Ok(c.execute(
-                    "DELETE FROM conversations WHERE id = ?1",
-                    rusqlite::params![id],
-                )? > 0)
-            })
-            .await?)
+        self.with_conn(move |c| {
+            c.execute(
+                "DELETE FROM messages WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            c.execute(
+                "DELETE FROM runs WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(c.execute(
+                "DELETE FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+            )? > 0)
+        })
+        .await
     }
 
     pub async fn touch_conversation(&self, id: String) -> Result<()> {
