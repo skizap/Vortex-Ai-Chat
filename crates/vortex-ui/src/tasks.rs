@@ -108,10 +108,8 @@ fn ApprovalCard(approval: ApprovalInfo) -> impl IntoView {
             <div class="approval-actions">
                 <button class="btn danger"
                     on:click={
-                        let ctx = ctx.clone();
                         let id = approval.id.clone();
                         move |_| {
-                            let ctx = ctx.clone();
                             let id = id.clone();
                             spawn_local(async move {
                                 if api::decide_approval(&id, false).await.is_ok() {
@@ -123,10 +121,8 @@ fn ApprovalCard(approval: ApprovalInfo) -> impl IntoView {
                     }>"Deny"</button>
                 <button class="btn primary"
                     on:click={
-                        let ctx = ctx.clone();
                         let id = approval.id.clone();
                         move |_| {
-                            let ctx = ctx.clone();
                             let id = id.clone();
                             spawn_local(async move {
                                 if api::decide_approval(&id, true).await.is_ok() {
@@ -192,7 +188,7 @@ fn AgentCard(agent: AgentDisplay) -> impl IntoView {
 fn PreviewList() -> impl IntoView {
     let previews = RwSignal::new(Vec::new());
     Effect::new(move |_| {
-        let p = previews.clone();
+        let p = previews;
         spawn_local(async move {
             if let Ok(list) = api::previews().await {
                 p.set(list);

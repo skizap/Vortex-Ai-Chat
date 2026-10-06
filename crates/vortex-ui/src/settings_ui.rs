@@ -27,7 +27,7 @@ fn SettingsForm(s: S) -> impl IntoView {
     let saved_flash = RwSignal::new(false);
 
     Effect::new(move |_| {
-        let m = models.clone();
+        let m = models;
         spawn_local(async move {
             if let Ok(list) = api::models().await {
                 m.set(list);
@@ -37,8 +37,8 @@ fn SettingsForm(s: S) -> impl IntoView {
 
     let save = move || {
         let s = draft.get_untracked();
-        let ctx = ctx.clone();
-        let flash = saved_flash.clone();
+        let ctx = ctx;
+        let flash = saved_flash;
         spawn_local(async move {
             match api::save_settings(&s).await {
                 Ok(saved) => {
@@ -262,7 +262,7 @@ fn toggle(
     view! {
         <div class="toggle-field">
             <label>
-                <input type="checkbox" prop:checked=move || get()
+                <input type="checkbox" prop:checked=get
                     on:change=move |ev| set(event_target_checked(&ev))/>
                 {label}
             </label>

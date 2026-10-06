@@ -18,7 +18,7 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> RunSubscription {
     let source = web_sys::EventSource::new(&format!("/api/runs/{run_id}/events"))
         .expect("EventSource constructs");
 
-    let ctx_msg = ctx.clone();
+    let ctx_msg = ctx;
     let on_message =
         Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
             let Some(text) = ev.data().as_string() else {
@@ -30,12 +30,12 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> RunSubscription {
             handle_event(&ctx_msg, event);
         });
 
-    let ctx_err = ctx.clone();
+    let ctx_err = ctx;
     let run_id_err = run_id.clone();
     let on_error = Closure::<dyn FnMut()>::new(move || {
         if let Some(status) = ctx_err.run_status.get_untracked() {
             if !status.is_terminal() {
-                let ctx = ctx_err.clone();
+                let ctx = ctx_err;
                 let run_id = run_id_err.clone();
                 spawn_local(async move {
                     match crate::api::run_state(&run_id).await {
@@ -199,7 +199,7 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 ctx.error_banner.set(None);
             }
             if status.is_terminal() {
-                let ctx2 = ctx.clone();
+                let ctx2 = *ctx;
                 let current = ctx.current.get_untracked();
                 if let Some(conv) = current {
                     spawn_local(async move {

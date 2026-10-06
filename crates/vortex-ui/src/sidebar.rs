@@ -15,7 +15,6 @@ pub fn Sidebar() -> impl IntoView {
                 <h1 class="brand">"Vortex"</h1>
                 <button class="btn primary"
                     on:click=move |_| {
-                        let ctx = ctx;
                         spawn_local(async move {
                             let mode = ctx.mode.get_untracked();
                             match api::create_conversation("New chat", mode).await {
@@ -39,7 +38,6 @@ pub fn Sidebar() -> impl IntoView {
                 on:input=move |ev| {
                     let q = event_target_value(&ev);
                     ctx.search.set(q.clone());
-                    let ctx = ctx;
                     spawn_local(async move {
                         if let Ok(list) = api::conversations(&q).await {
                             ctx.conversations.set(list);
@@ -60,7 +58,6 @@ pub fn Sidebar() -> impl IntoView {
                                 <ConvButton conv_id=conv.id.clone() title=conv.title.clone() mode=conv.mode.as_str() />
                                 <button class="icon-btn conv-rename" title="Rename"
                                     on:click={
-                                        let ctx = ctx.clone();
                                         let id = conv.id.clone();
                                         let title = conv.title.clone();
                                         move |_| {
@@ -74,7 +71,6 @@ pub fn Sidebar() -> impl IntoView {
                                                     .flatten()
                                                 });
                                             if let Some(new) = new.filter(|s| !s.trim().is_empty()) {
-                                                let ctx = ctx.clone();
                                                 let id = id.clone();
                                                 spawn_local(async move {
                                                     if api::rename_conversation(&id, &new).await.is_ok() {
@@ -90,10 +86,8 @@ pub fn Sidebar() -> impl IntoView {
                                     }>"✎"</button>
                                 <button class="icon-btn conv-delete" title="Delete"
                                     on:click={
-                                        let ctx = ctx.clone();
                                         let id = conv.id.clone();
                                         move |_| {
-                                            let ctx = ctx.clone();
                                             let id = id.clone();
                                             spawn_local(async move {
                                                 if api::delete_conversation(&id).await.is_ok() {
@@ -122,7 +116,6 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
     view! {
         <button class="conv-open" title=title.clone()
             on:click=move |_| {
-                let ctx = ctx;
                 ctx.current.set(Some(conv_id.clone()));
                 ctx.stream_text.set(String::new());
                 ctx.plan.set(Vec::new());
@@ -130,7 +123,6 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
                 ctx.agents.set(Vec::new());
                 ctx.run_status.set(None);
                 ctx.error_banner.set(None);
-                let ctx = ctx.clone();
                 let id = conv_id.clone();
                 spawn_local(async move {
                     match api::messages(&id).await {
@@ -199,7 +191,6 @@ fn WorkspacePicker() -> impl IntoView {
                             Ok(root) => {
                                 if let Some(mut s) = ctx.settings.get_untracked() {
                                     s.workspace = Some(root);
-                                    let ctx = ctx.clone();
                                     spawn_local(async move {
                                         match api::save_settings(&s).await {
                                             Ok(saved) => {
