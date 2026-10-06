@@ -1,0 +1,4 @@
+[build]
+target = "index.html"
+dist = "../vortex-server/ui-dist"
+public-dir = "public"

@@ -1,0 +1,33 @@
+[package]
+name = "vortex-agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-types = { workspace = true }
+vortex-core = { workspace = true }
+vortex-llm = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+similar = { workspace = true }
+libc = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+anyhow = { workspace = true }

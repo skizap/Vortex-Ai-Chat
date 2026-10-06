@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vortex-types",
+    "crates/vortex-core",
+    "crates/vortex-llm",
+    "crates/vortex-agents",
+    "crates/vortex-server",
+    "crates/vortex-ui",
+]
+# `vortex-ui` targets `wasm32-unknown-unknown` (built with Trunk via
+# scripts/build-ui.sh); plain `cargo build/test/clippy` from the workspace root
+# only touches the native packages below.
+default-members = [
+    "crates/vortex-types",
+    "crates/vortex-core",
+    "crates/vortex-llm",
+    "crates/vortex-agents",
+    "crates/vortex-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89.0"
+license = "MIT"
+repository = "https://github.com/skizap/Vortex-Ai-Chat"
+
+[workspace.dependencies]
+vortex-types = { path = "crates/vortex-types" }
+vortex-core = { path = "crates/vortex-core" }
+vortex-llm = { path = "crates/vortex-llm" }
+vortex-agents = { path = "crates/vortex-agents" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+regex = "1"
+walkdir = "2"
+similar = "2"
+libc = "0.2"
+toml = "0.8"
+url = "2"
+rust-embed = { version = "8", features = ["include-exclude"] }
+tempfile = "3"
+percent-encoding = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
