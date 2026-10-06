@@ -15,7 +15,8 @@ vortex-core = { workspace = true }
 vortex-llm = { workspace = true }
 vortex-agents = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+async-trait = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
@@ -31,3 +32,4 @@ url = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+percent-encoding = { workspace = true }

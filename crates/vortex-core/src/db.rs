@@ -49,6 +49,11 @@ impl Db {
         .map_err(|e| CoreError::Config(format!("db task join error: {e}")))?
     }
 
+    /// Synchronous access for one-shot startup tasks only.
+    pub fn raw_connection(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().expect("db mutex poisoned")
+    }
+
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute_batch(SCRIPT)?;
