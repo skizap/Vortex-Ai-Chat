@@ -5,15 +5,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Theme {
+    #[default]
     Dark,
     Light,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Dark
-    }
 }
 
 /// Coarse permission profile. Regardless of profile, backend-enforced
@@ -21,20 +17,16 @@ impl Default for Theme {
 /// explicitly flags) always require explicit human approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PermissionProfile {
     /// Read-only tools; no writes, commands, or previews.
     Restricted,
     /// Workspace reads/writes and safe operations allowed; consequential actions gated.
+    #[default]
     Standard,
     /// Like Standard, but safe allowlisted commands run without per-run approval.
     /// Consequential actions are still always gated.
     Trusted,
-}
-
-impl Default for PermissionProfile {
-    fn default() -> Self {
-        PermissionProfile::Standard
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

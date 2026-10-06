@@ -4,6 +4,12 @@ pub struct SseParser {
     buf: Vec<u8>,
 }
 
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseParser {
     pub fn new() -> Self {
         Self {

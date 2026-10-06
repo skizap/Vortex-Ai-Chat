@@ -78,7 +78,7 @@ impl CdpConnection {
         self.pending.lock().await.insert(id, tx);
         let send_result = {
             let mut w = self.write.lock().await;
-            w.send(WsMessage::Text(msg.to_string().into())).await
+            w.send(WsMessage::Text(msg.to_string())).await
         };
         if let Err(e) = send_result {
             self.pending.lock().await.remove(&id);

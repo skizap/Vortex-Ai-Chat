@@ -3,7 +3,7 @@
 use serde::de::DeserializeOwned;
 use vortex_types::{
     ApprovalInfo, Capabilities, ChatRequestDto, ConversationSummary, ModelInfo, PreviewInfo,
-    RunEvent, RunInfo, Settings, StoredMessage, ToolCallRecord,
+    RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
 const BASE: &str = "/api";
@@ -21,7 +21,11 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
 }
 
-pub async fn send_json<T: DeserializeOwned>(method: &str, path: &str, body: &str) -> Result<T, String> {
+pub async fn send_json<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<T, String> {
     let url = format!("{BASE}{path}");
     let req = match method {
         "POST" => gloo_net::http::Request::post(&url),
@@ -48,7 +52,11 @@ pub async fn send_json<T: DeserializeOwned>(method: &str, path: &str, body: &str
 fn parse_error(text: &str) -> String {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "unexpected server error".to_string())
 }
 
@@ -83,7 +91,10 @@ pub async fn conversations(q: &str) -> Result<Vec<ConversationSummary>, String> 
     }
 }
 
-pub async fn create_conversation(title: &str, mode: vortex_types::Mode) -> Result<ConversationSummary, String> {
+pub async fn create_conversation(
+    title: &str,
+    mode: vortex_types::Mode,
+) -> Result<ConversationSummary, String> {
     let body = serde_json::json!({ "title": title, "mode": mode.as_str() }).to_string();
     send_json("POST", "/conversations", &body).await
 }
@@ -152,7 +163,8 @@ pub async fn previews() -> Result<Vec<PreviewInfo>, String> {
 }
 
 pub async fn check_workspace(path: &str) -> Result<String, String> {
-    let resp = get_json::<serde_json::Value>(&format!("/workspace/check?path={}", urlencode(path))).await?;
+    let resp = get_json::<serde_json::Value>(&format!("/workspace/check?path={}", urlencode(path)))
+        .await?;
     resp.get("root")
         .and_then(|r| r.as_str())
         .map(|s| s.to_string())

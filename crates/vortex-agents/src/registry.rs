@@ -171,22 +171,19 @@ impl ToolRegistry {
             return failure(ToolError::InvalidArgs(name.to_string(), msg));
         }
         let filtered = def.filter(args.clone());
-        match tool.risk() {
-            Risk::Consequential => {
-                let payload = serde_json::to_string_pretty(&filtered).unwrap_or_default();
-                let title = format!("Approve {}: {}", def.name, def.description);
-                match ctx.approvals.request(&ctx.run_id, &title, &payload).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return failure(ToolError::Denied(format!(
-                            "the user declined this action ({})",
-                            def.name
-                        )))
-                    }
-                    Err(e) => return failure(e),
+        if tool.risk() == Risk::Consequential {
+            let payload = serde_json::to_string_pretty(&filtered).unwrap_or_default();
+            let title = format!("Approve {}: {}", def.name, def.description);
+            match ctx.approvals.request(&ctx.run_id, &title, &payload).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return failure(ToolError::Denied(format!(
+                        "the user declined this action ({})",
+                        def.name
+                    )))
                 }
+                Err(e) => return failure(e),
             }
-            _ => {}
         }
         match tool.execute(ctx, &filtered).await {
             Ok(r) => success(r),

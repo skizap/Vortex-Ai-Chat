@@ -22,8 +22,10 @@ pub async fn put_settings(
     Json(mut settings): Json<Settings>,
 ) -> axum::response::Response {
     // Validate and clamp before accepting anything.
-    settings.agents.max_concurrent =
-        settings.agents.max_concurrent.clamp(1, AgentSettings::MAX_LIMIT_CEILING);
+    settings.agents.max_concurrent = settings
+        .agents
+        .max_concurrent
+        .clamp(1, AgentSettings::MAX_LIMIT_CEILING);
     settings.agents.max_iterations = settings.agents.max_iterations.clamp(1, 64);
     settings.agents.run_timeout_secs = settings.agents.run_timeout_secs.clamp(30, 3600);
     settings.agents.approval_timeout_secs = settings.agents.approval_timeout_secs.clamp(10, 3600);
@@ -35,9 +37,10 @@ pub async fn put_settings(
         if trimmed.is_empty() {
             settings.workspace = None;
         } else if !std::path::Path::new(&trimmed).is_dir() {
-            return err_json(StatusCode::BAD_REQUEST, format!(
-                "workspace '{}' is not a directory", trimmed
-            ));
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                format!("workspace '{}' is not a directory", trimmed),
+            );
         } else {
             settings.workspace = Some(trimmed);
         }
@@ -45,7 +48,10 @@ pub async fn put_settings(
     if !state.is_mock_llm && !settings.search.base_url.trim().is_empty() {
         // Validate search URL shape early for a better error message.
         if url::Url::parse(settings.search.base_url.trim()).is_err() {
-            return err_json(StatusCode::BAD_REQUEST, "search base_url is not a valid URL");
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "search base_url is not a valid URL",
+            );
         }
     }
     if let Err(e) = state.db.save_settings(&settings).await {
@@ -92,7 +98,10 @@ pub async fn decide_approval(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let approve = body.get("approve").and_then(|a| a.as_bool()).unwrap_or(false);
+    let approve = body
+        .get("approve")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false);
     match state.engine.approvals.decide(&id, approve).await {
         true => Json(serde_json::json!({"ok": true})).into_response(),
         false => err_json(
@@ -121,6 +130,8 @@ pub async fn check_workspace(
     }
 }
 
-pub async fn list_previews(State(state): State<Arc<AppState>>) -> Json<Vec<vortex_types::PreviewInfo>> {
+pub async fn list_previews(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<vortex_types::PreviewInfo>> {
     Json(state.previews.list())
 }

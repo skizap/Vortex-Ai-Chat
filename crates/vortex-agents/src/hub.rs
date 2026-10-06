@@ -50,6 +50,8 @@ impl Hub {
         }
     }
 
+    /// Register a run; fields mirror [`RunMeta`] by design.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         id: &str,

@@ -11,14 +11,12 @@ use vortex_types::{ChatRequestDto, Role, RunStatus, StoredMessage};
 pub fn ChatView() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
     let input = RwSignal::new(String::new());
-    let ctx_key = ctx.clone();
-    let ctx_send = ctx.clone();
 
     let send = move || {
         let text = input.get_untracked();
         if !text.trim().is_empty() {
             input.set(String::new());
-            let ctx = ctx_send.clone();
+            let ctx = ctx;
             let mode = ctx.mode.get_untracked();
             spawn_local(async move {
                 crate::chat::send_message(ctx, text, mode).await;
@@ -71,7 +69,7 @@ pub fn ChatView() -> impl IntoView {
                                 let text = input.get_untracked();
                                 if !text.trim().is_empty() {
                                     input.set(String::new());
-                                    let ctx = ctx_key.clone();
+                                    let ctx = ctx;
                                     let mode = ctx.mode.get_untracked();
                                     spawn_local(async move {
                                         crate::chat::send_message(ctx, text, mode).await;
@@ -89,7 +87,9 @@ pub fn ChatView() -> impl IntoView {
 
 /// Send a message: optimistic user bubble + POST + SSE subscription.
 pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
-    let Some(conv_id) = ctx.current.get_untracked() else { return };
+    let Some(conv_id) = ctx.current.get_untracked() else {
+        return;
+    };
     // Optimistic user bubble.
     ctx.messages.update(|m| {
         m.push(StoredMessage {
@@ -106,7 +106,10 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
     ctx.agents.set(Vec::new());
     ctx.error_banner.set(None);
     ctx.run_status.set(Some(RunStatus::Queued));
-    let dto = ChatRequestDto { content: text, mode: Some(mode) };
+    let dto = ChatRequestDto {
+        content: text,
+        mode: Some(mode),
+    };
     match api::send_chat(&conv_id, &dto).await {
         Ok(r) => start_stream(ctx, r.run_id),
         Err(e) => {
@@ -140,8 +143,6 @@ fn set_new_subscription(sub: crate::sse::RunSubscription) {
 #[component]
 fn RunControls() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
-    let ctx_stop = ctx.clone();
-    let ctx_retry = ctx.clone();
     view! {
         <>
             <Show when=move || {
@@ -150,7 +151,7 @@ fn RunControls() -> impl IntoView {
             }>
                 <button class="btn danger"
                     on:click=move |_| {
-                        let ctx = ctx_stop.clone();
+                        let ctx = ctx;
                         spawn_local(async move {
                             if let Some(run) = ctx.run_id.get_untracked() {
                                 if api::stop_run(&run).await.is_ok() {
@@ -163,7 +164,7 @@ fn RunControls() -> impl IntoView {
             <Show when=move || matches!(ctx.run_status.get(), Some(RunStatus::Failed))>
                 <button class="btn"
                     on:click=move |_| {
-                        let ctx = ctx_retry.clone();
+                        let ctx = ctx;
                         spawn_local(async move {
                             if let Some(run) = ctx.run_id.get_untracked() {
                                 match api::retry_run(&run).await {
@@ -184,7 +185,6 @@ fn RunControls() -> impl IntoView {
 
 #[component]
 fn MessageBubble(msg: StoredMessage) -> impl IntoView {
-    let ctx = use_context::<AppCtx>().expect("ctx provided");
     let markdown = crate::markdown::render_markdown(&msg.content);
     let raw = msg.content.clone();
     let is_user = msg.role == Role::User;
@@ -212,10 +212,10 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
 }
 
 fn copy_text(text: &str) {
-    let _ = web_sys::window().and_then(|w| {
-        let clipboard = w.navigator().clipboard();
-        clipboard.write_text(text).ok().map(|_| ())
-    });
+    if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
+        // Fire-and-forget promise; failures are silent (clipboard permission).
+        let _ = clipboard.write_text(text);
+    }
     if let Some(ctx) = try_use_ctx() {
         ctx.set_toast("Copied");
     }
@@ -245,4 +245,3 @@ fn EmptyState() -> impl IntoView {
         </div>
     }
 }
-

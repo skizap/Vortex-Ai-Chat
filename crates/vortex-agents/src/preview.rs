@@ -5,6 +5,7 @@
 //! - Process previews: a user project's dev server (e.g. `npm run dev`),
 //!   spawned in its own process group; killed when stopped, when the owning
 //!   run ends, or when the server shuts down.
+//!
 //! Previews are always owned by the run that started them.
 
 use crate::errors::ToolError;
@@ -26,6 +27,12 @@ struct PreviewHandle {
     running: bool,
     abort: CancellationToken,
     child_pid: Option<u32>,
+}
+
+impl Default for PreviewRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PreviewRegistry {

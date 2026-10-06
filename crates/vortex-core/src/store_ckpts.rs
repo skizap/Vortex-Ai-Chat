@@ -13,40 +13,38 @@ impl Db {
         path: String,
         original: Option<String>,
     ) -> Result<i64> {
-        Ok(self
-            .with_conn(move |c| {
-                c.execute(
-                    "INSERT INTO checkpoints (conversation_id, run_id, path, original, created_at)
+        self.with_conn(move |c| {
+            c.execute(
+                "INSERT INTO checkpoints (conversation_id, run_id, path, original, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![conversation_id, run_id, path, original, now()],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
-            .await?)
+                rusqlite::params![conversation_id, run_id, path, original, now()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
     }
 
     pub async fn list_checkpoints(
         &self,
         conversation_id: String,
     ) -> Result<Vec<(i64, String, Option<String>)>> {
-        Ok(self
-            .with_conn(move |c| {
-                let mut st = c.prepare(
-                    "SELECT id, path, original FROM checkpoints WHERE conversation_id = ?1
+        self.with_conn(move |c| {
+            let mut st = c.prepare(
+                "SELECT id, path, original FROM checkpoints WHERE conversation_id = ?1
                      ORDER BY id DESC LIMIT 200",
-                )?;
-                let rows = st
-                    .query_map(rusqlite::params![conversation_id], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?)
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![conversation_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     /// Restore a checkpoint by id: returns (path, original_content).
@@ -54,18 +52,17 @@ impl Db {
         &self,
         checkpoint_id: i64,
     ) -> Result<Option<(String, Option<String>)>> {
-        Ok(self
-            .with_conn(move |c| {
-                let mut st = c.prepare("SELECT path, original FROM checkpoints WHERE id = ?1")?;
-                let row = st
-                    .query_map(rusqlite::params![checkpoint_id], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                    })?
-                    .next()
-                    .transpose()?;
-                Ok(row)
-            })
-            .await?)
+        self.with_conn(move |c| {
+            let mut st = c.prepare("SELECT path, original FROM checkpoints WHERE id = ?1")?;
+            let row = st
+                .query_map(rusqlite::params![checkpoint_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
+                .next()
+                .transpose()?;
+            Ok(row)
+        })
+        .await
     }
 }
 

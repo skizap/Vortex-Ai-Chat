@@ -6,8 +6,8 @@ pub mod api;
 pub mod chat;
 pub mod markdown;
 pub mod settings_ui;
-pub mod sse;
 pub mod sidebar;
+pub mod sse;
 pub mod state;
 pub mod tasks;
 
@@ -19,21 +19,25 @@ use state::{AppCtx, Tab};
 #[component]
 pub fn App() -> impl IntoView {
     let ctx = AppCtx::new();
-    provide_context(ctx.clone());
+    provide_context(ctx);
 
     // Load settings + capabilities first (drives theme + honest state).
-    let ctx_boot = ctx.clone();
+    let ctx_boot = ctx;
     spawn_local(async move {
         match api::settings().await {
             Ok(s) => {
                 crate::state::apply_theme(s.theme);
                 ctx_boot.settings.set(Some(s));
             }
-            Err(e) => ctx_boot.error_banner.set(Some(format!("could not load settings: {e}"))),
+            Err(e) => ctx_boot
+                .error_banner
+                .set(Some(format!("could not load settings: {e}"))),
         }
         match api::health().await {
             Ok(c) => ctx_boot.capabilities.set(Some(c)),
-            Err(e) => ctx_boot.error_banner.set(Some(format!("server unreachable: {e}"))),
+            Err(e) => ctx_boot
+                .error_banner
+                .set(Some(format!("server unreachable: {e}"))),
         }
         if let Ok(convs) = api::conversations("").await {
             ctx_boot.conversations.set(convs);
@@ -44,10 +48,10 @@ pub fn App() -> impl IntoView {
     });
 
     // Poll pending approvals so requests raised by sub-agents appear promptly.
-    let ctx_poll = ctx.clone();
+    let ctx_poll = ctx;
     set_interval(
         move || {
-            let ctx = ctx_poll.clone();
+            let ctx = ctx_poll;
             spawn_local(async move {
                 if let Ok(apprs) = api::approvals().await {
                     ctx.approvals.set(apprs);
@@ -63,16 +67,16 @@ pub fn App() -> impl IntoView {
             <main class="main">
                 <header class="topbar">
                     <div class="tabs" role="tablist">
-                        <button class=tab_class(ctx.clone(), Tab::Chat)
+                        <button class=tab_class(ctx, Tab::Chat)
                             on:click=move |_| ctx.tab.set(Tab::Chat)>"Chat"</button>
-                        <button class=tab_class(ctx.clone(), Tab::Tasks)
+                        <button class=tab_class(ctx, Tab::Tasks)
                             on:click=move |_| ctx.tab.set(Tab::Tasks)>
                             {move || {
                                 let pending = ctx.approvals.get().len();
                                 if pending > 0 { format!("Tasks ({pending})") } else { "Tasks".to_string() }
                             }}
                         </button>
-                        <button class=tab_class(ctx.clone(), Tab::Settings)
+                        <button class=tab_class(ctx, Tab::Settings)
                             on:click=move |_| ctx.tab.set(Tab::Settings)>"Settings"</button>
                     </div>
                     <div class="mode-select" title="Tools available to the assistant for the next message">
@@ -143,7 +147,7 @@ fn ThemeToggle() -> impl IntoView {
                 crate::state::apply_theme(new_theme);
                 if let Some(mut s) = s {
                     s.theme = new_theme;
-                    let ctx = ctx.clone();
+                    let ctx = ctx;
                     spawn_local(async move {
                         if let Ok(saved) = api::save_settings(&s).await {
                             ctx.settings.set(Some(saved));
@@ -160,4 +164,3 @@ fn ThemeToggle() -> impl IntoView {
         </button>
     }
 }
-

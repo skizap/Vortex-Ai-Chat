@@ -5,6 +5,7 @@
 //! - typing into password fields or CAPTCHA widgets is refused: the model
 //!   must hand off to the human for login/verification,
 //! - page reads report login/captcha presence so the model pauses.
+//!
 //! Consequential web actions (purchases, publishing, submissions) are handled
 //! by the model calling `request_approval`, which always pauses for the user.
 
@@ -218,7 +219,7 @@ impl Tool for BrowserReadTool {
         if has_captcha {
             out.push_str("CAPTCHA PRESENT: pause and hand off to the human user.\n");
         }
-        out.push_str("\n");
+        out.push('\n');
         out.push_str(&text);
         Ok(ToolResult {
             summary: format!("read page {url}"),

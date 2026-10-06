@@ -23,7 +23,9 @@ pub use settings::{
 /// backend will expose to the model for a given run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Mode {
+    #[default]
     Chat,
     Research,
     Coding,
@@ -38,12 +40,6 @@ impl Mode {
             Mode::Coding => "coding",
             Mode::Browser => "browser",
         }
-    }
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Chat
     }
 }
 

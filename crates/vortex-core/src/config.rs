@@ -31,6 +31,7 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct LanConfig {
     /// Opt-in LAN exposure. When true, a bearer token is required on all
     /// API requests and the server binds on all interfaces.
@@ -38,15 +39,6 @@ pub struct LanConfig {
     /// Required bearer token when `enabled` is true. Generated on first boot
     /// with 0600 permissions on the config file.
     pub token: String,
-}
-
-impl Default for LanConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            token: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

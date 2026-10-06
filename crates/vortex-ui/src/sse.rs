@@ -15,24 +15,27 @@ pub struct RunSubscription {
 }
 
 pub fn subscribe_run(ctx: AppCtx, run_id: String) -> RunSubscription {
-    let source =
-        web_sys::EventSource::new(&format!("/api/runs/{run_id}/events")).expect("EventSource constructs");
+    let source = web_sys::EventSource::new(&format!("/api/runs/{run_id}/events"))
+        .expect("EventSource constructs");
 
-    let ctx_msg = ctx.clone();
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |ev: web_sys::MessageEvent| {
-            let Some(text) = ev.data().as_string() else { return };
-            let Ok(event) = serde_json::from_str::<vortex_types::RunEvent>(&text) else { return };
+    let ctx_msg = ctx;
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
+            let Some(text) = ev.data().as_string() else {
+                return;
+            };
+            let Ok(event) = serde_json::from_str::<vortex_types::RunEvent>(&text) else {
+                return;
+            };
             handle_event(&ctx_msg, event);
-        },
-    );
+        });
 
-    let ctx_err = ctx.clone();
+    let ctx_err = ctx;
     let run_id_err = run_id.clone();
     let on_error = Closure::<dyn FnMut()>::new(move || {
         if let Some(status) = ctx_err.run_status.get_untracked() {
             if !status.is_terminal() {
-                let ctx = ctx_err.clone();
+                let ctx = ctx_err;
                 let run_id = run_id_err.clone();
                 spawn_local(async move {
                     match crate::api::run_state(&run_id).await {
@@ -71,7 +74,14 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
         E::PlanUpdated { steps, .. } => {
             ctx.plan.set(steps);
         }
-        E::RunStarted { run_id, agent, model, task, depth, .. } => {
+        E::RunStarted {
+            run_id,
+            agent,
+            model,
+            task,
+            depth,
+            ..
+        } => {
             if depth > 0 {
                 ctx.agents.update(|a| {
                     a.retain(|x| x.run_id != run_id);
@@ -86,7 +96,12 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 });
             }
         }
-        E::ToolCallStarted { call_id, tool, args, .. } => {
+        E::ToolCallStarted {
+            call_id,
+            tool,
+            args,
+            ..
+        } => {
             ctx.tool_calls.update(|c| {
                 c.retain(|x| x.call_id != call_id);
                 c.push(crate::state::ToolCallDisplay {
@@ -100,7 +115,13 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 });
             });
         }
-        E::ToolCallFinished { call_id, ok, summary, diff, .. } => {
+        E::ToolCallFinished {
+            call_id,
+            ok,
+            summary,
+            diff,
+            ..
+        } => {
             ctx.tool_calls.update(|c| {
                 for tc in c.iter_mut() {
                     if tc.call_id == call_id {
@@ -116,7 +137,13 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 }
             });
         }
-        E::ApprovalRequested { approval_id, agent, title, payload, .. } => {
+        E::ApprovalRequested {
+            approval_id,
+            agent,
+            title,
+            payload,
+            ..
+        } => {
             ctx.approvals.update(|a| {
                 a.retain(|x| x.id != approval_id);
                 a.push(vortex_types::ApprovalInfo {
@@ -130,7 +157,11 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 });
             });
         }
-        E::ApprovalResolved { approval_id, approved, .. } => {
+        E::ApprovalResolved {
+            approval_id,
+            approved,
+            ..
+        } => {
             ctx.approvals.update(|a| a.retain(|x| x.id != approval_id));
             ctx.set_toast(if approved {
                 "Action approved by the user"
@@ -168,7 +199,7 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 ctx.error_banner.set(None);
             }
             if status.is_terminal() {
-                let ctx2 = ctx.clone();
+                let ctx2 = *ctx;
                 let current = ctx.current.get_untracked();
                 if let Some(conv) = current {
                     spawn_local(async move {
@@ -184,4 +215,3 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
         }
     }
 }
-

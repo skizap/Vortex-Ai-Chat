@@ -66,13 +66,18 @@ async fn main() -> anyhow::Result<()> {
                     "OPENROUTER_API_KEY is not set; chat will fail until it is configured \
                      (see README.md 'Setup')"
                 );
-                Arc::new(vortex_llm::OpenRouterClient::new(&config.llm.base_url, None)?)
+                Arc::new(vortex_llm::OpenRouterClient::new(
+                    &config.llm.base_url,
+                    None,
+                )?)
             }
         }
     };
 
     let hub = Arc::new(vortex_agents::Hub::new());
-    let scheduler = Arc::new(vortex_agents::Scheduler::new(settings.agents.max_concurrent));
+    let scheduler = Arc::new(vortex_agents::Scheduler::new(
+        settings.agents.max_concurrent,
+    ));
     let browser = Arc::new(vortex_agents::browser::BrowserManager::new(
         paths.browser_profile(),
         true, // headless by default
@@ -84,7 +89,9 @@ async fn main() -> anyhow::Result<()> {
         if config.is_mock_llm() || settings.search.provider == "mock" {
             Some(Arc::new(vortex_agents::search::MockSearchProvider))
         } else if settings.search.is_configured() {
-            Some(Arc::new(vortex_agents::search::SearxngProvider::new(&settings.search.base_url)))
+            Some(Arc::new(vortex_agents::search::SearxngProvider::new(
+                &settings.search.base_url,
+            )))
         } else {
             tracing::info!("no search provider configured; research tools will say so honestly");
             None
@@ -153,22 +160,41 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
         .route("/{*path}", get(static_files::asset))
         // API
         .route("/api/health", get(routes_misc::health))
-        .route("/api/settings", get(routes_misc::get_settings).put(routes_misc::put_settings))
+        .route(
+            "/api/settings",
+            get(routes_misc::get_settings).put(routes_misc::put_settings),
+        )
         .route("/api/models", get(routes_misc::list_models))
         .route("/api/approvals", get(routes_misc::list_approvals))
-        .route("/api/approvals/{id}/decide", post(routes_misc::decide_approval))
+        .route(
+            "/api/approvals/{id}/decide",
+            post(routes_misc::decide_approval),
+        )
         .route("/api/workspace/check", get(routes_misc::check_workspace))
         .route("/api/previews", get(routes_misc::list_previews))
-        .route("/api/conversations", get(routes_conv::list_conversations).post(routes_conv::create_conversation))
-        .route("/api/conversations/{id}", axum::routing::patch(routes_conv::rename_conversation).delete(routes_conv::delete_conversation))
-        .route("/api/conversations/{id}/messages", get(routes_conv::get_messages))
+        .route(
+            "/api/conversations",
+            get(routes_conv::list_conversations).post(routes_conv::create_conversation),
+        )
+        .route(
+            "/api/conversations/{id}",
+            axum::routing::patch(routes_conv::rename_conversation)
+                .delete(routes_conv::delete_conversation),
+        )
+        .route(
+            "/api/conversations/{id}/messages",
+            get(routes_conv::get_messages),
+        )
         .route("/api/conversations/{id}/chat", post(routes_conv::post_chat))
         .route("/api/runs", get(routes_runs::list_runs))
         .route("/api/runs/{id}/events", get(routes_runs::run_events))
         .route("/api/runs/{id}/state", get(routes_runs::run_state))
         .route("/api/runs/{id}/stop", post(routes_runs::stop_run))
         .route("/api/runs/{id}/retry", post(routes_runs::retry_run))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), guard::guard))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            guard::guard,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
 }
@@ -219,4 +245,3 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
-

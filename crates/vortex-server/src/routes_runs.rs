@@ -7,11 +7,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use futures::stream; // for the fallback iterator
-use tokio_stream::StreamExt;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::Stream;
+use tokio_stream::StreamExt;
 use vortex_types::{Role, RunEvent, RunInfo, RunStatus};
 
 /// GET /api/runs/{id}/events — SSE stream of the run and its whole agent tree.
@@ -35,17 +35,19 @@ pub async fn run_events(
             error: None,
         };
         let stream = stream::iter(vec![Ok::<Event, Infallible>(
-            Event::default().json_data(event).expect("run event serializes"),
+            Event::default()
+                .json_data(event)
+                .expect("run event serializes"),
         )]);
         return sse_response(stream);
     };
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(ev) => Some(Ok(Event::default().json_data(ev).expect("run event serializes"))),
+        Ok(ev) => Some(Ok(Event::default()
+            .json_data(ev)
+            .expect("run event serializes"))),
         Err(_lagged) => {
             // Consumer lagged; hint the client to refresh its snapshot.
-            Some(Ok(Event::default()
-                .event("lagged")
-                .data("snapshot")))
+            Some(Ok(Event::default().event("lagged").data("snapshot")))
         }
     });
     sse_response(stream)
@@ -56,7 +58,11 @@ where
     S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
 {
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("ping"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
         .into_response()
 }
 
@@ -80,7 +86,11 @@ pub async fn run_state(
     let Some(run) = state.db.get_run(id.clone()).await.unwrap_or(None) else {
         return err_json(StatusCode::NOT_FOUND, "run not found");
     };
-    let children = state.db.list_child_runs(id.clone()).await.unwrap_or_default();
+    let children = state
+        .db
+        .list_child_runs(id.clone())
+        .await
+        .unwrap_or_default();
     let tool_calls = state.db.list_tool_calls(id).await.unwrap_or_default();
     Json(serde_json::json!({
         "run": run,
@@ -115,7 +125,11 @@ pub async fn retry_run(
     let Some(conv_id) = run.conversation_id.clone() else {
         return err_json(StatusCode::BAD_REQUEST, "run has no conversation to retry");
     };
-    let messages = state.db.get_messages(conv_id.clone()).await.unwrap_or_default();
+    let messages = state
+        .db
+        .get_messages(conv_id.clone())
+        .await
+        .unwrap_or_default();
     let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) else {
         return err_json(StatusCode::BAD_REQUEST, "no user message to retry");
     };

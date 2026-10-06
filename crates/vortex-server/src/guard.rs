@@ -32,7 +32,11 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
     // it must match the loopback origin (or any origin in LAN mode is rejected
     // unless it matches the LAN listen address).
     if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
-        if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        if let Some(origin) = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|o| o.to_str().ok())
+        {
             let ok = if lan {
                 true // token auth below is the real gate in LAN mode
             } else {
@@ -40,7 +44,9 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
                 matches!(o.split(':').next(), Some("127.0.0.1") | Some("localhost"))
             };
             if !ok {
-                return denied(format!("cross-origin request from '{origin}' is not allowed"));
+                return denied(format!(
+                    "cross-origin request from '{origin}' is not allowed"
+                ));
             }
         }
     }
@@ -56,14 +62,12 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
             .and_then(|a| a.strip_prefix("Bearer "))
             .map(|s| s.to_string())
             .or_else(|| {
-                req.uri()
-                    .query()
-                    .and_then(|q| {
-                        q.split('&').find_map(|kv| {
-                            let (k, v) = kv.split_once('=')?;
-                            (k == "token").then(|| urldecode(v))
-                        })
+                req.uri().query().and_then(|q| {
+                    q.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        (k == "token").then(|| urldecode(v))
                     })
+                })
             });
         match provided {
             Some(t) if t == *token => {}
@@ -75,7 +79,9 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
 }
 
 fn urldecode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string()
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 fn denied(msg: String) -> Response {

@@ -127,7 +127,6 @@ fn content_type(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[tokio::test]
     async fn static_preview_serves_confined_files() {
@@ -157,7 +156,7 @@ mod tests {
         let parsed = url::Url::parse(url).unwrap();
         let addr = format!("{}:{}", parsed.host_str().unwrap(), parsed.port().unwrap());
         let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let path = parsed.path().to_string() + if parsed.query().is_some() { "" } else { "" };
+        let path = parsed.path().to_string();
         let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = String::new();

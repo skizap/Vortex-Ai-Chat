@@ -1,7 +1,9 @@
 //! Global UI state (signals provided through Leptos context).
 
 use leptos::prelude::*;
-use vortex_types::{ApprovalInfo, Capabilities, ConversationSummary, PlanStep, RunStatus, Settings, StoredMessage};
+use vortex_types::{
+    ApprovalInfo, Capabilities, ConversationSummary, PlanStep, RunStatus, Settings, StoredMessage,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -32,7 +34,10 @@ pub struct AgentDisplay {
     pub usage: Option<vortex_types::Usage>,
 }
 
-#[derive(Clone)]
+/// All fields are Copy `RwSignal`s, so the context itself is `Copy` —
+/// required for Leptos 0.8 view closures (which re-run and must only
+/// capture `Copy` state).
+#[derive(Debug, Clone, Copy)]
 pub struct AppCtx {
     pub tab: RwSignal<Tab>,
     pub conversations: RwSignal<Vec<ConversationSummary>>,
@@ -89,11 +94,12 @@ impl AppCtx {
     pub fn set_toast(&self, msg: impl Into<String>) {
         let msg: String = msg.into();
         let toast = self.toast;
+        let for_timeout = msg.clone();
         toast.set(Some(msg));
         set_timeout(
             move || {
                 toast.update(|t| {
-                    if t.as_deref() == Some(msg.as_str()) {
+                    if t.as_deref() == Some(for_timeout.as_str()) {
                         *t = None;
                     }
                 });
