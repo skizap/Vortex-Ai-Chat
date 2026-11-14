@@ -27,6 +27,11 @@ struct PreviewHandle {
     running: bool,
     abort: CancellationToken,
     child_pid: Option<u32>,
+    /// The spawned dev-server child must be kept alive here: it is created
+    /// with `kill_on_drop(true)`, so dropping the handle would kill the
+    /// server immediately. Holding it also guarantees the process dies when
+    /// the handle is removed (run end / shutdown).
+    _child: Option<tokio::process::Child>,
 }
 
 impl Default for PreviewRegistry {
@@ -75,6 +80,7 @@ impl PreviewRegistry {
             running: true,
             abort,
             child_pid: None,
+            _child: None,
         });
         Ok(url)
     }
@@ -85,6 +91,7 @@ impl PreviewRegistry {
         root: PathBuf,
         url: String,
         pid: u32,
+        child: tokio::process::Child,
         cancel: CancellationToken,
     ) {
         self.inner.lock().expect("previews").push(PreviewHandle {
@@ -95,6 +102,7 @@ impl PreviewRegistry {
             running: true,
             abort: cancel,
             child_pid: Some(pid),
+            _child: Some(child),
         });
     }
 
@@ -161,5 +169,56 @@ impl PreviewRegistry {
                 running: p.running,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn attached_child_survives_registration_and_dies_on_stop() {
+        let registry = PreviewRegistry::new();
+        let child = {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn().expect("sleep spawns")
+        };
+        let pid = child.id().expect("child has a pid");
+        registry.attach_child(
+            "run-1",
+            PathBuf::from("/tmp"),
+            "http://127.0.0.1:0".to_string(),
+            pid,
+            child,
+            CancellationToken::new(),
+        );
+        // Regression: the spawning scope has ended; kill_on_drop must NOT
+        // have fired (the registry now owns the handle).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(alive(pid), "dev server was killed right after attach");
+
+        let id = registry.list()[0].id.clone();
+        assert!(registry.stop(&id));
+        for _ in 0..50 {
+            if !alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Dropping the handle (run end / shutdown) must also terminate it.
+        registry.stop_for_run("run-1");
+        assert!(!alive(pid), "dev server survived stop");
     }
 }

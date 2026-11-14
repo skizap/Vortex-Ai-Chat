@@ -138,7 +138,7 @@ threat model, permission model, and known limitations.
 ## Development
 
 ```bash
-cargo test                       # 43 tests (all offline: mocks + local servers)
+cargo test                       # 46 tests (all offline: mocks + local servers)
 cargo fmt --all -- --check
 cargo clippy --all-targets       # clean
 scripts/build-ui.sh              # WASM UI only (debug server reads ui-dist/ from disk)

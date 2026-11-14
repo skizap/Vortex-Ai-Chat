@@ -26,7 +26,7 @@ vortex-types   (shared serde DTOs: chat, events, settings; compiles to WASM)
 ## Commands
 
 ```bash
-cargo test                          # 43 tests, all offline (mocks + local test servers)
+cargo test                          # 46 tests, all offline (mocks + local test servers)
 cargo fmt --all -- --check          # must stay clean
 cargo clippy --all-targets          # must stay clean
 scripts/build-ui.sh                 # Trunk → crates/vortex-server/ui-dist (needs trunk + wasm-bindgen-cli)

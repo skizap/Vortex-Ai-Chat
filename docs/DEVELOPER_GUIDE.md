@@ -284,7 +284,7 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   overflow). `event:`/`id:` fields are ignored; multi-line `data:` events are
   not joined (spec deviation, `KNOWN_ISSUES.md` C24).
 - `mock.rs` — `MockLlm` with scripted `MockTurn`s (`text`, `tool_call`);
-  streams word-by-word with a 5 ms default delay; used by the 43-test
+  streams word-by-word with a 5 ms default delay; used by the 46-test
   offline suite. Cannot script failures (`KNOWN_ISSUES.md` C23).
 
 ### vortex-agents (`crates/vortex-agents/src/`)
@@ -337,9 +337,9 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
 - `preview.rs` / `preview_server.rs` / `tools_preview.rs` — static previews:
   small loopback-only Rust HTTP server (GET/HEAD, 16 KiB header cap, `..`
   rejected, canonicalized root-prefix guard, ephemeral port). Dev-server
-  previews: approval required, spawned in own process group, port parsed
-  from stdout (≤ 20 s, 8417 excluded), killed on run end/cancel/shutdown
-  (runtime bug: `KNOWN_ISSUES.md` C1).
+   previews: approval required, spawned in own process group, port parsed
+   from stdout (≤ 20 s, 8417 excluded), killed on run end/cancel/shutdown
+   (the registry owns the `Child` handle; see `KNOWN_ISSUES.md` C1, fixed).
 - `browser.rs` / `cdp.rs` / `tools_browser.rs` — Chromium detection in PATH
   (`VORTEX_CHROME_PATH` overrides); launched headless with isolated
   `--user-data-dir` under the XDG cache, own process group,
@@ -347,9 +347,10 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   loopback-only URLs accepted); minimal CDP client over websocket
   (Target.createTarget/attachToTarget, Page.navigate, Runtime.evaluate;
   per-command timeouts 10–30 s); one page per run, closed at run end.
-  Navigate/read restricted to http/https (`file://`, `chrome://` refused);
-  typing into password fields refused; login/CAPTCHA presence reported for
-  human handoff (runtime bug: `KNOWN_ISSUES.md` C1).
+   Navigate/read restricted to http/https (`file://`, `chrome://` refused);
+   typing into password fields refused; login/CAPTCHA presence reported for
+   human handoff (the manager owns the `Child` handle; see
+   `KNOWN_ISSUES.md` C1, fixed).
 - `safe_http.rs` / `html.rs` — SSRF guard for model-chosen URLs: http/https
   only; DNS resolved and **every** address checked against
   loopback/RFC1918/link-local/broadcast/ULA before connecting; redirects
@@ -548,12 +549,12 @@ Per run (`engine.rs`, see §7):
 ## 12. Testing
 
 ```bash
-cargo test        # 43 tests, fully offline
+cargo test        # 46 tests, fully offline
 ```
 
 | Suite | Count | Covers |
 | --- | --- | --- |
-| `vortex-agents` unit tests | 21 | workspace confinement (`..`, absolute-outside, symlink escape/inside), registry gating, scheduler limits/release-on-drop, safe_http IP classification, schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership |
+| `vortex-agents` unit tests | 24 | workspace confinement (`..`, absolute-outside, symlink escape/inside, dangling-symlink rejection), registry gating, scheduler limits/release-on-drop, safe_http IP classification, schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership, preview child-process lifecycle regression (survives attach, dies on stop) |
 | `vortex-agents/tests/engine.rs` | 5 | end-to-end runs against `MockLlm`: tool round-trips, sub-agent concurrency (exactly 6 under limit 6), permission inheritance (child can't widen), cancellation propagating to sub-agents, budget exhaustion |
 | `vortex-core` unit tests | 8 | config parsing (TOML, LAN entry), path overrides, conversation/message/settings roundtrips, run status updates, tool calls, approvals lifecycle, checkpoints |
 | `vortex-llm` unit + `tests/openrouter.rs` | 1 + 8 | SSE parser (chunk splits, CRLF); OpenRouter client against a local mock HTTP server: streaming text, tool-call delta accumulation, auth error without retry, 429 retry-then-success, missing key, malformed stream, missing `[DONE]`, model-not-found without retry |
@@ -578,10 +579,10 @@ and [`SECURITY.md`](SECURITY.md)):
 - **A real OpenRouter API key is required** for any real use; without one
   the server starts but chat returns 503. The mock provider is a plumbing
   test harness only.
-- **Browser tools and dev-server previews are currently broken at runtime**
-  (spawned processes are killed immediately after launch — `KNOWN_ISSUES.md`
-  C1). Static previews, files, commands, search, chat, and sub-agents are
-  unaffected.
+- Browser tools and dev-server previews were broken at runtime (spawned
+  processes were killed immediately after launch — `KNOWN_ISSUES.md` C1,
+  **fixed** with regression tests; live browser verification still requires
+  a machine with Chromium installed).
 - Live OpenRouter streaming has only been verified against a
   protocol-faithful local mock; real-provider framing differences are
   possible (P14).

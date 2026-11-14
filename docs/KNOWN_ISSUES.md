@@ -16,7 +16,15 @@ no code was changed. Severity notes are informational.
 
 ## Confirmed issues
 
-### C1. Chromium and dev-server previews are killed immediately after launch (critical)
+### C1. Chromium and dev-server previews are killed immediately after launch (critical) — **FIXED**
+
+**Status.** Fixed: `BrowserProcess` and `PreviewHandle` now own the
+`tokio::process::Child` (kept alive for the manager/registry lifetime,
+killed on drop as intended), `attach_child` takes the handle, and the
+`pid.unwrap()` panic paths were replaced with proper errors. Regression
+test: `attached_child_survives_registration_and_dies_on_stop`
+(`crates/vortex-agents/src/preview.rs`). Browser-side runtime behavior
+still requires Chromium to verify live.
 
 **Description.** Both process-spawning paths set `.kill_on_drop(true)` and then
 drop the `tokio::process::Child` handle when the launching function returns.
@@ -50,7 +58,13 @@ Chromium being installed).
 (or drop `kill_on_drop` and rely solely on the existing process-group kill
 paths, which already exist for shutdown/cancel).
 
-### C2. Workspace confinement: dangling-symlink write escape (security)
+### C2. Workspace confinement: dangling-symlink write escape (security) — **FIXED**
+
+**Status.** Fixed: `WorkspaceRoots::resolve` now rejects any component that
+fails canonicalization but is itself a symlink (dangling or unresolvable),
+while plain missing components remain allowed so write tools can create new
+files (`crates/vortex-agents/src/workspace.rs`). Regression tests:
+`rejects_dangling_symlink_escape`, `allows_missing_path_for_creation`.
 
 **Description.** `WorkspaceRoots::resolve` canonicalizes each path component
 only *if canonicalization succeeds*; a symlink whose target does not exist
@@ -474,11 +488,12 @@ locks (e.g., `hub.rs:39,42,116,126,141,144,147`; `db.rs:45,54,58`). A panic
 inside a critical section poisons the mutex and turns every later access into
 a panic.
 
-### P7. Chromium launch failure panics inside `page_for`
+### P7. Chromium launch failure panics inside `page_for` — partially fixed
 
-`pid.unwrap()` and `.expect("stderr piped")` (`browser.rs:112-124`): if the
-binary exits instantly, the tool task panics (caught by the engine) and
-browser calls fail with a generic tool failure instead of a diagnostic.
+Fixed alongside C1: `pid.unwrap()` in `browser.rs` and `tools_preview.rs`
+was replaced with proper `ToolError`s. `.expect("stderr piped")` remains
+(safe: `Stdio::piped()` is set unconditionally); `tools_command.rs:176`
+still indexes `argv[0]` without an empty check in a `pub fn`.
 
 ### P8. `run_command` output drain has no deadline after normal exit
 

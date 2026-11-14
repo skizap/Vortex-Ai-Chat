@@ -76,14 +76,34 @@ impl WorkspaceRoots {
             match comp {
                 Component::Normal(part) => {
                     current.push(part);
-                    if let Ok(canonical) = std::fs::canonicalize(&current) {
-                        if !canonical.starts_with(&self.root) {
-                            return Err(ToolError::NotPermitted(format!(
-                                "path '{}' resolves outside the approved workspace (symlink escape)",
-                                user_path
-                            )));
+                    match std::fs::canonicalize(&current) {
+                        Ok(canonical) => {
+                            if !canonical.starts_with(&self.root) {
+                                return Err(ToolError::NotPermitted(format!(
+                                    "path '{}' resolves outside the approved workspace (symlink escape)",
+                                    user_path
+                                )));
+                            }
+                            current = canonical;
                         }
-                        current = canonical;
+                        Err(_) => {
+                            // Canonicalization can fail for a *dangling symlink*:
+                            // the link exists but its target does not, so there is
+                            // no canonical path to check. Writing through it would
+                            // follow the link and create/overwrite the target
+                            // wherever it points — possibly outside the workspace —
+                            // so refuse it. Plain missing components are fine
+                            // (write tools create them).
+                            if let Ok(meta) = std::fs::symlink_metadata(&current) {
+                                if meta.file_type().is_symlink() {
+                                    return Err(ToolError::NotPermitted(format!(
+                                        "path '{}' contains an unresolvable symlink (its target \
+                                         does not exist); refusing to follow it",
+                                        user_path
+                                    )));
+                                }
+                            }
+                        }
                     }
                 }
                 Component::CurDir => {}
@@ -155,6 +175,35 @@ mod tests {
         std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
         let roots = WorkspaceRoots::new(dir.path()).unwrap();
         let p = roots.resolve("link/f.txt").unwrap();
+        assert!(p.starts_with(roots.root()));
+    }
+
+    #[test]
+    fn rejects_dangling_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        // Target deliberately does not exist: canonicalize() fails on it, and
+        // a write through the link would create it outside the workspace.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            dir.path().join("outside-target-missing"),
+            dir.path().join("ws/evil"),
+        )
+        .unwrap();
+        let roots = WorkspaceRoots::new(&dir.path().join("ws")).unwrap();
+        let err = roots.resolve("evil").unwrap_err();
+        assert!(
+            err.to_string().contains("unresolvable symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(roots.resolve("evil/nested.txt").is_err());
+        assert!(!dir.path().join("outside-target-missing").exists());
+    }
+
+    #[test]
+    fn allows_missing_path_for_creation() {
+        let (_d, roots) = setup();
+        let p = roots.resolve("brand/new/file.txt").unwrap();
         assert!(p.starts_with(roots.root()));
     }
 }

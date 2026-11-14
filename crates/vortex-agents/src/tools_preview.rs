@@ -126,12 +126,12 @@ async fn run_process_preview(
     let mut child = proc
         .spawn()
         .map_err(|e| ToolError::Execution(format!("starting dev server: {e}")))?;
-    let pid = child.id();
+    let pid = child
+        .id()
+        .ok_or_else(|| ToolError::Execution("dev server exited immediately after launch".into()))?;
     let port = wait_for_port(&mut child).await;
     let Some(port) = port else {
-        if let Some(pid) = pid {
-            kill_process_group(pid as i32).await;
-        }
+        kill_process_group(pid as i32).await;
         return Err(ToolError::Execution(
             "could not detect the dev server port. Ensure the command binds to 127.0.0.1 and \
              prints its URL/port."
@@ -139,11 +139,15 @@ async fn run_process_preview(
         ));
     };
     let url = format!("http://127.0.0.1:{port}");
+    // The registry takes ownership of the child handle: dropping it here
+    // would kill the server (kill_on_drop), which used to happen the moment
+    // this function returned.
     registry.attach_child(
         &ctx.run_id,
         root,
         url.clone(),
-        pid.unwrap() as u32,
+        pid,
+        child,
         ctx.cancel.clone(),
     );
     Ok(ToolResult {
