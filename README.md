@@ -25,6 +25,10 @@ No Python and no Node.js are used or required by the assistant itself.
 
 ## Setup
 
+**A real OpenRouter API key is required** — the assistant cannot function
+without one. Create an account at <https://openrouter.ai/keys>, generate a
+key, and put it in `.env` as shown below.
+
 ```bash
 git clone https://github.com/skizap/Vortex-Ai-Chat.git
 cd Vortex-Ai-Chat
@@ -38,15 +42,23 @@ scripts/build-release.sh      # builds WASM UI + native release binary
 `.env` is loaded from the working directory at startup; environment variables
 take precedence over `config.toml`, which lives under `~/.config/vortex/`.
 
-### Testing without credentials
+> **Fresh clone?** The built UI assets (`crates/vortex-server/ui-dist/`) are
+> not tracked by Git. Until you run `scripts/build-ui.sh` (included in
+> `build-release.sh`), the server serves a placeholder page explaining this.
+> For a dev workflow, see `docs/DEVELOPER_GUIDE.md` §3.
+
+### Offline test harness (not a way to use the assistant)
 
 ```bash
 VORTEX_LLM=mock ./target/release/vortex-server
 ```
 
-runs against a built-in mock provider (no network, no key): `VORTEX_MOCK_SCRIPT=echo`
-echoes your message; `VORTEX_MOCK_SCRIPT=tools` performs a real web_search tool
-round-trip so the whole tool pipeline can be exercised offline.
+runs against a built-in mock provider (no network, no key). It exists solely
+to exercise the request/tool/SSE plumbing offline for development and tests:
+`VORTEX_MOCK_SCRIPT=echo` echoes your message; `VORTEX_MOCK_SCRIPT=tools`
+performs a scripted web_search tool round-trip. The mock produces canned
+text with no model behind it — it does **not** provide real chat, research,
+or coding functionality and is **not** a substitute for an API key.
 
 ## Storage locations (XDG)
 
@@ -113,13 +125,23 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate layout, data
 flow, and the agent loop; see [`docs/SECURITY.md`](docs/SECURITY.md) for the
 threat model, permission model, and known limitations.
 
+## Documentation
+
+- [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) — full developer
+  guide: setup, running locally, component walkthroughs, HTTP API reference,
+  data model, agent-loop semantics, testing.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — confirmed issues and
+  possible concerns from the latest source analysis, with file:line evidence.
+- [`AGENTS.md`](AGENTS.md) — orientation for AI agents working in this repo
+  (commands, toolchain pins, invariants, gotchas).
+
 ## Development
 
 ```bash
 cargo test                       # 43 tests (all offline: mocks + local servers)
 cargo fmt --all -- --check
 cargo clippy --all-targets       # clean
-scripts/build-ui.sh              # WASM UI only
+scripts/build-ui.sh              # WASM UI only (debug server reads ui-dist/ from disk)
 cargo build --release -p vortex-server
 ```
 
