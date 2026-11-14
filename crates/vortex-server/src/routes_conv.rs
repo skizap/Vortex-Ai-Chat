@@ -110,14 +110,7 @@ pub async fn post_chat(
     if content.len() > 100_000 {
         return bad("message too long (max 100KB)");
     }
-    let Some(conversation) = state
-        .db
-        .list_conversations()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .find(|c| c.id == id)
-    else {
+    let Some(conversation) = state.db.get_conversation(id.clone()).await.unwrap_or(None) else {
         return err_json(StatusCode::NOT_FOUND, "conversation not found");
     };
     let mode = body.mode.unwrap_or(conversation.mode);

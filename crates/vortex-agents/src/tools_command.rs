@@ -173,7 +173,15 @@ pub async fn run_command_scoped(
     max_output: usize,
 ) -> Result<(String, String), ToolError> {
     use tokio::io::AsyncReadExt;
-    let binary = resolve_binary(&argv[0])?;
+    // `argv[0]` without an emptiness check would panic on an empty slice;
+    // this is a pub fn reachable from the preview tool.
+    let Some(binary_name) = argv.first() else {
+        return Err(ToolError::InvalidArgs(
+            "cmd".into(),
+            "argv must not be empty".into(),
+        ));
+    };
+    let binary = resolve_binary(binary_name)?;
     let mut cmd = tokio::process::Command::new(&binary);
     cmd.args(&argv[1..])
         .current_dir(cwd)
@@ -185,7 +193,7 @@ pub async fn run_command_scoped(
     cmd.process_group(0);
     let mut child = cmd
         .spawn()
-        .map_err(|e| ToolError::Execution(format!("spawning {}: {e}", argv[0])))?;
+        .map_err(|e| ToolError::Execution(format!("spawning {binary_name}: {e}")))?;
     let pid = child.id();
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
@@ -207,9 +215,19 @@ pub async fn run_command_scoped(
             return Err(ToolError::Timeout);
         }
     };
-    // Drain remaining output after exit (bounded).
-    let _ = stdout.read_to_end(&mut out_buf).await;
-    let _ = stderr.read_to_end(&mut err_buf).await;
+    // Drain remaining output after exit (bounded, with a deadline): a
+    // grandchild that inherited the pipes and never exits must not stall
+    // the tool forever after the direct child is gone.
+    let drain = async {
+        let _ = stdout.read_to_end(&mut out_buf).await;
+        let _ = stderr.read_to_end(&mut err_buf).await;
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("output drain timed out; a child process may still hold the pipes open");
+    }
     if out_buf.len() > max_output {
         out_buf.truncate(max_output);
     }

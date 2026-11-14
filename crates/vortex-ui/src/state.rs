@@ -51,6 +51,10 @@ pub struct AppCtx {
     // Active run state
     pub run_id: RwSignal<Option<String>>,
     pub stream_text: RwSignal<String>,
+    /// Throttled mirror of `stream_text` for the streaming bubble: updated at
+    /// most every 125 ms (App-level interval), so markdown + syntax highlight
+    /// re-render ≤8×/s instead of on every SSE delta.
+    pub stream_display: RwSignal<String>,
     pub run_status: RwSignal<Option<RunStatus>>,
     pub plan: RwSignal<Vec<PlanStep>>,
     pub tool_calls: RwSignal<Vec<ToolCallDisplay>>,
@@ -73,6 +77,7 @@ impl AppCtx {
             toast: RwSignal::new(None),
             run_id: RwSignal::new(None),
             stream_text: RwSignal::new(String::new()),
+            stream_display: RwSignal::new(String::new()),
             run_status: RwSignal::new(None),
             plan: RwSignal::new(Vec::new()),
             tool_calls: RwSignal::new(Vec::new()),
@@ -80,12 +85,19 @@ impl AppCtx {
             approvals: RwSignal::new(Vec::new()),
             error_banner: RwSignal::new(None),
         };
-        // Default the mode from the persisted settings once loaded.
+        // Default the mode from the persisted settings on FIRST load only.
+        // Re-applying on every settings write used to reset the user's mode
+        // selection mid-conversation (e.g. after a theme toggle saved
+        // settings, the response overwrote the mode signal).
         let settings_sig = ctx.settings;
         let mode_sig = ctx.mode;
+        let initialized = std::cell::Cell::new(false);
         Effect::new(move || {
             if let Some(s) = settings_sig.get() {
-                mode_sig.set(s.default_mode);
+                if !initialized.get() {
+                    initialized.set(true);
+                    mode_sig.set(s.default_mode);
+                }
             }
         });
         ctx
@@ -117,9 +129,10 @@ impl Default for AppCtx {
 
 /// Apply the theme on the <html> element and persist it locally.
 pub fn apply_theme(theme: vortex_types::Theme) {
-    let doc = web_sys::window()
-        .and_then(|w| w.document())
-        .expect("document available");
+    // No document (e.g. non-browser context): nothing to theme, don't trap.
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
     if let Some(html) = doc.document_element() {
         let _ = html.set_attribute(
             "data-theme",

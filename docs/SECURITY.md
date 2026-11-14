@@ -23,10 +23,13 @@
   for SSE) on every request. A warning is logged at startup.
 - **SSRF:** model-chosen URLs may only use http/https; loopback, private
   (RFC1918), link-local, and unique-local addresses are refused — including
-  after DNS resolution and on every redirect hop. Only the user-configured
-  search provider may live on the local network. Residual risk: TOCTOU DNS
-  rebinding between check and connect (standard for proxy-less fetchers;
-  documented, not hidden).
+  IPv4-mapped IPv6 forms, after DNS resolution, and on every redirect hop.
+  Connections are **IP-pinned**: DNS is resolved once per hop, every
+  resolved address is validated, and the request connects to a validated
+  address via a per-request resolver override (TLS SNI/certificate checks
+  still use the hostname), closing the TOCTOU DNS-rebinding window between
+  validation and connect. Only the user-configured search provider may live
+  on the local network (it keeps a shared unpinned client by design).
 
 ## Secrets
 
@@ -89,7 +92,7 @@ please open a private issue; do not publish against instances you do not own.
 - Live OpenRouter endpoints were exercised against a protocol-faithful local
   mock; behavior differences of real providers (e.g., unusual SSE framing)
   may surface and would be surfaced as clear errors, not silent failures.
-- The LAN mode token is compared with constant-time-adjacent string
-  comparison; for a home-LAN threat model this is acceptable, but it is not a
-  substitute for TLS, which LAN mode does not provide.
+- The LAN mode token is compared in constant time (byte-wise XOR fold;
+  length mismatch is inherently revealed); it is still not a substitute for
+  TLS, which LAN mode does not provide.
 - Wayland/X11 desktop automation is not implemented.

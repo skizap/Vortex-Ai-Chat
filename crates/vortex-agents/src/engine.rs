@@ -263,7 +263,21 @@ impl Engine {
         };
 
         let result = self.run_loop(&spec, ctx, deadline).await;
-        fwd.abort();
+        // Drain instead of abort: `run_loop` owns `ctx` and every tool task is
+        // joined inside `execute_tool_calls`, so all `ctx.events` senders are
+        // dropped by the time `run_loop` returns — the forwarder delivers
+        // queued tool events and exits on its own, guaranteeing `finish()`
+        // publishes `RunFinished` strictly last. The timeout bounds the drain
+        // in case a future change ever lets a `ToolContext` clone outlive the
+        // run loop (nothing does today).
+        let mut fwd = fwd;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut fwd)
+            .await
+            .is_err()
+        {
+            tracing::warn!("tool-event forwarder did not drain within 2s; aborting it");
+            fwd.abort();
+        }
 
         match &result {
             Ok(_) => self.finish(&run_id, RunStatus::Completed, None).await,
@@ -286,7 +300,10 @@ impl Engine {
     async fn persist_status(&self, run_id: &str, status: RunStatus, error: Option<String>) {
         let (usage, plan) = match self.hub.get(run_id) {
             Some(h) => {
-                let m = h.meta.lock().expect("run meta");
+                let m = h
+                    .meta
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (Some(m.usage), Some(m.plan.clone()))
             }
             None => (None, None),
@@ -409,12 +426,28 @@ impl Engine {
         let tools_schema = self.registry.schemas(&spec.allowed);
 
         for _iteration in 0..settings.agents.max_iterations.max(1) {
+            // Token budget is enforced *before* each provider call, and the
+            // request's own `max_tokens` is clamped to what remains, so a
+            // single huge completion cannot overshoot the run budget by more
+            // than one clamped completion. The post-tool check below stays as
+            // a backstop.
+            let remaining = settings
+                .agents
+                .max_total_tokens
+                .saturating_sub(total_usage.total_tokens);
+            if remaining == 0 {
+                return Err(RunError::Failed(
+                    "token budget exhausted before the next model call; summarize progress".into(),
+                ));
+            }
             let req = CompletionRequest {
                 model: spec.model.clone(),
                 messages: messages.clone(),
                 tools: tools_schema.clone(),
                 temperature: settings.temperature,
-                max_tokens: settings.max_tokens,
+                max_tokens: settings
+                    .max_tokens
+                    .min(remaining.min(u64::from(u32::MAX)) as u32),
             };
             let (llm_tx, mut llm_rx) = mpsc::channel::<LlmEvent>(256);
             let fwd = {
@@ -433,24 +466,35 @@ impl Engine {
                 })
             };
             let llm = self.llm.clone();
-            let call = tokio::spawn(async move { llm.complete(&req, llm_tx).await });
+            let mut call = tokio::spawn(async move { llm.complete(&req, llm_tx).await });
             let resp = tokio::select! {
-                r = call => r.map_err(|e| RunError::Failed(format!("provider task failed: {e}")))?.map_err(|e| RunError::Failed(e.to_string())),
+                r = &mut call => r.map_err(|e| RunError::Failed(format!("provider task failed: {e}")))?.map_err(|e| RunError::Failed(e.to_string())),
                 _ = spec.cancel.cancelled() => {
+                    // Abort the provider task: merely dropping the JoinHandle
+                    // would leave the completion running detached, consuming
+                    // (and billing) the stream after cancellation.
+                    call.abort();
                     fwd.abort();
                     return Err(RunError::Cancelled);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    call.abort();
                     fwd.abort();
                     return Err(RunError::Failed("run time budget exceeded".into()));
                 }
             };
-            fwd.abort();
+            // The provider task has finished and dropped its `llm_tx`, so the
+            // delta forwarder drains whatever is queued and exits on its own:
+            // no tail deltas are lost (previously `fwd.abort()` dropped them).
+            let _ = fwd.await;
             let resp = resp?;
             if let Some(u) = resp.usage {
                 total_usage = total_usage + u;
                 if let Some(h) = self.hub.get(&run_id) {
-                    h.meta.lock().expect("run meta").usage = total_usage;
+                    h.meta
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .usage = total_usage;
                 }
                 self.hub.publish(
                     &run_id,
@@ -471,15 +515,28 @@ impl Engine {
                     .await;
             }
 
+            // Normalize provider tool-call ids once, before anything consumes
+            // them: strict OpenAI-compatible APIs reject an empty
+            // `tool_call_id` on the follow-up request, and Started/Finished
+            // events plus DB rows need one stable id per call (previously
+            // Started used a generated UUID while Finished used "", leaving
+            // UI tool rows stuck on "running…" forever).
+            let mut tool_calls = resp.tool_calls;
+            for tc in tool_calls.iter_mut() {
+                if tc.id.trim().is_empty() {
+                    tc.id = uuid::Uuid::new_v4().to_string();
+                }
+            }
+
             messages.push(ChatMessage {
                 role: vortex_types::Role::Assistant,
                 content: resp.content.clone(),
-                tool_calls: resp.tool_calls.clone(),
+                tool_calls: tool_calls.clone(),
                 tool_call_id: None,
                 tool_name: None,
             });
 
-            if resp.tool_calls.is_empty() {
+            if tool_calls.is_empty() {
                 if spec.is_root {
                     if let Some(conv) = &spec.conversation_id {
                         let _ = self
@@ -492,27 +549,20 @@ impl Engine {
                 return Ok(resp.content);
             }
 
-            let outcomes = self
-                .execute_tool_calls(&run_id, &ctx, &resp.tool_calls)
-                .await;
-            for (tc, outcome) in resp.tool_calls.iter().zip(outcomes) {
-                let call_id = if tc.id.is_empty() {
-                    String::new()
-                } else {
-                    tc.id.clone()
-                };
+            let outcomes = self.execute_tool_calls(&run_id, &ctx, &tool_calls).await;
+            for (tc, outcome) in tool_calls.iter().zip(outcomes) {
                 self.hub.publish(
                     &run_id,
                     RunEvent::ToolCallFinished {
                         run_id: run_id.clone(),
-                        call_id: call_id.clone(),
+                        call_id: tc.id.clone(),
                         ok: outcome.ok,
                         summary: outcome.result.summary.clone(),
                         diff: outcome.result.diff.clone(),
                     },
                 );
                 messages.push(ChatMessage::tool_result(
-                    call_id,
+                    tc.id.clone(),
                     tc.name.clone(),
                     outcome.result.text,
                 ));
@@ -534,19 +584,28 @@ impl Engine {
 
 impl Engine {
     /// Validate, persist, and execute one turn's tool calls concurrently.
+    /// Call ids are computed once so the Started event, the DB row and the
+    /// finished-state update always refer to the same id.
     async fn execute_tool_calls(
         self: &Arc<Self>,
         run_id: &str,
         ctx: &ToolContext,
         tool_calls: &[vortex_types::ToolCall],
     ) -> Vec<crate::registry::ToolOutcome> {
+        // Ids are normalized upstream in run_loop; this fallback keeps
+        // Started/Finished consistent even if an empty id ever slips through.
+        let ids: Vec<String> = tool_calls
+            .iter()
+            .map(|tc| {
+                if tc.id.trim().is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    tc.id.clone()
+                }
+            })
+            .collect();
         let mut tasks = Vec::new();
-        for tc in tool_calls {
-            let call_id = if tc.id.is_empty() {
-                uuid::Uuid::new_v4().to_string()
-            } else {
-                tc.id.clone()
-            };
+        for (tc, call_id) in tool_calls.iter().zip(ids.iter()) {
             let args: serde_json::Value =
                 serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
             self.hub.publish(
@@ -587,21 +646,19 @@ impl Engine {
                     diff: None,
                 },
             });
-            if let Some(tc) = tool_calls.get(i) {
-                if !tc.id.is_empty() {
-                    let _ = self
-                        .db
-                        .add_tool_call(&ToolCallRecord {
-                            id: tc.id.clone(),
-                            run_id: run_id.to_string(),
-                            tool: tc.name.clone(),
-                            args: serde_json::Value::Null,
-                            ok: outcome.ok,
-                            summary: outcome.result.summary.clone(),
-                            created_at: vortex_core::db::now(),
-                        })
-                        .await;
-                }
+            if let (Some(tc), Some(call_id)) = (tool_calls.get(i), ids.get(i)) {
+                let _ = self
+                    .db
+                    .add_tool_call(&ToolCallRecord {
+                        id: call_id.clone(),
+                        run_id: run_id.to_string(),
+                        tool: tc.name.clone(),
+                        args: serde_json::Value::Null,
+                        ok: outcome.ok,
+                        summary: outcome.result.summary.clone(),
+                        created_at: vortex_core::db::now(),
+                    })
+                    .await;
             }
             out.push(outcome);
         }

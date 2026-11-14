@@ -73,12 +73,15 @@ pub fn Sidebar() -> impl IntoView {
                                             if let Some(new) = new.filter(|s| !s.trim().is_empty()) {
                                                 let id = id.clone();
                                                 spawn_local(async move {
-                                                    if api::rename_conversation(&id, &new).await.is_ok() {
-                                                        ctx.conversations.update(|l| {
-                                                            for c in l.iter_mut() {
-                                                                if c.id == id { c.title = new.clone(); }
-                                                            }
-                                                        });
+                                                    match api::rename_conversation(&id, &new).await {
+                                                        Ok(()) => {
+                                                            ctx.conversations.update(|l| {
+                                                                for c in l.iter_mut() {
+                                                                    if c.id == id { c.title = new.clone(); }
+                                                                }
+                                                            });
+                                                        }
+                                                        Err(e) => ctx.set_toast(format!("rename failed: {e}")),
                                                     }
                                                 });
                                             }
@@ -90,12 +93,17 @@ pub fn Sidebar() -> impl IntoView {
                                         move |_| {
                                             let id = id.clone();
                                             spawn_local(async move {
-                                                if api::delete_conversation(&id).await.is_ok() {
-                                                    ctx.conversations.update(|l| l.retain(|c| c.id != id));
-                                                    if ctx.current.get_untracked().as_deref() == Some(id.as_str()) {
-                                                        ctx.current.set(None);
-                                                        ctx.messages.set(Vec::new());
+                                                match api::delete_conversation(&id).await {
+                                                    Ok(()) => {
+                                                        ctx.conversations.update(|l| l.retain(|c| c.id != id));
+                                                        if ctx.current.get_untracked().as_deref() == Some(id.as_str()) {
+                                                            ctx.current.set(None);
+                                                            ctx.messages.set(Vec::new());
+                                                            ctx.run_id.set(None);
+                                                            crate::sse::close_subscription();
+                                                        }
                                                     }
+                                                    Err(e) => ctx.set_toast(format!("delete failed: {e}")),
                                                 }
                                             });
                                         }
@@ -118,11 +126,18 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
             on:click=move |_| {
                 ctx.current.set(Some(conv_id.clone()));
                 ctx.stream_text.set(String::new());
+                ctx.stream_display.set(String::new());
                 ctx.plan.set(Vec::new());
                 ctx.tool_calls.set(Vec::new());
                 ctx.agents.set(Vec::new());
                 ctx.run_status.set(None);
                 ctx.error_banner.set(None);
+                // Clear the active run and close its SSE subscription: Stop/
+                // Retry read run_id, and without this they would act on the
+                // previous conversation's run (streaming its events into the
+                // newly opened conversation's panels).
+                ctx.run_id.set(None);
+                crate::sse::close_subscription();
                 let id = conv_id.clone();
                 spawn_local(async move {
                     match api::messages(&id).await {
@@ -130,7 +145,8 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
                         Err(e) => ctx.set_toast(format!("could not load messages: {e}")),
                     }
                     if let Ok(runs) = api::runs_for_conversation(&id).await {
-                        if let Some(latest) = runs.first() {
+                        // Runs come back oldest-first; the latest run is last.
+                        if let Some(latest) = runs.last() {
                             if let Ok(snap) = api::run_state(&latest.id).await {
                                 let agents = snap.agents;
                                 let calls: Vec<crate::state::ToolCallDisplay> = snap

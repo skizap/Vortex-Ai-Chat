@@ -70,12 +70,27 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
                 })
             });
         match provided {
-            Some(t) if t == *token => {}
+            Some(t) if ct_eq(t.as_bytes(), token.as_bytes()) => {}
             _ => return denied("missing or invalid LAN access token".to_string()),
         }
     }
 
     next.run(req).await
+}
+
+/// Constant-time equality for the LAN token: `==` on strings short-circuits
+/// on the first differing byte, which leaks token prefix information through
+/// response timing. Length mismatch is inherently revealed (unavoidable
+/// without a MAC); the byte loop itself always runs to completion.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn urldecode(s: &str) -> String {
@@ -90,4 +105,20 @@ fn denied(msg: String) -> Response {
         axum::Json(serde_json::json!({ "error": msg })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn constant_time_equality_matches_str_eq_semantics() {
+        assert!(ct_eq(b"secret-token", b"secret-token"));
+        assert!(!ct_eq(b"secret-token", b"secret-tokem"));
+        assert!(!ct_eq(b"secret-token", b"secret"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
+        // Same prefix, differing length must not match.
+        assert!(!ct_eq(b"abc", b"abcd"));
+    }
 }

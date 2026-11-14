@@ -26,7 +26,7 @@ vortex-types   (shared serde DTOs: chat, events, settings; compiles to WASM)
 ## Commands
 
 ```bash
-cargo test                          # 46 tests, all offline (mocks + local test servers)
+cargo test                          # 105 tests, all offline (mocks + local test servers; +1 #[ignore]d live-provider smoke)
 cargo fmt --all -- --check          # must stay clean
 cargo clippy --all-targets          # must stay clean
 scripts/build-ui.sh                 # Trunk → crates/vortex-server/ui-dist (needs trunk + wasm-bindgen-cli)
@@ -50,19 +50,19 @@ Native `cargo build/test/clippy` from the workspace root **never touches `vortex
 2. **Workspace confinement.** File tools are refused until a workspace root is set; paths are resolved/canonicalized inside it; `..` and symlink escapes are rejected; writes are mutex-serialized with cross-run ownership and checkpoints (`crates/vortex-agents/src/workspace.rs`).
 3. **Approval gating.** `Risk::Consequential` actions always route through the human approval gate regardless of permission profile or agent depth; the only resolution path is `POST /api/approvals/{id}/decide`; timeout auto-denies (`crates/vortex-agents/src/registry.rs`, `approvals.rs`). Models have no path to approval.
 4. **Sub-agent caps.** Concurrency is enforced server-side by the scheduler semaphore (default 6, ceiling `AgentSettings::MAX_LIMIT_CEILING = 16`), never by prompts; nested agents share the same global gate; sub-agents inherit at most the coordinator's tool set.
-5. **SSRF defenses.** Model-chosen URLs: http/https only; loopback/private/link-local refused after DNS resolution and on every redirect hop (`crates/vortex-agents/src/safe_http.rs`).
+5. **SSRF defenses.** Model-chosen URLs: http/https only; loopback/private/link-local refused after DNS resolution and on every redirect hop; connections are IP-pinned to a validated address per hop (`crates/vortex-agents/src/safe_http.rs`).
 6. **Secrets.** `.env` is gitignored — never commit it, never print `OPENROUTER_API_KEY`, never log request headers/bodies, never put keys in error messages or docs.
 7. **Interrupted-run honesty.** Runs live at process exit are marked `interrupted` at startup; nothing consequential is ever replayed automatically (`crates/vortex-core/src/db.rs`).
 
 ## Gotchas
 
-- **`crates/vortex-server/ui-dist/` is gitignored and untracked.** A fresh clone has no UI assets; the server still compiles (build.rs writes a placeholder `index.html`) and serves an instructional placeholder page until `scripts/build-ui.sh` runs. The `.gitkeep` referenced by `.gitignore` does not exist.
+- **`crates/vortex-server/ui-dist/` is gitignored and untracked.** A fresh clone has no UI assets; the server still compiles (build.rs writes a placeholder `index.html`) and serves an instructional placeholder page until `scripts/build-ui.sh` runs. The directory is ignored wholesale — Trunk empties it on every build, so no sentinel file can be tracked inside it.
 - **Debug vs release asset serving.** `rust-embed` reads `ui-dist/` **from disk** in debug builds (UI rebuilds appear on refresh without recompiling the server) but **embeds at compile time** in release builds (must rebuild the server after UI changes).
-- **`vortex-ui` is outside `default-members`** — workspace-wide cargo commands silently skip it; CI-less repo, so run UI builds/lints explicitly.
+- **`vortex-ui` is outside `default-members`** — workspace-wide cargo commands silently skip it; CI (`.github/workflows/ci.yml`) lints both targets, but run UI builds/lints explicitly when iterating locally.
 - **wasm-bindgen version drift** breaks `scripts/build-ui.sh` — check `Cargo.lock` after any dependency bump.
 - **Mock LLM is opt-in** via `VORTEX_LLM=mock` (`VORTEX_MOCK_SCRIPT=echo|tools`). Without a key and without the mock, the server still starts (to show setup guidance) but `POST /api/conversations/{id}/chat` returns 503.
 - **Settings live in SQLite** (`~/.local/share/vortex/data/vortex.db`); boot config lives in `~/.config/vortex/config.toml` + `.env`/env vars. Precedence: env vars > `.env` > `config.toml`.
-- No CI (`.github/` absent), no `LICENSE` file (README/Cargo.toml claim MIT), `main` branch is stale — work happens on `feat/rust-linux-ai-assistant`.
+- CI lives at `.github/workflows/ci.yml` (fmt, clippy native + wasm, tests, Trunk build); a `LICENSE` (MIT) file now matches README/Cargo.toml. `main` branch is still stale — work happens on `feat/rust-linux-ai-assistant`.
 
 ## Documentation pointers
 

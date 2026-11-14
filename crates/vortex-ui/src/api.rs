@@ -2,8 +2,8 @@
 
 use serde::de::DeserializeOwned;
 use vortex_types::{
-    ApprovalInfo, Capabilities, ChatRequestDto, ConversationSummary, ModelInfo, PreviewInfo,
-    RunInfo, Settings, StoredMessage, ToolCallRecord,
+    ApprovalInfo, Capabilities, ChatRequestDto, CheckpointInfo, ConversationSummary, ModelInfo,
+    PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
 const BASE: &str = "/api";
@@ -15,7 +15,9 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
-    if !(200..400).contains(&status) {
+    // Only 2xx is success: a 3xx reaching this point means a redirect the
+    // browser did not follow, and its body is not the expected JSON.
+    if !(200..300).contains(&status) {
         return Err(parse_error(&text));
     }
     serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
@@ -43,7 +45,7 @@ pub async fn send_json<T: DeserializeOwned>(
         .map_err(|e| e.to_string())?;
     let status = resp.status();
     let text = resp.text().await.map_err(|e| e.to_string())?;
-    if !(200..400).contains(&status) {
+    if !(200..300).contains(&status) {
         return Err(parse_error(&text));
     }
     serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
@@ -175,6 +177,33 @@ pub async fn runs_for_conversation(id: &str) -> Result<Vec<RunInfo>, String> {
     get_json(&format!("/runs?conversation_id={id}")).await
 }
 
+/// File checkpoints for a conversation, newest first, cursor-paginated
+/// (`before` = smallest id of the previous page).
+pub async fn checkpoints(
+    conv_id: &str,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<CheckpointInfo>, String> {
+    let mut query = format!("limit={limit}");
+    if let Some(b) = before {
+        query.push_str(&format!("&before={b}"));
+    }
+    get_json(&format!("/conversations/{conv_id}/checkpoints?{query}")).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct RestoreResult {
+    pub ok: bool,
+    pub path: String,
+    /// "restored" (content written back) or "trashed" (the snapshot recorded
+    /// that the file did not exist, so the current file was moved to trash).
+    pub action: String,
+}
+
+pub async fn restore_checkpoint(id: i64) -> Result<RestoreResult, String> {
+    send_json("POST", &format!("/checkpoints/{id}/restore"), "").await
+}
+
 pub fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -182,7 +211,9 @@ pub fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
-            b' ' => out.push('+'),
+            // %20, not '+': a '+' is only a space in form-encoded bodies; in a
+            // URL path/query a literal '+' decodes ambiguously.
+            b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

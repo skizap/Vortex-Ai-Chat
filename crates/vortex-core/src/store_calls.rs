@@ -59,13 +59,14 @@ mod tests {
     use crate::db::now;
     use vortex_types::{Mode, PlanStep, RunInfo, RunStatus, StepStatus, Usage};
 
-    async fn test_db() -> Db {
-        Db::open(format!("/tmp/vortex-test-{}.db", uuid::Uuid::new_v4())).unwrap()
+    async fn test_db() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Db::open(dir.path().join("test.db")).unwrap(), dir)
     }
 
     #[tokio::test]
     async fn runs_status_updates() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let conv = db.create_conversation("c", Mode::Chat, None).await.unwrap();
         let run = RunInfo {
             id: "r1".into(),

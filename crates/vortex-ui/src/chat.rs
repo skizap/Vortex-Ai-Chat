@@ -38,10 +38,10 @@ pub fn ChatView() -> impl IntoView {
                     >
                         <MessageBubble msg />
                     </For>
-                    <Show when=move || !ctx.stream_text.get().is_empty()>
+                    <Show when=move || !ctx.stream_display.get().is_empty()>
                         <div class="msg assistant streaming">
                             <div class="msg-body markdown"
-                                inner_html=move || crate::markdown::render_markdown(&ctx.stream_text.get())>
+                                inner_html=move || crate::markdown::render_markdown(&ctx.stream_display.get())>
                             </div>
                             <span class="cursor">"▊"</span>
                         </div>
@@ -49,7 +49,7 @@ pub fn ChatView() -> impl IntoView {
                     <Show when=move || {
                         let running = matches!(ctx.run_status.get(),
                             Some(RunStatus::Running) | Some(RunStatus::Queued) | Some(RunStatus::WaitingApproval));
-                        running && ctx.stream_text.get().is_empty()
+                        running && ctx.stream_display.get().is_empty()
                     }>
                         <div class="msg assistant">
                             <div class="msg-body"><em class="working">"working…"</em></div>
@@ -85,15 +85,33 @@ pub fn ChatView() -> impl IntoView {
     }
 }
 
+// Optimistic user bubbles need locally-unique negative ids: `<For>` keys on
+// `id`, so a shared `-1` sentinel made two rapid sends collide (duplicate
+// keys) and error rollback removed *all* optimistic bubbles, not just the
+// failed one. Ids decrement per send (WASM is single-threaded, so a
+// thread-local counter is enough).
+thread_local! {
+    static OPTIMISTIC_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+fn next_optimistic_id() -> i64 {
+    OPTIMISTIC_ID.with(|c| {
+        let next = c.get() - 1;
+        c.set(next);
+        next
+    })
+}
+
 /// Send a message: optimistic user bubble + POST + SSE subscription.
 pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
     let Some(conv_id) = ctx.current.get_untracked() else {
         return;
     };
     // Optimistic user bubble.
+    let optimistic_id = next_optimistic_id();
     ctx.messages.update(|m| {
         m.push(StoredMessage {
-            id: -1,
+            id: optimistic_id,
             role: Role::User,
             content: text.clone(),
             tool_calls: Vec::new(),
@@ -101,6 +119,7 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
         })
     });
     ctx.stream_text.set(String::new());
+    ctx.stream_display.set(String::new());
     ctx.plan.set(Vec::new());
     ctx.tool_calls.set(Vec::new());
     ctx.agents.set(Vec::new());
@@ -114,7 +133,8 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
         Ok(r) => start_stream(ctx, r.run_id),
         Err(e) => {
             ctx.run_status.set(None);
-            ctx.messages.update(|m| m.retain(|x| x.id != -1));
+            // Roll back only *this* send's bubble.
+            ctx.messages.update(|m| m.retain(|x| x.id != optimistic_id));
             ctx.error_banner.set(Some(e));
         }
     }
@@ -124,20 +144,16 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
 pub fn start_stream(ctx: AppCtx, run_id: String) {
     ctx.run_id.set(Some(run_id.clone()));
     ctx.run_status.set(Some(RunStatus::Running));
-    set_new_subscription(crate::sse::subscribe_run(ctx, run_id));
-}
-
-thread_local! {
-    static SUBSCRIPTION: std::cell::RefCell<Option<crate::sse::RunSubscription>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn set_new_subscription(sub: crate::sse::RunSubscription) {
-    SUBSCRIPTION.with(|s| {
-        if let Some(old) = s.borrow_mut().replace(sub) {
-            old.source.close();
+    match crate::sse::subscribe_run(ctx, run_id) {
+        Ok(sub) => crate::sse::set_new_subscription(sub),
+        Err(e) => {
+            // Environmental failure (e.g. browser connection limits): show a
+            // banner instead of trapping the WASM module.
+            ctx.run_status.set(None);
+            ctx.error_banner
+                .set(Some(format!("could not subscribe to run events: {e}")));
         }
-    });
+    }
 }
 
 #[component]
@@ -154,8 +170,9 @@ fn RunControls() -> impl IntoView {
                         let ctx = ctx;
                         spawn_local(async move {
                             if let Some(run) = ctx.run_id.get_untracked() {
-                                if api::stop_run(&run).await.is_ok() {
-                                    ctx.set_toast("Stopping task…");
+                                match api::stop_run(&run).await {
+                                    Ok(()) => ctx.set_toast("Stopping task…"),
+                                    Err(e) => ctx.set_toast(format!("stop failed: {e}")),
                                 }
                             }
                         });
@@ -212,13 +229,22 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
 }
 
 fn copy_text(text: &str) {
-    if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
-        // Fire-and-forget promise; failures are silent (clipboard permission).
-        let _ = clipboard.write_text(text);
-    }
-    if let Some(ctx) = try_use_ctx() {
-        ctx.set_toast("Copied");
-    }
+    let Some(ctx) = try_use_ctx() else {
+        return;
+    };
+    let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) else {
+        ctx.set_toast("Clipboard is not available in this browser");
+        return;
+    };
+    // Await the promise: claiming "Copied" while the write was denied by
+    // permissions policy is a lie.
+    let promise = clipboard.write_text(text);
+    spawn_local(async move {
+        match wasm_bindgen_futures::JsFuture::from(promise).await {
+            Ok(_) => ctx.set_toast("Copied"),
+            Err(_) => ctx.set_toast("Clipboard write was blocked by the browser"),
+        }
+    });
 }
 
 fn try_use_ctx() -> Option<AppCtx> {

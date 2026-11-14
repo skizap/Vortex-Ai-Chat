@@ -163,7 +163,8 @@ impl AppConfig {
     }
 }
 
-/// Minimal `.env` loader: KEY=VALUE lines, `#` comments, no interpolation.
+/// Minimal `.env` loader: KEY=VALUE lines, `#` comments, optional `export `
+/// prefix, inline comments after unquoted values, no interpolation.
 /// Never overwrites variables that are already set in the environment.
 fn load_dotenv() {
     let Ok(text) = std::fs::read_to_string(".env") else {
@@ -174,6 +175,7 @@ fn load_dotenv() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let line = line.strip_prefix("export ").unwrap_or(line);
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
@@ -186,9 +188,89 @@ fn load_dotenv() {
             || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
         {
             v = &v[1..v.len() - 1];
+        } else if let Some(idx) = v.find(" #") {
+            // Inline comment on an unquoted value: `KEY=value # comment`.
+            v = v[..idx].trim_end();
         }
         std::env::set_var(k, v);
     }
+}
+
+/// Patch (or create) the `server.lan.token` entry in a config.toml text,
+/// preserving all comments and unknown keys. A full
+/// `toml::to_string_pretty` round-trip would silently discard them.
+///
+/// Handles the `[server.lan]` section form and the dotted-key form
+/// (`server.lan.token = ...`). Returns the new file text.
+pub fn patch_lan_token(text: &str, token: &str) -> String {
+    let token_line = format!("token = \"{token}\"");
+    let mut out: Vec<String> = Vec::new();
+    let mut in_lan_section = false;
+    let mut replaced = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_lan_section = trimmed == "[server.lan]";
+            if in_lan_section && !replaced {
+                // Keep the header, then check whether a token key follows;
+                // insertion happens either at the next key boundary or below.
+                out.push(line.to_string());
+                continue;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        // Dotted-key form anywhere in the file: preserve the dotted form.
+        if !replaced && is_key_line(trimmed, "server.lan.token") {
+            out.push(format!("server.lan.token = \"{token}\""));
+            replaced = true;
+            continue;
+        }
+        if in_lan_section && !replaced && is_key_line(trimmed, "token") {
+            out.push(token_line.clone());
+            replaced = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if !replaced {
+        if text.lines().any(|l| l.trim() == "[server.lan]") {
+            // Section exists but has no token key: insert right after header.
+            let mut out2: Vec<String> = Vec::new();
+            for line in out {
+                out2.push(line.clone());
+                if line.trim() == "[server.lan]" {
+                    out2.push(token_line.clone());
+                }
+            }
+            out = out2;
+        } else {
+            if !out.is_empty() && !out.last().map(|l| l.is_empty()).unwrap_or(true) {
+                out.push(String::new());
+            }
+            out.push("[server.lan]".to_string());
+            out.push(token_line);
+        }
+    }
+
+    let mut result = out.join("\n");
+    if text.ends_with('\n') || !result.is_empty() {
+        result.push('\n');
+    }
+    result
+}
+
+/// Does this trimmed line assign the given TOML key? (Comments excluded.)
+fn is_key_line(trimmed: &str, key: &str) -> bool {
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let Some((k, _)) = trimmed.split_once('=') else {
+        return false;
+    };
+    k.trim() == key
 }
 
 /// Restrict config file permissions to the owner (best effort on Linux).
@@ -227,5 +309,79 @@ token = "abc"
         assert!(cfg.server.lan.enabled);
         assert_eq!(cfg.server.lan.token, "abc");
         assert!(cfg.is_loopback_host());
+    }
+
+    #[test]
+    fn patch_replaces_existing_token_and_keeps_comments() {
+        let input = "\
+# my annotated config
+[server]
+host = \"127.0.0.1\" # keep me
+
+[server.lan]
+enabled = true
+token = \"\"
+
+[llm]
+provider = \"openrouter\"
+";
+        let out = patch_lan_token(input, "deadbeef");
+        assert!(out.contains("token = \"deadbeef\""));
+        assert!(out.contains("# my annotated config"));
+        assert!(out.contains("host = \"127.0.0.1\" # keep me"));
+        assert!(out.contains("[llm]"));
+        // Still valid TOML with the expected value.
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "deadbeef");
+        assert!(cfg.server.lan.enabled);
+        assert_eq!(cfg.llm.provider, "openrouter");
+    }
+
+    #[test]
+    fn patch_inserts_token_into_section_without_one() {
+        let input = "\
+[server.lan]
+enabled = true
+
+[llm]
+provider = \"mock\"
+";
+        let out = patch_lan_token(input, "t0k");
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "t0k");
+        assert!(out.contains("[llm]"));
+    }
+
+    #[test]
+    fn patch_handles_dotted_key_form() {
+        let input = "server.lan.enabled = true\nserver.lan.token = \"old\"\n";
+        let out = patch_lan_token(input, "new");
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "new");
+    }
+
+    #[test]
+    fn patch_appends_section_when_missing() {
+        let input = "[server]\nhost = \"127.0.0.1\"\n";
+        let out = patch_lan_token(input, "tok");
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "tok");
+        assert!(out.contains("[server]"));
+    }
+
+    #[test]
+    fn patch_on_empty_file_creates_valid_section() {
+        let out = patch_lan_token("", "tok");
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "tok");
+    }
+
+    #[test]
+    fn patch_never_touches_commented_token_lines() {
+        let input = "[server.lan]\nenabled = true\n# token = \"commented\"\n";
+        let out = patch_lan_token(input, "tok");
+        assert!(out.contains("# token = \"commented\""));
+        let cfg: AppConfig = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.server.lan.token, "tok");
     }
 }

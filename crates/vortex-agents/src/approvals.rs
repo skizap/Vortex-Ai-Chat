@@ -34,17 +34,31 @@ impl ApprovalManager {
     }
 
     /// Resolve a pending approval from the server API. Returns whether the
-    /// approval existed and was still pending.
+    /// approval existed, was still pending, AND the decision was delivered
+    /// to the waiter.
+    ///
+    /// The sender is removed under the lock, so exactly one of `decide` or
+    /// the timeout branch owns the DB write for a given approval. If the
+    /// waiter has already timed out (send fails), the row is recorded as
+    /// `expired` — never as a decision nobody consumed.
     pub async fn decide(&self, id: &str, approve: bool) -> bool {
         let sender = self.pending.lock().await.remove(id);
         let Some(sender) = sender else { return false };
+        if sender.send(approve).is_err() {
+            // Waiter timed out between the timeout firing and this call.
+            let _ = self
+                .db
+                .resolve_approval(id.to_string(), ApprovalStatus::Expired)
+                .await;
+            return false;
+        }
         let status = if approve {
             ApprovalStatus::Approved
         } else {
             ApprovalStatus::Denied
         };
         let _ = self.db.resolve_approval(id.to_string(), status).await;
-        sender.send(approve).is_ok()
+        true
     }
 
     /// Approvals pending resolution right now.
@@ -88,6 +102,7 @@ impl ApprovalGate for ApprovalManager {
         let approved = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => {
+                // Sender dropped without a decision (manager shutting down).
                 let _ = self
                     .db
                     .resolve_approval(id.clone(), ApprovalStatus::Expired)
@@ -95,11 +110,17 @@ impl ApprovalGate for ApprovalManager {
                 false
             }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
-                let _ = self
-                    .db
-                    .resolve_approval(id.clone(), ApprovalStatus::Expired)
-                    .await;
+                // Timeout. Only write `expired` if this branch still owns the
+                // sender: if `decide` removed it first, that call owns the DB
+                // write (decision delivered, or `expired` on late arrival),
+                // and a second write here could overwrite the user's choice.
+                let owned = self.pending.lock().await.remove(&id).is_some();
+                if owned {
+                    let _ = self
+                        .db
+                        .resolve_approval(id.clone(), ApprovalStatus::Expired)
+                        .await;
+                }
                 tracing::info!(approval_id = %id, "approval timed out and was auto-denied");
                 false
             }

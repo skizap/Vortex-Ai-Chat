@@ -70,7 +70,25 @@ impl Db {
                     }
                 })?;
             match row {
-                Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+                Some(json) => match serde_json::from_str::<Settings>(&json) {
+                    Ok(s) => Ok(s),
+                    Err(e) => {
+                        // Never silently discard user data: keep the corrupt
+                        // blob for inspection/recovery and say so loudly.
+                        tracing::error!(
+                            error = %e,
+                            "stored settings could not be parsed; falling back to defaults. \
+                             The original blob was preserved under settings key \
+                             'settings_corrupt_backup'."
+                        );
+                        let _ = c.execute(
+                            "INSERT INTO settings (key, value) VALUES ('settings_corrupt_backup', ?1)
+                             ON CONFLICT(key) DO UPDATE SET value = ?1",
+                            rusqlite::params![json],
+                        );
+                        Ok(Settings::default())
+                    }
+                },
                 None => Ok(Settings::default()),
             }
         })
@@ -97,13 +115,14 @@ mod tests {
     use super::*;
     use vortex_types::Mode;
 
-    async fn test_db() -> Db {
-        Db::open(format!("/tmp/vortex-test-{}.db", uuid::Uuid::new_v4())).unwrap()
+    fn test_db() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (Db::open(dir.path().join("test.db")).unwrap(), dir)
     }
 
     #[tokio::test]
     async fn conversation_roundtrip_and_search() {
-        let db = test_db().await;
+        let (db, _dir) = test_db();
         let c = db
             .create_conversation("Hello", Mode::Chat, None)
             .await
@@ -123,7 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_roundtrip() {
-        let db = test_db().await;
+        let (db, _dir) = test_db();
         let mut s = db.load_settings().await.unwrap();
         assert_eq!(s.agents.max_concurrent, 6);
         s.model = "some/model".into();
@@ -132,5 +151,32 @@ mod tests {
         let s2 = db.load_settings().await.unwrap();
         assert_eq!(s2.model, "some/model");
         assert_eq!(s2.agents.max_concurrent, 8);
+    }
+
+    #[tokio::test]
+    async fn corrupt_settings_fall_back_to_defaults_and_keep_backup() {
+        let (db, _dir) = test_db();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO settings (key, value) VALUES ('settings', '{not valid json')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let s = db.load_settings().await.unwrap();
+        assert_eq!(s.agents.max_concurrent, 6, "defaults are used");
+        let backup: String = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT value FROM settings WHERE key = 'settings_corrupt_backup'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(backup, "{not valid json", "corrupt blob is preserved");
     }
 }

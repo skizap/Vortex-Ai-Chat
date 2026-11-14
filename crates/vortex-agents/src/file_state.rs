@@ -41,7 +41,10 @@ impl FileState {
 
     /// Get (or create) the async lock for a path.
     pub fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.locks.lock().expect("locks map poisoned");
+        let mut map = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(path.to_path_buf()).or_default().clone()
     }
 
@@ -49,7 +52,7 @@ impl FileState {
     pub fn owner_of(&self, path: &Path) -> Option<String> {
         self.owners
             .lock()
-            .expect("owners map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(path)
             .cloned()
     }
@@ -58,7 +61,7 @@ impl FileState {
     pub fn record_write(&self, path: &Path, run_id: &str) {
         self.owners
             .lock()
-            .expect("owners map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(path.to_path_buf(), run_id.to_string());
     }
 
@@ -87,7 +90,7 @@ impl FileState {
     pub fn cleanup_run(&self, run_id: &str) {
         self.owners
             .lock()
-            .expect("owners map poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|_, owner| owner != run_id);
         // Keep the per-path locks; they are cheap and shared.
     }

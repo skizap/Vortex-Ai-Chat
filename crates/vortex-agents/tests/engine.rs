@@ -201,10 +201,13 @@ async fn six_subagents_run_concurrently_plus_coordinator() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
         match events.try_recv() {
-            Ok(vortex_types::RunEvent::RunFinished {
-                status: RunStatus::Completed,
-                ..
-            }) => {
+            Ok((
+                _,
+                vortex_types::RunEvent::RunFinished {
+                    status: RunStatus::Completed,
+                    ..
+                },
+            )) => {
                 finished_root = true;
                 break;
             }
@@ -239,6 +242,7 @@ fn turn_with_ten_delegates() -> vortex_llm::MockTurn {
     vortex_llm::MockTurn {
         content: String::new(),
         tool_calls: calls,
+        fail_with: None,
     }
 }
 
@@ -366,6 +370,7 @@ async fn unapproved_command_times_out_and_is_denied() {
                 name: "run_command".into(),
                 arguments: serde_json::json!({ "cmd": ["cargo", "--version"] }).to_string(),
             }],
+            fail_with: None,
         },
         vortex_llm::MockTurn::text("done after command"),
     ]);
@@ -385,9 +390,11 @@ async fn unapproved_command_times_out_and_is_denied() {
     let mut run_finished = false;
     while std::time::Instant::now() < deadline {
         match events.try_recv() {
-            Ok(vortex_types::RunEvent::ApprovalRequested { .. }) => approval_requested = true,
-            Ok(vortex_types::RunEvent::ToolCallFinished { ok: false, .. }) => tool_denied = true,
-            Ok(vortex_types::RunEvent::RunFinished { .. }) => {
+            Ok((_, vortex_types::RunEvent::ApprovalRequested { .. })) => approval_requested = true,
+            Ok((_, vortex_types::RunEvent::ToolCallFinished { ok: false, .. })) => {
+                tool_denied = true
+            }
+            Ok((_, vortex_types::RunEvent::RunFinished { .. })) => {
                 run_finished = true;
                 break;
             }
@@ -461,4 +468,226 @@ async fn stopping_root_cancels_children_and_releases_slots() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// ACCEPTANCE (C7 drain fix): events queued through the tool-event forwarder
+/// (`PlanUpdated` is sent by `update_plan` via `ctx.events`) and the directly
+/// published `ToolCallFinished` must all be observable from the root
+/// subscription *before* `RunFinished` — the forwarder is drained, not
+/// aborted, so `RunFinished` is strictly last.
+#[tokio::test]
+async fn tool_events_are_delivered_before_run_finished() {
+    let (settings, _dir) = settings_with_workspace();
+    let llm = Arc::new(vortex_llm::MockLlm::new(vec![
+        vortex_llm::MockTurn::tool_call(
+            "update_plan",
+            "c1",
+            serde_json::json!({ "steps": ["[in_progress] do the thing"] }).to_string(),
+        ),
+        vortex_llm::MockTurn::text("all done"),
+    ]));
+    let (engine, db) = test_engine(llm, settings).await;
+    let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+    let run_id = engine
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "plan something")
+        .await;
+    let mut events = engine.hub.subscribe(&run_id).unwrap();
+
+    let mut seq_plan: Option<u64> = None;
+    let mut seq_tool_finished: Option<u64> = None;
+    let mut seq_run_finished: Option<u64> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        match events.try_recv() {
+            Ok((seq, vortex_types::RunEvent::PlanUpdated { .. })) => {
+                if seq_plan.is_none() {
+                    seq_plan = Some(seq);
+                }
+            }
+            Ok((seq, vortex_types::RunEvent::ToolCallFinished { .. })) => {
+                if seq_tool_finished.is_none() {
+                    seq_tool_finished = Some(seq);
+                }
+            }
+            Ok((seq, vortex_types::RunEvent::RunFinished { status, .. })) => {
+                assert_eq!(status, RunStatus::Completed);
+                seq_run_finished = Some(seq);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let finished = seq_run_finished.expect("run must finish");
+    let plan = seq_plan.expect("update_plan must publish a PlanUpdated event");
+    let tool = seq_tool_finished.expect("the tool call must report ToolCallFinished");
+    assert!(
+        plan < finished,
+        "PlanUpdated (queued through the forwarder) must arrive before RunFinished: {plan} vs {finished}"
+    );
+    assert!(
+        tool < finished,
+        "ToolCallFinished must arrive before RunFinished: {tool} vs {finished}"
+    );
+}
+
+/// ACCEPTANCE (P15): once the run's token budget is used up, the engine must
+/// fail *before* the next provider call — not after another completion — and
+/// the request budget clamp must not let a second call through.
+#[tokio::test]
+async fn token_budget_is_enforced_before_the_next_call() {
+    let (mut settings, _dir) = settings_with_workspace();
+    // The first mock turn reports exactly 10 total tokens (10 prompt + 0
+    // completion for an empty-content tool-call turn).
+    settings.agents.max_total_tokens = 10;
+    let llm = Arc::new(vortex_llm::MockLlm::new(vec![
+        vortex_llm::MockTurn::tool_call(
+            "update_plan",
+            "c1",
+            serde_json::json!({ "steps": ["one step"] }).to_string(),
+        ),
+        vortex_llm::MockTurn::text("should never be requested"),
+    ]));
+    let (engine, db) = test_engine(llm.clone(), settings).await;
+    let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+    let run_id = engine
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "budget")
+        .await;
+    let mut events = engine.hub.subscribe(&run_id).unwrap();
+
+    let mut finished: Option<(RunStatus, Option<String>)> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        match events.try_recv() {
+            Ok((_, vortex_types::RunEvent::RunFinished { status, error, .. })) => {
+                finished = Some((status, error));
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let (status, error) = finished.expect("run must finish");
+    assert_eq!(status, RunStatus::Failed);
+    let msg = error.unwrap_or_default();
+    assert!(
+        msg.contains("token budget exhausted"),
+        "run must fail with the pre-call budget error, got: {msg}"
+    );
+    assert_eq!(
+        llm.calls(),
+        1,
+        "no second provider call may happen once the budget is gone"
+    );
+}
+
+/// A provider whose completion takes ~60 simulated seconds and reports when
+/// its future is dropped (N8: cancel must abort the provider task, not leave
+/// it running detached).
+struct AbortProbeLlm {
+    active: AtomicUsize,
+}
+
+struct ProbeGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl LlmClient for AbortProbeLlm {
+    async fn complete(
+        &self,
+        _req: &CompletionRequest,
+        _events: mpsc::Sender<LlmEvent>,
+    ) -> Result<CompletionResponse, vortex_llm::LlmError> {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _guard = ProbeGuard(&self.active);
+        for _ in 0..6000 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(CompletionResponse {
+            content: "never reached".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: "stop".into(),
+        })
+    }
+
+    async fn models(&self) -> Result<Vec<vortex_types::ModelInfo>, vortex_llm::LlmError> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self) -> &'static str {
+        "abort-probe"
+    }
+}
+
+/// ACCEPTANCE (N8): cancelling a run mid-completion must abort the spawned
+/// provider task promptly. Before the fix, dropping the JoinHandle left the
+/// completion running detached (stream kept being consumed/billed).
+#[tokio::test]
+async fn cancel_aborts_the_provider_task() {
+    let (settings, _dir) = settings_with_workspace();
+    let probe = Arc::new(AbortProbeLlm {
+        active: AtomicUsize::new(0),
+    });
+    let (engine, db) = test_engine(probe.clone(), settings).await;
+    let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+    let run_id = engine
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "long completion")
+        .await;
+    let mut events = engine.hub.subscribe(&run_id).unwrap();
+
+    // Wait until the provider task is demonstrably in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while probe.active.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        probe.active.load(Ordering::SeqCst),
+        1,
+        "provider task never started"
+    );
+
+    engine.hub.cancel(&run_id);
+
+    // Abort must drop the completion future promptly; a detached task would
+    // keep it alive for the full 60 simulated seconds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while probe.active.load(Ordering::SeqCst) == 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        probe.active.load(Ordering::SeqCst),
+        0,
+        "provider task was not aborted on cancel (it is still running detached)"
+    );
+
+    // And the run must finish honestly as cancelled.
+    let mut finished = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match events.try_recv() {
+            Ok((_, vortex_types::RunEvent::RunFinished { status, .. })) => {
+                assert_eq!(status, RunStatus::Cancelled);
+                finished = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(finished, "cancelled run must publish RunFinished");
 }

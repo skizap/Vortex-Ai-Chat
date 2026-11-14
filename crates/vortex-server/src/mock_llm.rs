@@ -6,9 +6,13 @@
 //!   answer quoting the tool evidence — proving the full tool pipeline
 //!   (tool call → registry validation → provider → result → citations)
 //!   without any network or credentials.
+//!
+//! The turn is derived from the request itself (has a tool result arrived
+//! yet?), not from a process-global counter, so *every* run performs the
+//! tool round-trip — the counter version silently degraded to plain text
+//! for all runs after the first.
 
 use async_trait::async_trait;
-use std::sync::Mutex;
 use tokio::sync::mpsc;
 use vortex_llm::llm::{CompletionRequest, CompletionResponse, LlmClient, LlmEvent};
 use vortex_llm::LlmError;
@@ -16,8 +20,6 @@ use vortex_types::{ChatMessage, ModelInfo, Role, Usage};
 
 pub struct DemoMockLlm {
     script: String,
-    /// Turns used by this "session"; every run starts fresh.
-    turn_counter: Mutex<u32>,
 }
 
 impl DemoMockLlm {
@@ -28,7 +30,6 @@ impl DemoMockLlm {
             } else {
                 script.to_string()
             },
-            turn_counter: Mutex::new(0),
         }
     }
 
@@ -58,25 +59,22 @@ impl LlmClient for DemoMockLlm {
         req: &CompletionRequest,
         events: mpsc::Sender<LlmEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        let turn = {
-            let mut c = self.turn_counter.lock().expect("mock turn counter");
-            let t = *c;
-            *c += 1;
-            t
-        };
+        // "First turn" == no tool result in the conversation yet. This is
+        // per-request state, so concurrent and subsequent runs behave alike.
+        let has_tool_result = req.messages.iter().any(|m| m.role == Role::Tool);
         let usage = Some(Usage {
             prompt_tokens: 12,
             completion_tokens: 20,
             total_tokens: 32,
         });
 
-        if self.script == "tools" && turn == 0 {
+        if self.script == "tools" && !has_tool_result {
             let query = Self::last_user_message(&req.messages);
             let args = serde_json::json!({ "query": query });
             return Ok(CompletionResponse {
                 content: String::new(),
                 tool_calls: vec![vortex_types::ToolCall {
-                    id: "mock-call-1".to_string(),
+                    id: format!("mock-call-{}", uuid::Uuid::new_v4().simple()),
                     name: "web_search".to_string(),
                     arguments: args.to_string(),
                 }],
@@ -97,7 +95,13 @@ impl LlmClient for DemoMockLlm {
         };
 
         for word in content.split_inclusive(' ') {
-            let _ = events.try_send(LlmEvent::TextDelta(word.to_string()));
+            if events
+                .send(LlmEvent::TextDelta(word.to_string()))
+                .await
+                .is_err()
+            {
+                break; // consumer hung up
+            }
             tokio::time::sleep(std::time::Duration::from_millis(3)).await;
         }
         Ok(CompletionResponse {

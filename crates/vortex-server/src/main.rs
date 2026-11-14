@@ -5,6 +5,7 @@
 
 mod guard;
 mod mock_llm;
+mod routes_ckpts;
 mod routes_conv;
 mod routes_misc;
 mod routes_runs;
@@ -31,14 +32,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Vortex-Ai-Chat {} starting", env!("CARGO_PKG_VERSION"));
 
-    // Database + honest interrupted-run marking.
+    // Database + honest interrupted-run marking (and expiry of the pending
+    // approvals that belonged to those runs).
     let db = Db::open(paths.database())?;
     {
         let conn = db.raw_connection();
-        let n = vortex_core::db::mark_interrupted_on_startup(&conn)?;
-        if n > 0 {
+        let (runs, approvals) = vortex_core::db::mark_interrupted_on_startup(&conn)?;
+        if runs > 0 {
             tracing::warn!(
-                "marked {n} run(s) as interrupted from a previous session; \
+                "marked {runs} run(s) as interrupted from a previous session \
+                 ({approvals} pending approval(s) expired); \
                  consequential actions are never replayed automatically"
             );
         }
@@ -186,6 +189,14 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
             get(routes_conv::get_messages),
         )
         .route("/api/conversations/{id}/chat", post(routes_conv::post_chat))
+        .route(
+            "/api/conversations/{id}/checkpoints",
+            get(routes_ckpts::list_checkpoints),
+        )
+        .route(
+            "/api/checkpoints/{id}/restore",
+            post(routes_ckpts::restore_checkpoint),
+        )
         .route("/api/runs", get(routes_runs::list_runs))
         .route("/api/runs/{id}/events", get(routes_runs::run_events))
         .route("/api/runs/{id}/state", get(routes_runs::run_state))
@@ -200,7 +211,8 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
 }
 
 /// If LAN mode is enabled but no token exists, generate one, persist it in the
-/// config file (0600) and print a loud warning.
+/// config file (0600) and print a loud warning. The file is *patched*, not
+/// regenerated: user comments and unknown keys survive.
 fn handle_lan_token(mut config: AppConfig, paths: &Paths) -> anyhow::Result<AppConfig> {
     if config.server.lan.enabled && config.server.lan.token.is_empty() {
         use rand::RngCore;
@@ -208,9 +220,9 @@ fn handle_lan_token(mut config: AppConfig, paths: &Paths) -> anyhow::Result<AppC
         rand::rng().fill_bytes(&mut bytes);
         config.server.lan.token = hex(&bytes);
         let file = paths.config_file();
-        let text = toml::to_string_pretty(&config)
-            .map_err(|e| anyhow::anyhow!("serializing config: {e}"))?;
-        std::fs::write(&file, text)?;
+        let existing = std::fs::read_to_string(&file).unwrap_or_default();
+        let patched = vortex_core::config::patch_lan_token(&existing, &config.server.lan.token);
+        std::fs::write(&file, patched)?;
         vortex_core::config::ensure_private_config_perms(&file);
         tracing::warn!(
             "LAN ACCESS ENABLED: this server is exposed to your local network. \

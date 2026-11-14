@@ -72,16 +72,19 @@ impl PreviewRegistry {
         tokio::spawn(async move {
             let _ = task.await;
         });
-        self.inner.lock().expect("previews").push(PreviewHandle {
-            id: id.clone(),
-            run_id: run_id.to_string(),
-            url: url.clone(),
-            root,
-            running: true,
-            abort,
-            child_pid: None,
-            _child: None,
-        });
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PreviewHandle {
+                id: id.clone(),
+                run_id: run_id.to_string(),
+                url: url.clone(),
+                root,
+                running: true,
+                abort,
+                child_pid: None,
+                _child: None,
+            });
         Ok(url)
     }
 
@@ -94,20 +97,26 @@ impl PreviewRegistry {
         child: tokio::process::Child,
         cancel: CancellationToken,
     ) {
-        self.inner.lock().expect("previews").push(PreviewHandle {
-            id: uuid::Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
-            url,
-            root,
-            running: true,
-            abort: cancel,
-            child_pid: Some(pid),
-            _child: Some(child),
-        });
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PreviewHandle {
+                id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                url,
+                root,
+                running: true,
+                abort: cancel,
+                child_pid: Some(pid),
+                _child: Some(child),
+            });
     }
 
     pub fn stop(&self, id: &str) -> bool {
-        let mut guard = self.inner.lock().expect("previews");
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(handle) = guard.iter_mut().find(|p| p.id == id) else {
             return false;
         };
@@ -127,7 +136,7 @@ impl PreviewRegistry {
         let ids: Vec<String> = self
             .inner
             .lock()
-            .expect("previews")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|p| p.run_id == run_id)
             .map(|p| p.id.clone())
@@ -137,7 +146,7 @@ impl PreviewRegistry {
         }
         self.inner
             .lock()
-            .expect("previews")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|p| p.run_id != run_id);
     }
 
@@ -146,20 +155,23 @@ impl PreviewRegistry {
         let ids: Vec<String> = self
             .inner
             .lock()
-            .expect("previews")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|p| p.id.clone())
             .collect();
         for id in ids {
             self.stop(&id);
         }
-        self.inner.lock().expect("previews").clear();
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     pub fn list(&self) -> Vec<vortex_types::PreviewInfo> {
         self.inner
             .lock()
-            .expect("previews")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|p| vortex_types::PreviewInfo {
                 id: p.id.clone(),

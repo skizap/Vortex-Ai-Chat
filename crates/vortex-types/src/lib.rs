@@ -11,8 +11,8 @@ pub mod settings;
 
 pub use chat::{ChatMessage, ModelInfo, Role, ToolCall, Usage};
 pub use dto::{
-    ApprovalInfo, ApprovalStatus, Capabilities, ChatRequestDto, ConversationSummary, PreviewInfo,
-    RunInfo, StoredMessage, ToolCallRecord,
+    ApprovalInfo, ApprovalStatus, Capabilities, ChatRequestDto, CheckpointInfo,
+    ConversationSummary, PreviewInfo, RunInfo, StoredMessage, ToolCallRecord,
 };
 pub use events::{PlanStep, RunEvent, RunStatus, StepStatus};
 pub use settings::{

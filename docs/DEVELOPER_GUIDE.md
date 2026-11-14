@@ -139,9 +139,10 @@ and tests):
 
 **The mock is not a way to use the assistant.** It produces canned text, has
 no model behind it, and does not provide real chat, research, or coding
-functionality. Real use requires a real OpenRouter API key. Known quirk: with
-`tools` scripting, only the first run of the process performs the tool
-round-trip (`docs/KNOWN_ISSUES.md` C8).
+functionality. Real use requires a real OpenRouter API key. With `tools`
+scripting, every run performs the tool round-trip (the turn is derived from
+the request, not a process-global counter — `docs/KNOWN_ISSUES.md` C8,
+fixed).
 
 Without a key and without the mock, the server still starts (so the UI can
 show setup guidance), but `POST /api/conversations/{id}/chat` returns
@@ -194,19 +195,21 @@ mock_script = "echo"
 | `VORTEX_CONFIG_DIR` / `VORTEX_DATA_DIR` / `VORTEX_CACHE_DIR` | storage overrides (must be absolute) |
 | `RUST_LOG` | tracing filter |
 
-Note: `VORTEX_SEARXNG_URL` appears in `.env.example` but is **not read by
-any code** (`KNOWN_ISSUES.md` C9) — configure search in Settings → Search
-instead.
+Note: the search provider (SearXNG) URL is runtime state stored in SQLite —
+configure it in Settings → Search. There is no environment override for it
+(the formerly advertised `VORTEX_SEARXNG_URL` was never read and has been
+removed from `.env.example`).
 
 ### Storage locations
 
 | Purpose | Default | Override |
 | --- | --- | --- |
-| Config (`config.toml`) | `~/.config/vortex/` | `VORTEX_CONFIG_DIR` |
-| Data (SQLite DB, trash) | `~/.local/share/vortex/` | `VORTEX_DATA_DIR` |
-| Cache (browser profile) | `~/.cache/vortex/` | `VORTEX_CACHE_DIR` |
+| Config (`config.toml`) | `$XDG_CONFIG_HOME/vortex/` (fallback `~/.config/vortex/`) | `VORTEX_CONFIG_DIR` |
+| Data (SQLite DB, trash) | `$XDG_DATA_HOME/vortex/` (fallback `~/.local/share/vortex/`) | `VORTEX_DATA_DIR` |
+| Cache (browser profile) | `$XDG_CACHE_HOME/vortex/` (fallback `~/.cache/vortex/`) | `VORTEX_CACHE_DIR` |
 
-The `XDG_*_HOME` variables are *not* consulted (`KNOWN_ISSUES.md` C10).
+Precedence: `VORTEX_*_DIR` (must be absolute) > absolute `XDG_*_HOME` >
+`$HOME` defaults. Relative `XDG_*_HOME` values are ignored per the XDG spec.
 
 ### Runtime settings (SQLite, editable in the UI Settings tab)
 
@@ -257,8 +260,9 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   (`store_msgs.rs`), runs with upsert/status updates (`store_runs.rs`), tool
   calls (`store_calls.rs`), approvals (`store_appr.rs`), checkpoints
   (`store_ckpts.rs` — file content *before* modification, `original = None`
-  means "file did not exist"; list capped at newest 200). All values bound
-  via `rusqlite::params!` (no SQL injection surface).
+  means "file did not exist"; cursor-paginated listing returning
+  `CheckpointInfo` metadata, content only via `get_checkpoint`). All values
+  bound via `rusqlite::params!` (no SQL injection surface).
 
 ### vortex-llm (`crates/vortex-llm/src/`)
 
@@ -272,20 +276,26 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   `X-Title: Vortex-Ai-Chat`. Timeouts: connect 10 s, read/stall 120 s (no
   total cap — deliberate for long generations). Tool-call accumulation:
   fragments merged per `index` — `id`/`name` set when non-empty, `arguments`
-  appended (`openrouter.rs:208-239`). Retries: up to 2 extra attempts with
-  1 s/3 s backoff for `RateLimited`/`Timeout`/`Network`/`Provider`; never for
-  auth/credits/model-not-found/malformed (see `KNOWN_ISSUES.md` C3/C13 for
-  retry caveats). Status mapping: 401/403→`InvalidCredentials`,
+  appended; slot growth capped at 64 entries, out-of-range indexes ignored
+  (`openrouter.rs`, `KNOWN_ISSUES.md` P3 fixed). Retries: up to 2 extra
+  attempts with 1 s/3 s backoff for `RateLimited`/`Timeout`/`Network` and
+  *5xx* `Provider` errors only — 4xx are terminal (C13 fixed) — and only
+  while nothing has been streamed to the consumer; a retryable failure after
+  partial delivery surfaces as an error instead of duplicating output
+  (C3 fixed). Status mapping: 401/403→`InvalidCredentials`,
   402→`InsufficientCredits`, 404→`ModelNotFound`, 429→`RateLimited`,
   422→`MalformedStream`, else `Provider`.
-- `sse.rs` — line-oriented SSE parser: buffers bytes until `\n`, handles
+- `sse.rs` — spec-oriented SSE parser: buffers bytes until `\n`, handles
   CRLF, converts only complete lines (UTF-8-safe across chunk splits),
-  extracts `data:` payloads, hard cap 1 MiB per line (buffer cleared on
-  overflow). `event:`/`id:` fields are ignored; multi-line `data:` events are
-  not joined (spec deviation, `KNOWN_ISSUES.md` C24).
-- `mock.rs` — `MockLlm` with scripted `MockTurn`s (`text`, `tool_call`);
-  streams word-by-word with a 5 ms default delay; used by the 46-test
-  offline suite. Cannot script failures (`KNOWN_ISSUES.md` C23).
+  accumulates `data:` lines per event and dispatches on the blank line
+  (multi-line `data:` joined with `\n`, one leading space stripped);
+  `finish()` flushes an unterminated trailing event at stream end.
+  `event:`/`id:` fields are ignored. Oversized input (1 MiB line / 8 MiB
+  event) is reported via `take_overflow()` and fails the stream as
+  `MalformedStream` instead of being silently dropped (C24 fixed).
+- `mock.rs` — `MockLlm` with scripted `MockTurn`s (`text`, `tool_call`,
+  `failure`); streams word-by-word with a 5 ms default delay; used by the
+  76-test offline suite (failure scripting: `KNOWN_ISSUES.md` C23, fixed).
 
 ### vortex-agents (`crates/vortex-agents/src/`)
 
@@ -295,7 +305,11 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   (each further gated by settings/profile/availability). `start_chat_run`
   keeps the last 40 history turns. `spawn_subagent`: child cancel token,
   depth cap 3, recursive delegation opt-in, allow-list is the *intersection*
-  of the parent's list and the request.
+  of the parent's list and the request. Event forwarders are **drained, not
+  aborted**, at completion (queued tool events/deltas are delivered and
+  `RunFinished` is published strictly last; a 2 s timeout bounds the drain
+  as a safety net), and cancel/deadline paths **abort the provider task**
+  (`KNOWN_ISSUES.md` C7/N8, fixed).
 - `registry.rs` — single enforcement point (`ToolRegistry::execute`):
   unregistered → refused; not in the run's allow-list → refused;
   `available()` check; typed schema validation (specs in `schema.rs`
@@ -304,8 +318,10 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   execution.
 - `workspace.rs` — `WorkspaceRoots::resolve`: canonicalized root; absolute
   paths must be inside; `..` rejected lexically; each existing component
-  canonicalized and re-checked against the root (symlink escape defense;
-  dangling-symlink gap: `KNOWN_ISSUES.md` C2).
+  canonicalized and re-checked against the root (symlink escape defense);
+  components that fail canonicalization but are themselves symlinks
+  (dangling/unresolvable) are rejected outright, while plain missing
+  components remain allowed for creation (`KNOWN_ISSUES.md` C2, fixed).
 - `file_state.rs` — per-path `tokio::Mutex` map + cross-run ownership:
   coordinator may always write; a sub-agent cannot modify a file owned by
   another run.
@@ -313,7 +329,9 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   of previous content → create dirs → write → record ownership; `edit_file`
   exact-once replace with unified diff (`similar`); `delete_path`
   (Risk::Consequential) moves to `data/trash/` instead of unlinking.
-  Restricted profile blocks all writes.
+  Restricted profile blocks all writes. Checkpoint recording distinguishes
+  "file absent" (NULL original = didn't exist) from "present but not UTF-8"
+  (no row + warning — a NULL would have meant *delete on restore*).
 - `tools_command.rs` — argv arrays only (no shell), binary resolved from
   PATH; `FORBIDDEN` patterns (sudo/su, `rm -rf /`, disk writers, power
   management…) never run even if allowlisted/approved; `SENSITIVE` patterns
@@ -330,16 +348,27 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   fallback); `SlotGuard` releases on drop (cancellation- and panic-safe);
   limit default 6, min 1, ceiling 16, runtime-adjustable; the coordinator
   never consumes a slot; nested sub-agents share the same gate.
-- `hub.rs` — run registry + event fan-out: per-run `broadcast::channel(512)`;
-  events published to the run **and all ancestors** (one SSE subscription
-  covers a whole agent tree); `cancel`/`cancel_all` via
-  `CancellationToken`s.
+- `hub.rs` — run registry + event fan-out: per-run `broadcast::channel(512)`
+  carrying `(seq, RunEvent)` plus a bounded in-memory replay log
+  (`MAX_RUN_LOG = 8192` entries, oldest evicted). Seq allocation, log insert
+  and broadcast send happen under one lock, so log order and stream order
+  always agree; each handle (including ancestors) has its own seq
+  namespace. `replay_from(run_id, since)` feeds SSE reconnects (§9). Events
+  published to the run **and all ancestors** (one SSE subscription covers a
+  whole agent tree); `cancel`/`cancel_all` via `CancellationToken`s. The
+  log dies with the run handle — runs never survive restarts, so nothing is
+  persisted.
 - `preview.rs` / `preview_server.rs` / `tools_preview.rs` — static previews:
   small loopback-only Rust HTTP server (GET/HEAD, 16 KiB header cap, `..`
   rejected, canonicalized root-prefix guard, ephemeral port). Dev-server
-   previews: approval required, spawned in own process group, port parsed
-   from stdout (≤ 20 s, 8417 excluded), killed on run end/cancel/shutdown
-   (the registry owns the `Child` handle; see `KNOWN_ISSUES.md` C1, fixed).
+   previews: approval required, spawned in own process group; port detection
+   (≤ 20 s) matches stdout against a URL/port regex but **only accepts a
+   port that shows up as a new LISTEN socket** in `/proc/net/tcp{,6}`
+   compared against a pre-spawn snapshot (listener-ownership check,
+   `KNOWN_ISSUES.md` P9 fixed); fallback: exactly one new listener and no
+   parseable output; 8417 always excluded. Killed on run end/cancel/
+   shutdown (the registry owns the `Child` handle; see `KNOWN_ISSUES.md`
+   C1, fixed).
 - `browser.rs` / `cdp.rs` / `tools_browser.rs` — Chromium detection in PATH
   (`VORTEX_CHROME_PATH` overrides); launched headless with isolated
   `--user-data-dir` under the XDG cache, own process group,
@@ -352,12 +381,17 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
    human handoff (the manager owns the `Child` handle; see
    `KNOWN_ISSUES.md` C1, fixed).
 - `safe_http.rs` / `html.rs` — SSRF guard for model-chosen URLs: http/https
-  only; DNS resolved and **every** address checked against
-  loopback/RFC1918/link-local/broadcast/ULA before connecting; redirects
-  disabled in reqwest and re-validated per hop (max 5); content-type
-  allowlist; body cap. Constructed with `allow_private_hosts = false` for
-  all model-chosen URLs (`vortex-server/src/main.rs:107`); only the
-  user-configured search provider may be local.
+  only; DNS resolved once per hop and **every** address checked against
+  loopback/RFC1918/link-local/broadcast/ULA/IPv4-mapped-IPv6 before
+  connecting; the connection is then **IP-pinned** to a validated address
+  via a per-hop reqwest client with `.resolve(host, addr)` (TLS SNI and
+  certificate verification still use the hostname), closing the DNS
+  rebinding TOCTOU window (`KNOWN_ISSUES.md` P1, fixed); redirects disabled
+  in reqwest and re-validated + re-pinned per hop (max 5); content-type
+  allowlist; streamed body cap. Cost: one client build per hop — acceptable
+  at tool-call frequency. Constructed with `allow_private_hosts = false` for
+  all model-chosen URLs (`vortex-server/src/main.rs`); only the
+  user-configured search provider may be local (shared unpinned client).
 - `search.rs` / `tools_search.rs` — `SearxngProvider` (user-configured base
   URL, JSON format) and `MockSearchProvider`; `web_search` (result count
   from settings) and `fetch_url` (SafeHttp, 2 MB body cap, text truncated to
@@ -383,10 +417,17 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   skipped in LAN mode where the token is the gate); LAN mode requires
   `Authorization: Bearer <token>` or `?token=` (for EventSource, which
   cannot set headers). 2 MiB body limit.
-- `routes_conv.rs` / `routes_runs.rs` / `routes_misc.rs` — REST surface
-  (§9). Notable: `post_chat` pre-flight refuses with 503 when no key and no
-  mock; SSE `run_events` replays a single terminal event for finished/unknown
-  runs so late subscribers settle; broadcast lag emits a `lagged` hint event.
+- `routes_conv.rs` / `routes_runs.rs` / `routes_misc.rs` /
+  `routes_ckpts.rs` — REST surface (§9). Notable: `post_chat` pre-flight
+  refuses with 503 when no key and no mock; SSE `run_events` replays the
+  run's retained event log from the client's cursor (`Last-Event-ID` header
+  or `?since=`), stamps every event with `id: <seq>`, dedupes the
+  replay/live overlap per connection, and emits a `replay_gap` event when
+  the cursor predates the retained window (or the consumer lagged);
+  terminal/unknown runs still get a single synthesized `run_finished` so
+  late subscribers settle. `routes_ckpts.rs` serves checkpoint listing and
+  the human-initiated restore flow (reversible: the current content is
+  snapshotted first; confined to the current workspace).
 - `static_files.rs` — rust-embed serving of `ui-dist/` (disk in debug,
   embedded in release); blocks `..`/leading-`/` paths; SPA fallback for
   dot-less paths; instructional placeholder when `index.html` is missing.
@@ -394,23 +435,38 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
 
 ### vortex-ui (`crates/vortex-ui/src/`)
 
-Leptos 0.8 CSR app; global state is an `AppCtx` of 17 `RwSignal`s
+Leptos 0.8 CSR app; global state is an `AppCtx` of 18 `RwSignal`s
 (`state.rs`). `lib.rs` boots (settings → health → conversations →
-approvals), polls `/api/approvals` every 5 s, renders tabs (Chat/Tasks/
-Settings). `api.rs` is a typed fetch client over `BASE = "/api"` (errors
-surface as strings; no LAN-token support — LAN mode is unusable from this
-UI, see `KNOWN_ISSUES.md`). `sse.rs` subscribes one `EventSource` per run
-(single-slot; replaced on each send), applying `RunEvent`s to signals;
-terminal `RunFinished` triggers a full message refetch (the reconciliation
-point). `chat.rs` renders the message list, optimistic user bubble,
-streaming bubble (markdown re-rendered per delta), Stop/Retry controls.
+approvals), polls `/api/approvals` every 5 s (filtered through the
+session-resolved set so an in-flight response cannot resurrect an approval
+resolved via SSE), runs the 125 ms streaming-throttle interval, and renders
+tabs (Chat/Tasks/Settings). `api.rs` is a typed fetch client over
+`BASE = "/api"` (errors surface as strings; no LAN-token support — LAN mode
+is unusable from this UI, see `KNOWN_ISSUES.md`). `sse.rs` subscribes one
+`EventSource` per run (single-slot thread-local; replaced on each send,
+closable on conversation switch), applying `RunEvent`s to signals.
+Recovery: every SSE event carries the server's per-run sequence as its
+`id:`; the client tracks the last seen id, re-subscribes a CLOSED source
+with `?since=<last seq>` (the server replays what was missed from its
+8192-entry run log), and a `replay_gap` event (window overflow or consumer
+lag) triggers a resync from `/api/runs/{id}/state`; browser auto-reconnects
+send `Last-Event-ID` natively. Text deltas **and** status/finished events
+are filtered to the subscribed run, so sub-agent streams and statuses never
+leak into the coordinator's UI; an orphan `ToolCallFinished` is inserted as
+a recovered row. Terminal `RunFinished` triggers a full message refetch
+(the final reconciliation point). `chat.rs` renders the message list,
+optimistic user bubble (unique negative ids), the streaming bubble (reads
+the throttled `stream_display` mirror of `stream_text`, so markdown +
+syntax highlighting re-render ≤8×/s instead of per delta), Stop/Retry
+controls.
 `sidebar.rs` conversation list/search/rename/delete + workspace picker
 (server-validated). `tasks.rs` approvals/plan/tool-calls/sub-agents/
-previews panels. `settings_ui.rs` draft-pattern settings form.
+previews/file-checkpoints panels (the checkpoint panel lists snapshots for
+the current conversation with cursor pagination and a confirm-guarded
+Restore button). `settings_ui.rs` draft-pattern settings form.
 `markdown.rs` hand-rolled pulldown-cmark walker: raw HTML is never emitted,
 all text escaped, links restricted to `http(s)`/`#` (everything else becomes
-`href="#"`), code blocks highlighted with syntect. (`ammonia` is declared in
-`Cargo.toml` but unused — `KNOWN_ISSUES.md` C18.)
+`href="#"`), code blocks highlighted with syntect.
 
 ## 8. Scripts explained
 
@@ -454,9 +510,11 @@ body limit. Errors are uniform: `{"error": "…"}` (never containing secrets).
 | `GET /api/conversations` | `routes_conv::list_conversations` | list; `?q=` searches title+message content |
 | `POST /api/conversations` | `routes_conv::create_conversation` | `{"title"?, "mode"?}` → `ConversationSummary`; coding/browser modes attach the configured workspace |
 | `PATCH /api/conversations/{id}` | `routes_conv::rename_conversation` | `{"title": "…"}` |
-| `DELETE /api/conversations/{id}` | `routes_conv::delete_conversation` | delete conversation + messages + runs |
+| `DELETE /api/conversations/{id}` | `routes_conv::delete_conversation` | delete conversation + messages + run tree (incl. sub-agent runs) + their tool calls/approvals + checkpoints, in one transaction |
 | `GET /api/conversations/{id}/messages` | `routes_conv::get_messages` | `StoredMessage[]` (ordered) |
 | `POST /api/conversations/{id}/chat` | `routes_conv::post_chat` | `{"content", "mode"?}`; 400 empty/>100 KB; **503 when no API key and no mock**; persists user message, starts run → `{"run_id"}` |
+| `GET /api/conversations/{id}/checkpoints?before=&limit=` | `routes_ckpts::list_checkpoints` | `CheckpointInfo[]` (newest first, cursor-paginated by `id`; `limit` clamped 1–200, default 50; snapshot content never included) |
+| `POST /api/checkpoints/{id}/restore` | `routes_ckpts::restore_checkpoint` | human-initiated restore (UI confirms first): snapshots current content (`run_id="restore"`), then writes the original back (`action:"restored"`) or trashes the file when the snapshot recorded "did not exist" (`action:"trashed"`); 404 unknown id; 400 when outside the current workspace or the current content is non-UTF-8 |
 | `GET /api/runs?conversation_id=…` | `routes_runs::list_runs` | `RunInfo[]` for a conversation |
 | `GET /api/runs/{id}/state` | `routes_runs::run_state` | snapshot `{run, agents (child runs), tool_calls}` |
 | `POST /api/runs/{id}/stop` | `routes_runs::stop_run` | cancel run + descendants; 404 if not live |
@@ -466,11 +524,27 @@ body limit. Errors are uniform: `{"error": "…"}` (never containing secrets).
 ### SSE
 
 `GET /api/runs/{id}/events` — text/event-stream of the run **and its whole
-sub-agent tree** (child events are fanned up to ancestor channels). 15 s
-keep-alive pings. Terminal/unknown runs replay a single `run_finished`
-event with the stored status (so late subscribers settle). A special
-`event: lagged` message tells the client its buffer overflowed and it should
-refetch the snapshot.
+sub-agent tree** (child events are fanned up to ancestor channels; each
+channel has its own sequence namespace). 15 s keep-alive pings.
+
+Every event carries `id: <seq>` — the hub's per-run monotonic sequence. On
+(re-)subscription the server replays its retained run log (8192 entries)
+from the client's cursor, then tails the live broadcast with per-connection
+deduplication:
+
+- Cursor sources: the `Last-Event-ID` request header (sent automatically by
+  the browser's `EventSource` on reconnect) and/or `?since=<seq>` (used by
+  the UI for manual re-subscribes). When both are present, the larger wins;
+  with neither, the full retained log is replayed from seq 1.
+- If the cursor predates the retained window (events were evicted), a named
+  `replay_gap` event is emitted first (data = oldest retained seq) and the
+  client is expected to resync from `GET /api/runs/{id}/state`. Broadcast
+  buffer overflow (`lagged`) maps to the same `replay_gap` event.
+- A cursor *above* the newest seq (a future/stale value) is clamped, not
+  honored literally: no gap is signaled and the live tail keeps flowing.
+
+Terminal/unknown runs replay a single synthesized `run_finished` event with
+the stored status (so late subscribers settle); no ids are stamped there.
 
 Event catalog (`RunEvent`, serde `tag = "type"`, snake_case;
 `vortex-types/src/events.rs:71-139`):
@@ -503,7 +577,7 @@ SQLite at `<data_dir>/vortex.db` (WAL, `synchronous=NORMAL`,
 | `runs` | **id**, conversation_id?, parent_run_id?, agent, task, model, status, error?, usage_json?, plan_json, depth, created_at, updated_at | indexed by conversation + parent |
 | `tool_calls` | **id**, run_id, tool, args_json, ok, summary, created_at | upsert: first-write wins for args |
 | `approvals` | **id**, run_id, agent, title, payload, status, created_at, decided_at? | status: pending/approved/denied/expired; list capped at 100 |
-| `checkpoints` | **id** (autoinc), conversation_id, run_id, path, original?, created_at | file content before modification; `NULL original` = file did not exist; newest-200 listing |
+| `checkpoints` | **id** (autoinc), conversation_id, run_id, path, original?, created_at | file content before modification; `NULL original` = file did not exist; non-UTF-8 files are deliberately not snapshotted (warn+skip); cursor-paginated listing; `run_id="restore"` marks the pre-restore snapshots written by the restore route |
 
 Run lifecycle: `queued` (waiting for a scheduler slot) → `running` →
 (`waiting_approval` ⇄ `running`)* → `completed` | `failed` | `cancelled`.
@@ -520,14 +594,19 @@ Per run (`engine.rs`, see §7):
   Exhaustion → run `failed` with "iteration limit reached".
 - **Wall clock**: deadline = start + `run_timeout_secs` (default 600 s,
   floor 30 s), enforced via `tokio::select!` around the LLM call.
-- **Tokens**: cumulative `usage.total_tokens > max_total_tokens` (default
-  200 000) fails the run — checked once per iteration after tool execution
-  (a single iteration can overshoot; `KNOWN_ISSUES.md` P15).
+- **Tokens**: enforced *before every provider call* — the run fails when
+  `max_total_tokens` (default 200 000) is exhausted, and each request's
+  `max_tokens` is clamped to the remaining budget, bounding any overshoot
+  to one clamped completion; a post-tool check remains as a backstop
+  (`KNOWN_ISSUES.md` P15, fixed).
 - **History**: coordinator runs replay the last 40 stored turns; tool
   results are appended as `tool` messages within the run.
 - **Cancellation**: `CancellationToken` tree — sub-agents get
   `parent.child_token()`, so stopping a coordinator stops all descendants;
   `POST /api/runs/{id}/stop` cancels one tree; server shutdown cancels all.
+  Cancelling (or hitting the deadline) **aborts the in-flight provider
+  task**, so the completion stream stops being consumed immediately
+  (`KNOWN_ISSUES.md` N8, fixed).
 - **Tool execution**: calls within one assistant turn run concurrently as
   spawned tasks; a panicking tool becomes a failed tool result, not a run
   crash; every call is persisted (`tool_calls` running → completed).
@@ -549,27 +628,41 @@ Per run (`engine.rs`, see §7):
 ## 12. Testing
 
 ```bash
-cargo test        # 46 tests, fully offline
+cargo test        # 105 tests, fully offline (+1 #[ignore]d live test)
 ```
 
 | Suite | Count | Covers |
 | --- | --- | --- |
-| `vortex-agents` unit tests | 24 | workspace confinement (`..`, absolute-outside, symlink escape/inside, dangling-symlink rejection), registry gating, scheduler limits/release-on-drop, safe_http IP classification, schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership, preview child-process lifecycle regression (survives attach, dies on stop) |
-| `vortex-agents/tests/engine.rs` | 5 | end-to-end runs against `MockLlm`: tool round-trips, sub-agent concurrency (exactly 6 under limit 6), permission inheritance (child can't widen), cancellation propagating to sub-agents, budget exhaustion |
-| `vortex-core` unit tests | 8 | config parsing (TOML, LAN entry), path overrides, conversation/message/settings roundtrips, run status updates, tool calls, approvals lifecycle, checkpoints |
-| `vortex-llm` unit + `tests/openrouter.rs` | 1 + 8 | SSE parser (chunk splits, CRLF); OpenRouter client against a local mock HTTP server: streaming text, tool-call delta accumulation, auth error without retry, 429 retry-then-success, missing key, malformed stream, missing `[DONE]`, model-not-found without retry |
+| `vortex-agents` unit tests | 44 | workspace confinement (`..`, absolute-outside, symlink escape/inside, dangling-symlink rejection), registry gating, scheduler limits/release-on-drop, hub seq/replay/overflow/ancestor-namespace semantics, safe_http IP classification (incl. IPv4-mapped IPv6), SSRF IP pinning (simulated DNS rebinding, reject-if-any, pin-picked-address, end-to-end pinned connect against an unresolvable `.invalid` host, allow-private localhost fetch), HTML strip size-cap UTF-8 safety, `fetch_url` text-cap UTF-8 safety, dev-server port detection (listener-ownership accept/reject, single-new-listener fallback, `/proc/net/tcp` parsing), checkpoint recording honesty (non-UTF-8 skip, absent-vs-text), schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership, preview child-process lifecycle regression (survives attach, dies on stop), delegate title truncation (UTF-8-safe) |
+| `vortex-agents/tests/engine.rs` | 8 | end-to-end runs against `MockLlm`: tool round-trips, sub-agent concurrency (exactly 6 under limit 6), permission inheritance (child can't widen), cancellation propagating to sub-agents **and aborting the provider task**, token budget enforced before the next call, tool events drained before `RunFinished` |
+| `vortex-core` unit tests | 26 | config parsing (TOML, LAN entry, `patch_lan_token` comment preservation), XDG/override path resolution (pure fn), conversation/message/settings roundtrips, corrupt-settings backup, cascade delete (run tree + tool calls + approvals + checkpoints), LIKE escaping, startup interrupted-run/approval expiry, run status updates, tool calls, approvals lifecycle, checkpoint roundtrips (incl. restore-snapshot linkage) and cursor pagination |
+| `vortex-llm` unit + `tests/openrouter.rs` | 7 + 13 | SSE parser (chunk splits, CRLF, multi-line `data:` joining, blank-line dispatch, `finish()` flush, overflow reporting); retry classification (5xx only); OpenRouter client against a local mock HTTP server: streaming text, tool-call delta accumulation, auth error without retry, 429 retry-then-success, 503 retry, 400 without retry, no retry after partial stream delivery, out-of-range tool-call index, missing key, malformed stream, missing `[DONE]`, model-not-found without retry |
+| `vortex-llm/tests/live_openrouter.rs` | (1, `#[ignore]`d) | opt-in LIVE smoke against the real OpenRouter API — costs credits, never runs in CI or plain `cargo test` (see below) |
+| `vortex-server` unit tests | 7 | constant-time LAN token comparison; SSE route over a local axum server: replay+live-tail ordering with per-connection dedup, `?since=` windowing, `Last-Event-ID` header and max-cursor semantics, `replay_gap` on an evicted window vs. future-cursor clamping, cursor parsing; checkpoint restore workspace-confinement helper |
 
-`vortex-server` and `vortex-types` have no tests of their own (routes are
-exercised indirectly; types are serde-only). `vortex-ui` is outside
+`vortex-types` has no tests of its own (serde-only). `vortex-ui` is outside
 `default-members`, so `cargo test` never compiles it; lint it with
 `cargo clippy -p vortex-ui --target wasm32-unknown-unknown`.
+
+**Live provider test (P14).** Everything else is offline by design; real
+OpenRouter behavior is verified only when *you* run the ignored smoke test
+with a real key (tiny prompt, `max_tokens: 16`; prints provider description
+and usage only — never the key):
+
+```sh
+OPENROUTER_API_KEY=sk-or-... \
+  cargo test -p vortex-llm --test live_openrouter -- --ignored --nocapture
+# optional: OPENROUTER_TEST_MODEL=openai/gpt-4o-mini (default openrouter/auto)
+```
 
 Adding tests: unit tests live in `#[cfg(test)] mod tests` at the bottom of
 each source file; cross-module tests live in `crates/<crate>/tests/`. Engine
 tests use `MockLlm::shared(vec![MockTurn::…])` and `test_context()` helpers
 (`registry.rs:201-257`, `tests/engine.rs`). Keep tests offline: local mock
 HTTP servers (axum on ephemeral ports) are the pattern for network code.
-Known hygiene gaps: `KNOWN_ISSUES.md` C23.
+The former hygiene gaps (`KNOWN_ISSUES.md` C23) are fixed: path tests are
+pure (no env mutation), store tests use tempdirs, and `MockLlm` can script
+failures via `MockTurn::failure`.
 
 ## 13. Edge cases & known limitations
 
@@ -585,18 +678,27 @@ and [`SECURITY.md`](SECURITY.md)):
   a machine with Chromium installed).
 - Live OpenRouter streaming has only been verified against a
   protocol-faithful local mock; real-provider framing differences are
-  possible (P14).
-- Mid-stream retries can duplicate streamed text (C3); broadcast lag can
-  silently drop events (C7); the UI has no SSE reconnect logic and only
-  reconciles at run end (C15).
-- A dangling symlink inside the workspace can escape confinement on writes
-  (C2); DNS-rebinding TOCTOU remains a residual SSRF risk (P1).
+  possible (P14 — an opt-in `#[ignore]`d live smoke test now exists, see
+  §12; it has deliberately not been run yet because it costs credits).
+- Mid-stream retries no longer duplicate streamed text (C3, fixed: retries
+  stop once anything was delivered); the server keeps a per-run event log
+  (8192 entries) and the SSE route replays it from the client's cursor, so
+  reconnects recover missed events (C7, fixed). Residual: if the retained
+  window overflows (extreme event bursts), the client gets `replay_gap` and
+  resyncs from the snapshot — text deltas lost that way are not
+  reconstructible mid-run (the snapshot has no accumulated assistant text);
+  the bubble heals at run end via the terminal message refetch.
+- Dangling symlinks inside the workspace are rejected on resolve (C2,
+  fixed); model-chosen fetches are IP-pinned after validation, closing the
+  DNS-rebinding TOCTOU window (P1, fixed).
 - The workspace is **not** a sandbox: commands run with your user rights;
   there is no container/namespace isolation (by design, stated plainly in
   `SECURITY.md`).
 - LAN mode: token-gated but no TLS; the WASM UI cannot send the token, so
   LAN mode is API-only in practice.
-- No CI, no `LICENSE` file (MIT claimed), `main` branch stale (C22).
+- CI workflow (`.github/workflows/ci.yml`) and `LICENSE` (MIT) now exist,
+  but CI has not been exercised on GitHub Actions yet and the `main` branch
+  is still stale (C22 residual — pushing is a user action).
 - Wayland/X11 desktop automation is not implemented; no packaging
   (.deb/.rpm) or install wizard — run the binary as your own user (no root,
   no services).

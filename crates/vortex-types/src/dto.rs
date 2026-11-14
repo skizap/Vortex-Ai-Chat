@@ -98,6 +98,20 @@ pub struct PreviewInfo {
     pub running: bool,
 }
 
+/// File checkpoint metadata for the recovery UI. The snapshot content itself
+/// is never shipped in lists (it can be large); restore reads it server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    pub id: i64,
+    pub run_id: String,
+    /// Absolute path as recorded when the snapshot was taken.
+    pub path: String,
+    /// `false` means the file did not exist at snapshot time: restoring such
+    /// a checkpoint removes (trashes) the file instead of rewriting content.
+    pub has_original: bool,
+    pub created_at: String,
+}
+
 /// Honest, runtime-detected capability report. The UI shows unconfigured
 /// capabilities with setup instructions rather than pretending they work.
 #[derive(Debug, Clone, Serialize, Deserialize)]

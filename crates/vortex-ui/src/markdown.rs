@@ -55,11 +55,17 @@ pub fn render_markdown(md: &str) -> String {
             Event::End(TagEnd::Heading(level, ..)) => {
                 out.push_str(&format!("</{}>", heading_tag(level)));
             }
-            Event::Start(Tag::BlockQuote(_)) => out.push_str("<blockquote><p>"),
-            Event::End(TagEnd::BlockQuote(_)) => out.push_str("</p></blockquote>"),
-            Event::Start(Tag::List(Some(1))) => {
+            Event::Start(Tag::BlockQuote(_)) => out.push_str("<blockquote>"),
+            Event::End(TagEnd::BlockQuote(_)) => out.push_str("</blockquote>"),
+            Event::Start(Tag::List(Some(start))) => {
                 ordered.push(true);
-                out.push_str("<ol>");
+                if start == 1 {
+                    out.push_str("<ol>");
+                } else {
+                    // Preserve the author's numbering: a list starting at N
+                    // used to emit bare <li> elements with no wrapper at all.
+                    out.push_str(&format!("<ol start=\"{start}\">"));
+                }
             }
             Event::Start(Tag::List(None)) => {
                 ordered.push(false);

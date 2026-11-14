@@ -43,22 +43,42 @@ pub fn App() -> impl IntoView {
             ctx_boot.conversations.set(convs);
         }
         if let Ok(apprs) = api::approvals().await {
-            ctx_boot.approvals.set(apprs);
+            ctx_boot
+                .approvals
+                .set(sse::filter_resolved_approvals(apprs));
         }
     });
 
     // Poll pending approvals so requests raised by sub-agents appear promptly.
+    // Responses are filtered through the session-resolved set: a poll that
+    // was already in flight when an approval got resolved must not put the
+    // resolved card back on screen (P12).
     let ctx_poll = ctx;
     set_interval(
         move || {
             let ctx = ctx_poll;
             spawn_local(async move {
                 if let Ok(apprs) = api::approvals().await {
-                    ctx.approvals.set(apprs);
+                    ctx.approvals.set(sse::filter_resolved_approvals(apprs));
                 }
             });
         },
         std::time::Duration::from_secs(5),
+    );
+
+    // Streaming-bubble throttle (P12): markdown + syntax highlighting re-run
+    // on `stream_display`, which mirrors `stream_text` at most every 125 ms
+    // (≤8 renders/s instead of one per SSE delta). App-level interval: views
+    // come and go with tab switches, this lives for the session.
+    let ctx_throttle = ctx;
+    set_interval(
+        move || {
+            let next = ctx_throttle.stream_text.get_untracked();
+            if ctx_throttle.stream_display.get_untracked() != next {
+                ctx_throttle.stream_display.set(next);
+            }
+        },
+        std::time::Duration::from_millis(125),
     );
 
     view! {

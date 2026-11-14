@@ -15,6 +15,10 @@ use vortex_types::{ChatMessage, ModelInfo, Role, ToolCall, Usage};
 
 const USER_AGENT: &str = concat!("vortex-ai-chat/", env!("CARGO_PKG_VERSION"));
 
+/// Upper bound on provider-supplied tool-call `index` values. A hostile or
+/// broken endpoint must not be able to grow the slot vector without limit.
+const MAX_TOOL_CALL_SLOTS: usize = 64;
+
 pub struct OpenRouterClient {
     http: reqwest::Client,
     base_url: String,
@@ -128,11 +132,15 @@ fn extract_error_message(body: &str) -> Option<String> {
     Some(msg.chars().take(500).collect())
 }
 impl OpenRouterClient {
+    /// One attempt. `streamed` is set to true as soon as any delta has been
+    /// forwarded to the caller; the retry loop uses it to avoid re-delivering
+    /// text the consumer has already seen (duplicate output + double billing).
     async fn try_complete_once(
         &self,
         url: &str,
         body: &serde_json::Value,
         events: &mpsc::Sender<LlmEvent>,
+        streamed: &mut bool,
     ) -> Result<CompletionResponse, LlmError> {
         // Never log headers or the full body: bodies contain user content.
         let resp = self
@@ -146,7 +154,9 @@ impl OpenRouterClient {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    LlmError::Timeout(120)
+                    // connect_timeout(10s) vs read_timeout(120s): report the
+                    // phase that actually failed instead of a hardcoded value.
+                    LlmError::Timeout(if e.is_connect() { 10 } else { 120 })
                 } else {
                     LlmError::Network("request failed".into())
                 }
@@ -164,17 +174,68 @@ impl OpenRouterClient {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut usage = None;
         let mut finish_reason = String::new();
+        // Once the event consumer is gone, stop trying to deliver deltas but
+        // keep accumulating so the final response stays complete.
+        let mut sink_alive = true;
 
         use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| {
-                if e.is_timeout() {
-                    LlmError::Timeout(120)
-                } else {
-                    LlmError::Network("stream read failed".into())
+        loop {
+            let payloads = match stream.next().await {
+                Some(chunk) => {
+                    let bytes = chunk.map_err(|e| {
+                        if e.is_timeout() {
+                            LlmError::Timeout(120)
+                        } else {
+                            LlmError::Network("stream read failed".into())
+                        }
+                    })?;
+                    let p = parser.push(&bytes);
+                    if parser.take_overflow() {
+                        return Err(LlmError::MalformedStream(
+                            "SSE payload exceeded the 1 MiB line / 8 MiB event cap".into(),
+                        ));
+                    }
+                    p
                 }
-            })?;
-            for payload in parser.push(&bytes) {
+                None => {
+                    // Stream ended without [DONE]: flush a trailing event that
+                    // was never terminated by a blank line, then return what
+                    // we accumulated.
+                    if let Some(tail) = parser.finish() {
+                        if tail != "[DONE]" {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tail) {
+                                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                                    usage = Some(parse_usage(u));
+                                }
+                                if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
+                                    if let Some(reason) =
+                                        choice.get("finish_reason").and_then(|f| f.as_str())
+                                    {
+                                        finish_reason = reason.to_string();
+                                    }
+                                    if let Some(txt) = choice
+                                        .get("delta")
+                                        .and_then(|d| d.get("content"))
+                                        .and_then(|c| c.as_str())
+                                    {
+                                        if !txt.is_empty() {
+                                            content.push_str(txt);
+                                            *streamed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(CompletionResponse {
+                        content,
+                        tool_calls,
+                        usage,
+                        finish_reason,
+                    });
+                }
+            };
+            for payload in payloads {
                 if payload == "[DONE]" {
                     return Ok(CompletionResponse {
                         content,
@@ -201,8 +262,16 @@ impl OpenRouterClient {
                 {
                     if !txt.is_empty() {
                         content.push_str(txt);
-                        // Best-effort forward; if the UI hung up we keep going.
-                        let _ = events.try_send(LlmEvent::TextDelta(txt.to_string()));
+                        *streamed = true;
+                        if sink_alive
+                            && events
+                                .send(LlmEvent::TextDelta(txt.to_string()))
+                                .await
+                                .is_err()
+                        {
+                            // Consumer hung up; keep accumulating the final text.
+                            sink_alive = false;
+                        }
                     }
                 }
                 if let Some(tcs) = delta
@@ -210,7 +279,16 @@ impl OpenRouterClient {
                     .and_then(|t| t.as_array())
                 {
                     for tc in tcs {
-                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                        if index >= MAX_TOOL_CALL_SLOTS as u64 {
+                            tracing::warn!(
+                                index,
+                                cap = MAX_TOOL_CALL_SLOTS,
+                                "ignoring tool-call delta with out-of-range index"
+                            );
+                            continue;
+                        }
+                        let index = index as usize;
                         let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or_default();
                         let name = tc
                             .pointer("/function/name")
@@ -239,13 +317,6 @@ impl OpenRouterClient {
                 }
             }
         }
-        // Stream ended without [DONE]; still return what we accumulated.
-        Ok(CompletionResponse {
-            content,
-            tool_calls,
-            usage,
-            finish_reason,
-        })
     }
 }
 
@@ -272,16 +343,29 @@ impl LlmClient for OpenRouterClient {
         let body = self.build_body(req);
 
         let mut attempt: u32 = 0;
+        // Once any attempt has streamed text to the caller, retrying would
+        // re-deliver already-shown content into the same channel (duplicated
+        // UI text + double billing), so retries stop at that point.
+        let mut streamed_any = false;
         loop {
-            match self.try_complete_once(&url, &body, &events).await {
+            match self
+                .try_complete_once(&url, &body, &events, &mut streamed_any)
+                .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if e.is_retryable() && attempt < self.max_retries {
+                    if e.is_retryable() && attempt < self.max_retries && !streamed_any {
                         attempt += 1;
                         // Bounded backoff: 1s, 3s. Never longer.
                         tokio::time::sleep(Duration::from_secs(1 + 2 * attempt as u64)).await;
                         tracing::warn!(retry = attempt, "retrying provider request");
                         continue;
+                    }
+                    if streamed_any && e.is_retryable() {
+                        tracing::warn!(
+                            "provider failed mid-stream after partial delivery; not retrying \
+                             to avoid duplicating streamed output"
+                        );
                     }
                     return Err(e);
                 }
@@ -299,7 +383,13 @@ impl LlmClient for OpenRouterClient {
             .timeout(Duration::from_secs(20))
             .send()
             .await
-            .map_err(|e| LlmError::Network(format!("models request failed: {}", e.is_timeout())))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    LlmError::Timeout(20)
+                } else {
+                    LlmError::Network("models request failed".into())
+                }
+            })?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

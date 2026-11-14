@@ -1,6 +1,6 @@
 //! HTML → text extraction (dependency-free) and private-IP policy helpers.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::errors::ToolError;
 
@@ -72,7 +72,15 @@ pub fn strip_html(html: &str) -> (Option<String>, String) {
         }
     }
     let mut final_text = collapsed.trim().to_string();
-    final_text.truncate(final_text.len().min(120_000));
+    // Cap by bytes but never split a UTF-8 character: `truncate` panics on a
+    // non-char boundary, and fetched pages are full of multi-byte text.
+    if final_text.len() > 120_000 {
+        let mut cut = 120_000;
+        while !final_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        final_text.truncate(cut);
+    }
     (title, final_text)
 }
 
@@ -86,30 +94,48 @@ fn decode_entities(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-pub async fn ensure_not_private(parsed: &url::Url) -> Result<(), ToolError> {
+/// Production resolver: OS DNS via tokio.
+pub async fn default_resolve(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok(tokio::net::lookup_host((host, port)).await?.collect())
+}
+
+/// Resolve a URL's host and validate *every* returned address against the
+/// private-network policy: if any address is private, the whole URL is
+/// rejected. Returns the full validated address list (port included) so the
+/// caller can pin the actual connection to one of these exact addresses —
+/// closing the DNS-rebinding TOCTOU window between validation and connect.
+///
+/// The resolver is injectable so tests can simulate rebinding without DNS.
+pub async fn validated_addrs<F, Fut>(
+    parsed: &url::Url,
+    resolver: F,
+) -> Result<Vec<SocketAddr>, ToolError>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
     let host = parsed
         .host_str()
         .ok_or_else(|| ToolError::InvalidArgs("url".into(), "URL has no host".into()))?;
-    // IP-literal fast path.
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    // IP-literal fast path: no DNS involved, nothing can rebind.
     if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         if is_private_ip(ip) {
             return Err(ToolError::NotPermitted(format!(
                 "refusing to fetch '{host}': private/local network addresses are blocked"
             )));
         }
-        return Ok(());
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    // Resolve and check every address (blocks DNS-based bypasses).
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(it) => it.collect(),
-        Err(e) => {
-            return Err(ToolError::Execution(format!(
-                "DNS lookup failed for '{host}': {e}"
-            )))
-        }
-    };
-    for a in addrs {
+    let addrs = resolver(host.to_string(), port)
+        .await
+        .map_err(|e| ToolError::Execution(format!("DNS lookup failed for '{host}': {e}")))?;
+    if addrs.is_empty() {
+        return Err(ToolError::Execution(format!(
+            "DNS lookup for '{host}' returned no addresses"
+        )));
+    }
+    for a in &addrs {
         if is_private_ip(a.ip()) {
             return Err(ToolError::NotPermitted(format!(
                 "refusing to fetch '{host}': it resolves to a private/local address ({})",
@@ -117,7 +143,7 @@ pub async fn ensure_not_private(parsed: &url::Url) -> Result<(), ToolError> {
             )));
         }
     }
-    Ok(())
+    Ok(addrs)
 }
 
 pub fn is_private_ip(ip: IpAddr) -> bool {
@@ -130,6 +156,12 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.octets()[0] == 0
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) must be judged by
+            // their IPv4 half; otherwise e.g. ::ffff:127.0.0.1 slips past
+            // every check below and defeats the loopback/private block.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || (v6.segments()[0] & 0xfe00) == 0xfc00  // unique local fc00::/7
@@ -165,11 +197,26 @@ mod tests {
             "::1",
             "fe80::1",
             "fc00::1",
+            // IPv4-mapped IPv6 must inherit the IPv4 policy.
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+            "::ffff:169.254.169.254",
         ] {
             assert!(is_private_ip(ip.parse().unwrap()), "{ip} should be private");
         }
-        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700::1"] {
+        for ip in ["1.1.1.1", "8.8.8.8", "2606:4700::1", "::ffff:1.1.1.1"] {
             assert!(!is_private_ip(ip.parse().unwrap()), "{ip} should be public");
         }
+    }
+
+    #[test]
+    fn size_cap_never_splits_a_utf8_character() {
+        // Each char is 3 bytes; 120_000 is not a multiple of 3, so the old
+        // `truncate(120_000)` panicked on this input.
+        let big = "あ".repeat(60_000);
+        let html = format!("<p>{big}</p>");
+        let (_, text) = strip_html(&html);
+        assert!(text.len() <= 120_000);
+        assert!(text.chars().all(|c| c == 'あ'));
     }
 }

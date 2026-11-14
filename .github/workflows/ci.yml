@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test (Rust 1.89.0, wasm UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libsqlite3-dev
+
+      # rust-toolchain.toml pins 1.89.0; rustup honors it for every cargo call.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (native workspace)
+        run: cargo clippy --all-targets
+
+      - name: Clippy (wasm UI)
+        run: cargo clippy -p vortex-ui --target wasm32-unknown-unknown
+
+      - name: Test
+        run: cargo test
+
+      - name: Install Trunk + wasm-bindgen-cli (version must equal Cargo.lock)
+        run: |
+          cargo install trunk --locked
+          WASM_BINDGEN_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep version | sed 's/.*"\(.*\)".*/\1/')
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+
+      - name: Build WASM UI
+        run: scripts/build-ui.sh
+
+      - name: Build release server (embedded UI)
+        run: cargo build --release -p vortex-server
