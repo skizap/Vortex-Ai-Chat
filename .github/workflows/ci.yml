@@ -44,7 +44,8 @@ jobs:
 
       - name: Install Trunk + wasm-bindgen-cli (version must equal Cargo.lock)
         run: |
-          cargo install trunk --locked
+          # Trunk 0.22+ requires rustc >= 1.96; the repo pins 1.89.0, so pin Trunk too.
+          cargo install trunk --version 0.21.14 --locked
           WASM_BINDGEN_VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | grep version | sed 's/.*"\(.*\)".*/\1/')
           cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
 

@@ -72,7 +72,7 @@ Tested baseline: Linux Mint 22.3 / Ubuntu 24.04, x86_64. Linux only.
 | cc toolchain, `pkg-config` | bundled SQLite (rusqlite `bundled`) needs cc | `sudo apt install build-essential pkg-config` |
 | `libsqlite3-dev` | SQLite headers | `sudo apt install libsqlite3-dev` |
 | **OpenRouter API key** | **required — the assistant cannot function without one** | <https://openrouter.ai/keys> → put in `.env` |
-| Trunk | UI (WASM) builds only | `cargo install trunk --locked` (0.21.x tested) |
+| Trunk | UI (WASM) builds only | `cargo install trunk --version 0.21.14 --locked` (0.22+ needs rustc ≥ 1.96) |
 | wasm-bindgen-cli **0.2.129** | UI builds only; must equal the `wasm-bindgen` version in `Cargo.lock` or Trunk fails | `cargo install wasm-bindgen-cli --version 0.2.129` |
 | Chromium (optional) | browser tools | `sudo apt install chromium`, or set `VORTEX_CHROME_PATH` |
 | SearXNG (optional) | research-mode web search | e.g. `docker run --rm -p 127.0.0.1:8888:8080 searxng/searxng` with JSON output enabled |

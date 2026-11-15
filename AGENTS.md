@@ -41,7 +41,7 @@ Native `cargo build/test/clippy` from the workspace root **never touches `vortex
 
 - Rust **1.89.0** — pinned by `rust-toolchain.toml`; rustup enforces it.
 - `wasm-bindgen-cli` **0.2.129** — must equal the `wasm-bindgen` version in `Cargo.lock` or the Trunk build fails.
-- Trunk (any recent; 0.21.x tested) — `cargo install trunk --locked`.
+- Trunk **0.21.14** — `cargo install trunk --version 0.21.14 --locked` (Trunk 0.22+ requires rustc ≥ 1.96, incompatible with the 1.89.0 pin; CI is pinned the same way).
 - System deps: `build-essential pkg-config libsqlite3-dev` (SQLite is bundled via rusqlite `bundled` feature; cc is still required).
 
 ## Invariants — do not break these

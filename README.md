@@ -20,7 +20,7 @@ A local-first, privacy-respecting AI assistant for Linux — chat, internet rese
 - C compiler (cc) — for the bundled SQLite
 - `libsqlite3-dev`, `pkg-config`, `build-essential` — `sudo apt install build-essential pkg-config libsqlite3-dev` (Debian/Ubuntu)
 - **Optional:** Chromium for browser tools (`sudo apt install chromium`), a SearXNG instance for research
-- **Optional, UI builds only:** `cargo install trunk --locked` and a matching `cargo install wasm-bindgen-cli --version <version in Cargo.lock>` (currently 0.2.129). Not required to run a release binary that already embeds the UI.
+- **Optional, UI builds only:** `cargo install trunk --version 0.21.14 --locked` (Trunk 0.22+ needs a newer Rust than the pinned 1.89.0) and a matching `cargo install wasm-bindgen-cli --version <version in Cargo.lock>` (currently 0.2.129). Not required to run a release binary that already embeds the UI.
 
 No Python and no Node.js are used or required by the assistant itself.
 
