@@ -1,5 +1,7 @@
 # Vortex-Ai-Chat
 
+[![CI](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml/badge.svg)](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml)
+
 A local-first, privacy-respecting AI assistant for Linux — chat, internet research with citations, workspace coding, controlled website previews, and isolated browser automation, with a coordinator that can delegate to **up to six concurrent sub-agents**. The entire application — backend, agent orchestration, tools, storage, and the browser UI — is written in **Rust** (the UI compiles to WebAssembly).
 
 > Linux only (tested baseline: Linux Mint 22.3 / Ubuntu 24.04, x86_64). Windows/macOS are out of scope.

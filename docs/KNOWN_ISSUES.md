@@ -29,7 +29,7 @@ restore, outside-workspace rejection (P17). A live OpenRouter test now
 exists but stays `#[ignore]`d until the user runs it (P14).
 
 **Remaining open items** (quick index): C19 (residual `use_context`
-expects), C22 (CI not yet exercised on Actions; `main` stale), P2
+expects), C22 (CI verified green; `main` stale until the PR merges), P2
 (resolve→op TOCTOU), P11 (boot/poll error surfacing), P14 (live provider
 run pending).
 
@@ -560,10 +560,16 @@ absent in `crates/vortex-server/src/routes_runs.rs`.
 - `LICENSE` (MIT) added, matching `Cargo.toml`/README claims. — Done.
 - CI added at `.github/workflows/ci.yml` (fmt, clippy native + wasm, tests,
   Trunk build, release server build; honors the `rust-toolchain.toml` pin).
-  Not yet exercised on GitHub Actions (nothing was pushed in this pass) —
-  the workflow is unverified until the first push. — Done locally, OPEN
-  verification.
-- `main` still stale / no PR — out of scope for local work. — OPEN.
+  **Exercised on GitHub Actions and green** (run 43665360138 on
+  `d720c1b`: fmt, clippy `-D warnings` native + wasm, tests, Trunk UI build,
+  release server build). The first run failed at the Trunk install step
+  because unpinned `cargo install trunk` resolved to 0.22.x (needs
+  rustc >= 1.96, repo pins 1.89.0); CI, README, AGENTS.md, DEVELOPER_GUIDE
+  and `scripts/build-ui.sh` now pin Trunk 0.21.14. — Done, verified.
+- Stray `test.txt` removed and local `.kilo/` tool state untracked and
+  gitignored. — Done.
+- `main` stays stale until the `feat/rust-linux-ai-assistant` PR is merged.
+  — OPEN (merge pending).
 
 **Description (original).**
 - `.gitignore:6` exempts `crates/vortex-server/ui-dist/.gitkeep`, which did
