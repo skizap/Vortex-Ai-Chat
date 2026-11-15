@@ -34,10 +34,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (native workspace)
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (wasm UI)
-        run: cargo clippy -p vortex-ui --target wasm32-unknown-unknown
+        run: cargo clippy -p vortex-ui --target wasm32-unknown-unknown -- -D warnings
 
       - name: Test
         run: cargo test

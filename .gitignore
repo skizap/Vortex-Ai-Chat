@@ -11,6 +11,9 @@ crates/vortex-server/ui-dist/
 .env
 *.local.toml
 
+# Local tool state (agent plans, worktrees)
+.kilo/
+
 # Runtime data (never commit databases, caches, workspaces)
 *.db
 *.db-shm
