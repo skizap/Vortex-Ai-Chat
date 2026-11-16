@@ -12,6 +12,7 @@ use crate::schema::{ParamSpec, ParamType, ToolDef};
 use crate::tools_files::rel_display;
 use async_trait::async_trait;
 use std::path::Path;
+use vortex_core::diag;
 use vortex_types::PermissionProfile;
 
 fn profile_allows_writes(ctx: &ToolContext) -> Result<(), ToolError> {
@@ -26,7 +27,37 @@ fn profile_allows_writes(ctx: &ToolContext) -> Result<(), ToolError> {
 }
 
 async fn checkpoint(ctx: &ToolContext, ws: &crate::workspace::WorkspaceRoots, path: &Path) {
-    let original = tokio::fs::read_to_string(path).await.ok();
+    // Distinguish "file absent" (record `original = NULL`, meaning: did not
+    // exist — a restore trashes the file) from "present but not readable as
+    // UTF-8 text" (record NOTHING: a NULL would wrongly claim the file never
+    // existed, and a restore would then trash a binary file instead of
+    // putting its content back — silently destroying data).
+    let original = match tokio::fs::read_to_string(path).await {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            // The normal log names the path and the OS error text; in
+            // diagnostics mode both are user-controlled content, so only a
+            // fixed-category event is emitted instead.
+            if diag::enabled() {
+                diag::event(
+                    tracing::Level::WARN,
+                    diag::TOOL_CHECKPOINT_SKIPPED,
+                    &[
+                        ("run_id", diag::Field::Uuid(ctx.run_id.as_str())),
+                        ("reason", diag::Field::Static("not_utf8")),
+                    ],
+                );
+            } else {
+                tracing::warn!(
+                    "skipping checkpoint for '{}': the file exists but is not readable as UTF-8 \
+                     text ({e}); a text snapshot could not represent it faithfully",
+                    path.display()
+                );
+            }
+            return;
+        }
+    };
     if let (Some(db), Some(conv)) = (&ctx.db, &ctx.conversation_id) {
         let res = db
             .add_checkpoint(
@@ -37,7 +68,21 @@ async fn checkpoint(ctx: &ToolContext, ws: &crate::workspace::WorkspaceRoots, pa
             )
             .await;
         if let Err(e) = res {
-            tracing::warn!("checkpoint failed: {e}");
+            if diag::enabled() {
+                diag::event(
+                    tracing::Level::ERROR,
+                    diag::DB_PERSIST_FAILED,
+                    &[
+                        ("op", diag::Field::Static("checkpoint_add")),
+                        ("run_id", diag::Field::Uuid(ctx.run_id.as_str())),
+                        ("conversation_id", diag::Field::Uuid(conv.as_str())),
+                    ],
+                );
+            } else {
+                // Normal path keeps the existing message; the DB error text
+                // could echo query internals and is not diagnostics-safe.
+                tracing::warn!("checkpoint failed: {e}");
+            }
         }
     }
     let _ = ws;
@@ -251,5 +296,77 @@ impl Tool for WriteFileTool {
             summary: format!("wrote {display}"),
             diff: Some(diff),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_types::Settings;
+
+    async fn ctx_with_db(
+        dir: &tempfile::TempDir,
+    ) -> (ToolContext, vortex_core::Db, tempfile::TempDir) {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = vortex_core::Db::open(db_dir.path().join("t.db")).unwrap();
+        let settings = Settings {
+            workspace: Some(dir.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let (mut ctx, _rx, _cancel) = crate::registry::test_context(settings, &[]);
+        ctx.db = Some(db.clone());
+        ctx.conversation_id = Some("conv-ckpt".into());
+        ctx.run_id = "run-ckpt".into();
+        (ctx, db, db_dir)
+    }
+
+    /// Recording flaw fix: a file that exists but is not valid UTF-8 must NOT
+    /// get a checkpoint row — a NULL `original` would mean "didn't exist",
+    /// and a later restore would trash the binary file instead of keeping it.
+    #[tokio::test]
+    async fn checkpoint_skips_present_non_utf8_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, db, _db_dir) = ctx_with_db(&dir).await;
+        let ws = crate::workspace::WorkspaceRoots::new(dir.path()).unwrap();
+
+        let bin = dir.path().join("data.bin");
+        std::fs::write(&bin, [0xff_u8, 0xfe, 0x00, 0x80, 0xff]).unwrap();
+        checkpoint(&ctx, &ws, &bin).await;
+        let list = db
+            .list_checkpoints("conv-ckpt".into(), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            list.is_empty(),
+            "a non-UTF-8 file must not produce a (misleading NULL) checkpoint row: {list:?}"
+        );
+    }
+
+    /// Text files snapshot their content; absent files record `NULL`
+    /// ("did not exist") — the two cases must stay distinguishable.
+    #[tokio::test]
+    async fn checkpoint_records_text_and_absent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, db, _db_dir) = ctx_with_db(&dir).await;
+        let ws = crate::workspace::WorkspaceRoots::new(dir.path()).unwrap();
+
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, "hello").unwrap();
+        checkpoint(&ctx, &ws, &txt).await;
+        let absent = dir.path().join("brand-new.txt");
+        checkpoint(&ctx, &ws, &absent).await;
+
+        let list = db
+            .list_checkpoints("conv-ckpt".into(), None, 100)
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        // Newest first: the absent file, flagged has_original = false.
+        assert!(list[0].path.ends_with("brand-new.txt"));
+        assert!(!list[0].has_original);
+        assert!(list[1].path.ends_with("notes.txt"));
+        assert!(list[1].has_original);
+        let (_, _, original) = db.get_checkpoint(list[1].id).await.unwrap().unwrap();
+        assert_eq!(original.as_deref(), Some("hello"));
     }
 }

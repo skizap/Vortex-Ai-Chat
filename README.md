@@ -1,5 +1,7 @@
 # Vortex-Ai-Chat
 
+[![CI](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml/badge.svg)](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml)
+
 A local-first, privacy-respecting AI assistant for Linux — chat, internet research with citations, workspace coding, controlled website previews, and isolated browser automation, with a coordinator that can delegate to **up to six concurrent sub-agents**. The entire application — backend, agent orchestration, tools, storage, and the browser UI — is written in **Rust** (the UI compiles to WebAssembly).
 
 > Linux only (tested baseline: Linux Mint 22.3 / Ubuntu 24.04, x86_64). Windows/macOS are out of scope.
@@ -9,6 +11,7 @@ A local-first, privacy-respecting AI assistant for Linux — chat, internet rese
 - **Chat** — persistent conversations with streamed responses, safe Markdown, syntax-highlighted code, copy buttons, search/rename/delete.
 - **Research** — pluggable search (SearXNG or built-in mock) with source links; SSRF-protected page fetching.
 - **Coding** — file tools confined to a user-selected workspace, exact-match edits with unified diffs and automatic checkpoints, optional approval-gated command execution (no shell), loopback-only website previews.
+- **File checkpoints & recovery** — every agent write/edit/delete snapshots the previous content; the Tasks panel lists them per conversation (paginated) and one confirmed click restores a file — the current content is snapshotted first, so restores are reversible too.
 - **Browser** — isolated Chromium instance (separate profile, never yours) driven over the DevTools Protocol from Rust; login/CAPTCHA handoff to the human.
 - **Multi-agent** — the coordinator delegates self-contained subtasks to sub-agents; **6 run concurrently by default** (configurable 1–16, enforced server-side by a scheduler, not by prompts), nested agents share the same cap, and results are tracked in the Tasks panel.
 - **Approvals** — consequential actions (deletions, sensitive commands, purchases, publishing, …) always pause for explicit human approval; sub-agents cannot self-approve.
@@ -19,11 +22,15 @@ A local-first, privacy-respecting AI assistant for Linux — chat, internet rese
 - C compiler (cc) — for the bundled SQLite
 - `libsqlite3-dev`, `pkg-config`, `build-essential` — `sudo apt install build-essential pkg-config libsqlite3-dev` (Debian/Ubuntu)
 - **Optional:** Chromium for browser tools (`sudo apt install chromium`), a SearXNG instance for research
-- **Optional, UI builds only:** `cargo install trunk --locked` and a matching `cargo install wasm-bindgen-cli --version <version in Cargo.lock>` (currently 0.2.129). Not required to run a release binary that already embeds the UI.
+- **Optional, UI builds only:** `cargo install trunk --version 0.21.14 --locked` (Trunk 0.22+ needs a newer Rust than the pinned 1.89.0) and a matching `cargo install wasm-bindgen-cli --version <version in Cargo.lock>` (currently 0.2.129). Not required to run a release binary that already embeds the UI.
 
 No Python and no Node.js are used or required by the assistant itself.
 
 ## Setup
+
+**A real OpenRouter API key is required** — the assistant cannot function
+without one. Create an account at <https://openrouter.ai/keys>, generate a
+key, and put it in `.env` as shown below.
 
 ```bash
 git clone https://github.com/skizap/Vortex-Ai-Chat.git
@@ -38,24 +45,34 @@ scripts/build-release.sh      # builds WASM UI + native release binary
 `.env` is loaded from the working directory at startup; environment variables
 take precedence over `config.toml`, which lives under `~/.config/vortex/`.
 
-### Testing without credentials
+> **Fresh clone?** The built UI assets (`crates/vortex-server/ui-dist/`) are
+> not tracked by Git. Until you run `scripts/build-ui.sh` (included in
+> `build-release.sh`), the server serves a placeholder page explaining this.
+> For a dev workflow, see `docs/DEVELOPER_GUIDE.md` §3.
+
+### Offline test harness (not a way to use the assistant)
 
 ```bash
 VORTEX_LLM=mock ./target/release/vortex-server
 ```
 
-runs against a built-in mock provider (no network, no key): `VORTEX_MOCK_SCRIPT=echo`
-echoes your message; `VORTEX_MOCK_SCRIPT=tools` performs a real web_search tool
-round-trip so the whole tool pipeline can be exercised offline.
+runs against a built-in mock provider (no network, no key). It exists solely
+to exercise the request/tool/SSE plumbing offline for development and tests:
+`VORTEX_MOCK_SCRIPT=echo` echoes your message; `VORTEX_MOCK_SCRIPT=tools`
+performs a scripted web_search tool round-trip. The mock produces canned
+text with no model behind it — it does **not** provide real chat, research,
+or coding functionality and is **not** a substitute for an API key.
 
 ## Storage locations (XDG)
 
 | Purpose | Default | Override |
 | --- | --- | --- |
-| Config (`config.toml`) | `~/.config/vortex/` | `VORTEX_CONFIG_DIR` |
-| Data (SQLite DB, trash) | `~/.local/share/vortex/` | `VORTEX_DATA_DIR` |
-| Cache (isolated browser profile) | `~/.cache/vortex/` | `VORTEX_CACHE_DIR` |
+| Config (`config.toml`) | `$XDG_CONFIG_HOME/vortex/` (fallback `~/.config/vortex/`) | `VORTEX_CONFIG_DIR` |
+| Data (SQLite DB, trash) | `$XDG_DATA_HOME/vortex/` (fallback `~/.local/share/vortex/`) | `VORTEX_DATA_DIR` |
+| Cache (isolated browser profile) | `$XDG_CACHE_HOME/vortex/` (fallback `~/.cache/vortex/`) | `VORTEX_CACHE_DIR` |
 
+Precedence: `VORTEX_*_DIR` (must be absolute) > absolute `XDG_*_HOME` >
+`$HOME` defaults (relative `XDG_*_HOME` values are ignored per the XDG spec).
 All paths are created on first run. The SQLite database is `data/vortex.db`
 (WAL mode); deleted files go to `data/trash/` (recoverable).
 
@@ -113,13 +130,23 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate layout, data
 flow, and the agent loop; see [`docs/SECURITY.md`](docs/SECURITY.md) for the
 threat model, permission model, and known limitations.
 
+## Documentation
+
+- [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md) — full developer
+  guide: setup, running locally, component walkthroughs, HTTP API reference,
+  data model, agent-loop semantics, testing.
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — confirmed issues and
+  possible concerns from the latest source analysis, with file:line evidence.
+- [`AGENTS.md`](AGENTS.md) — orientation for AI agents working in this repo
+  (commands, toolchain pins, invariants, gotchas).
+
 ## Development
 
 ```bash
-cargo test                       # 43 tests (all offline: mocks + local servers)
+cargo test                       # 105 tests (all offline: mocks + local servers; +1 #[ignore]d live-provider smoke)
 cargo fmt --all -- --check
 cargo clippy --all-targets       # clean
-scripts/build-ui.sh              # WASM UI only
+scripts/build-ui.sh              # WASM UI only (debug server reads ui-dist/ from disk)
 cargo build --release -p vortex-server
 ```
 
@@ -138,4 +165,4 @@ cargo build --release -p vortex-server
 
 ## License
 
-MIT — see `Cargo.toml`.
+MIT — see `LICENSE`.

@@ -15,6 +15,13 @@ pub struct DelegateTool {
     pub engine_slot: Arc<OnceLock<Arc<Engine>>>,
 }
 
+/// Fallback title from the task text. Truncates by *characters*, never by
+/// bytes: the task is model-provided and a byte slice at position 20 can
+/// land inside a multi-byte UTF-8 character and panic.
+fn default_title(task: &str) -> String {
+    format!("sub-{}", task.chars().take(20).collect::<String>())
+}
+
 const DELEGATE_DEF: ToolDef = ToolDef {
     name: "delegate_subtask",
     description: "Delegate a self-contained subtask to a sub-agent. Give explicit context, the required output, and a tool list. Sub-agents run concurrently (bounded by the user's configured limit) and cannot exceed your own permissions.",
@@ -63,7 +70,7 @@ impl Tool for DelegateTool {
             .get("title")
             .and_then(|t| t.as_str())
             .map(|s| s.chars().take(40).collect::<String>())
-            .unwrap_or_else(|| format!("sub-{}", &task[..task.len().min(20)]));
+            .unwrap_or_else(|| default_title(task));
         let agent = format!("subagent-{}", uuid::Uuid::new_v4().simple());
         let requested: Option<Vec<String>> =
             args.get("tools").and_then(|t| t.as_array()).map(|a| {
@@ -83,5 +90,23 @@ impl Tool for DelegateTool {
                 "sub-agent '{title}' did not complete: {e}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_title_never_splits_a_utf8_character() {
+        // Byte 20 of this string lands inside a 3-byte character; the old
+        // byte-slice truncation panicked here.
+        let cjk = default_title("日本語のタスク説明テキストです");
+        assert_eq!(cjk, "sub-日本語のタスク説明テキストです");
+        let emoji = default_title("🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀");
+        assert!(emoji.starts_with("sub-"));
+        assert_eq!(emoji.chars().count(), 4 + 12);
+        let long = default_title(&"x".repeat(100));
+        assert_eq!(long, format!("sub-{}", "x".repeat(20)));
     }
 }

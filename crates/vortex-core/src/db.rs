@@ -22,6 +22,9 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = rusqlite::Connection::open(path.as_ref())?;
+        // A second process touching the DB (sqlite3 CLI, a stray second
+        // server) must produce a short wait, not an instant SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -42,20 +45,32 @@ impl Db {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = conn.lock().expect("db mutex poisoned");
+            // Poisoning recovery: the connection itself is not invalidated by
+            // a panic in an unrelated caller; failing every later query would
+            // turn one bug into a dead server.
+            let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
             f(&guard).map_err(CoreError::Db)
         })
         .await
-        .map_err(|e| CoreError::Config(format!("db task join error: {e}")))?
+        .map_err(|e| {
+            // Diagnostics carry only the fixed category: a JoinError's display
+            // can embed a panic payload, which must never reach diagnostics.
+            crate::diag::event(
+                tracing::Level::ERROR,
+                crate::diag::DB_JOIN_FAILED,
+                &[("panicked", crate::diag::Field::Flag(e.is_panic()))],
+            );
+            CoreError::Config(format!("db task join error: {e}"))
+        })?
     }
 
     /// Synchronous access for one-shot startup tasks only.
     pub fn raw_connection(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn.lock().expect("db mutex poisoned")
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(SCRIPT)?;
         Ok(())
     }
@@ -138,16 +153,90 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation ON checkpoints(conversation_id);
 "#;
 
-/// Mark runs that were live when the process died as honestly interrupted.
+/// Mark runs that were live when the process died as honestly interrupted,
+/// and expire the pending approvals that belonged to them (their in-memory
+/// waiters are gone, so leaving them "pending" would surface undismissable
+/// ghost approvals after a restart).
 /// Never replays anything consequential automatically.
-pub fn mark_interrupted_on_startup(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    conn.execute(
+/// Returns `(runs_marked, approvals_expired)`.
+pub fn mark_interrupted_on_startup(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<(usize, usize)> {
+    let ts = now();
+    let runs = conn.execute(
         "UPDATE runs SET status = 'interrupted', updated_at = ?1
          WHERE status IN ('queued','running','waiting_approval')",
-        rusqlite::params![now()],
-    )
+        rusqlite::params![ts],
+    )?;
+    let approvals = conn.execute(
+        "UPDATE approvals SET status = 'expired', decided_at = ?1
+         WHERE status = 'pending'
+           AND run_id IN (SELECT id FROM runs WHERE status = 'interrupted')",
+        rusqlite::params![ts],
+    )?;
+    Ok((runs, approvals))
 }
 
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_marks_runs_interrupted_and_expires_their_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("t.db")).unwrap();
+        conn.execute_batch(SCRIPT).unwrap();
+        let ts = now();
+        conn.execute(
+            "INSERT INTO runs (id, agent, task, model, status, created_at, updated_at)
+             VALUES ('r1','a','','','running',?1,?1)",
+            rusqlite::params![ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approvals (id, run_id, agent, title, payload, status, created_at)
+             VALUES ('a1','r1','a','t','p','pending',?1)",
+            rusqlite::params![ts],
+        )
+        .unwrap();
+        // An approval from an already-finished run must not be touched.
+        conn.execute(
+            "INSERT INTO runs (id, agent, task, model, status, created_at, updated_at)
+             VALUES ('r2','a','','','completed',?1,?1)",
+            rusqlite::params![ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO approvals (id, run_id, agent, title, payload, status, created_at)
+             VALUES ('a2','r2','a','t','p','approved',?1)",
+            rusqlite::params![ts],
+        )
+        .unwrap();
+
+        let (runs, approvals) = mark_interrupted_on_startup(&conn).unwrap();
+        assert_eq!(runs, 1);
+        assert_eq!(approvals, 1);
+        let status: String = conn
+            .query_row("SELECT status FROM approvals WHERE id='a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "expired");
+        let status: String = conn
+            .query_row("SELECT status FROM approvals WHERE id='a2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "approved");
+        let decided: Option<String> = conn
+            .query_row("SELECT decided_at FROM approvals WHERE id='a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(decided.is_some(), "expired approvals get a decided_at");
+    }
 }

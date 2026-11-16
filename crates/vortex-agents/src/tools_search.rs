@@ -72,6 +72,21 @@ impl Tool for WebSearchTool {
     }
 }
 
+/// Cap tool-output text by bytes without ever splitting a UTF-8 character:
+/// `String::truncate` panics on a non-char boundary, and fetched pages are
+/// full of multi-byte text (same bug class as C6/N6).
+fn cap_text(mut text: String, cap: usize) -> String {
+    if text.len() > cap {
+        let mut cut = cap;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n... (truncated)");
+    }
+    text
+}
+
 pub struct FetchUrlTool;
 
 const FETCH_DEF: ToolDef = ToolDef {
@@ -106,16 +121,41 @@ impl Tool for FetchUrlTool {
         let url = args["url"].as_str().expect("validated");
         let page = ctx.http.fetch_text(url, 2_000_000).await?;
         let title = page.title.unwrap_or_default();
-        let mut text = page.text;
-        if text.len() > 12_000 {
-            text.truncate(12_000);
-            text.push_str("\n... (truncated)");
-        }
+        let text = cap_text(page.text, 12_000);
         let out = format!("URL: {url}\nTitle: {title}\n\n{text}");
+        // Truncate by characters, not bytes: URLs are model/provider-provided
+        // and a byte cut can land inside a multi-byte UTF-8 character.
+        let short_url: String = page.url.chars().take(60).collect();
         Ok(ToolResult {
-            summary: format!("fetched {}", &page.url[..page.url.len().min(60)]),
+            summary: format!("fetched {short_url}"),
             text: out,
             diff: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap_text;
+
+    #[test]
+    fn cap_text_never_splits_a_utf8_character() {
+        // Each char is 3 bytes; 12_000 is a multiple of 3 but the fetched
+        // text rarely aligns — mix widths so the cut lands mid-character.
+        let big = format!("{}{}", "あ".repeat(5_000), "é".repeat(2_000));
+        let out = cap_text(big, 12_000);
+        assert!(out.ends_with("\n... (truncated)"));
+        assert!(out.len() <= 12_000 + "\n... (truncated)".len());
+        // Everything kept must be whole characters (no panic, no mojibake).
+        let kept: String = out.trim_end_matches("\n... (truncated)").to_string();
+        assert!(kept.chars().all(|c| c == 'あ' || c == 'é'));
+        assert!(kept.len() <= 12_000);
+    }
+
+    #[test]
+    fn cap_text_passes_short_text_through() {
+        assert_eq!(cap_text("short".into(), 12_000), "short");
+        let exact = "x".repeat(12_000);
+        assert_eq!(cap_text(exact.clone(), 12_000), exact);
     }
 }

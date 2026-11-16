@@ -27,9 +27,12 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rust-embed = { workspace = true }
-toml = { workspace = true }
 url = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
 percent-encoding = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
+tempfile = { workspace = true }

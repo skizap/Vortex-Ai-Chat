@@ -2,12 +2,17 @@
 /target
 **/target
 Cargo.lock.orig
-crates/vortex-server/ui-dist/*
-!crates/vortex-server/ui-dist/.gitkeep
+# UI build output (Trunk). Deliberately fully untracked: Trunk empties this
+# directory on every build, so even a .gitkeep cannot be tracked here.
+# build.rs creates the folder + a placeholder index.html on fresh clones.
+crates/vortex-server/ui-dist/
 
 # Local environment / secrets
 .env
 *.local.toml
+
+# Local tool state (agent plans, worktrees)
+.kilo/
 
 # Runtime data (never commit databases, caches, workspaces)
 *.db

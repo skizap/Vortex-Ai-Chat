@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use vortex_core::diag;
 use vortex_core::Db;
 use vortex_llm::{CompletionRequest, LlmClient, LlmEvent};
 use vortex_types::{
@@ -263,7 +264,26 @@ impl Engine {
         };
 
         let result = self.run_loop(&spec, ctx, deadline).await;
-        fwd.abort();
+        // Drain instead of abort: `run_loop` owns `ctx` and every tool task is
+        // joined inside `execute_tool_calls`, so all `ctx.events` senders are
+        // dropped by the time `run_loop` returns — the forwarder delivers
+        // queued tool events and exits on its own, guaranteeing `finish()`
+        // publishes `RunFinished` strictly last. The timeout bounds the drain
+        // in case a future change ever lets a `ToolContext` clone outlive the
+        // run loop (nothing does today).
+        let mut fwd = fwd;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut fwd)
+            .await
+            .is_err()
+        {
+            tracing::warn!("tool-event forwarder did not drain within 2s; aborting it");
+            diag::event(
+                tracing::Level::WARN,
+                diag::RUN_EVENT_FORWARDER_TIMEOUT,
+                &[("run_id", diag::Field::Uuid(run_id.as_str()))],
+            );
+            fwd.abort();
+        }
 
         match &result {
             Ok(_) => self.finish(&run_id, RunStatus::Completed, None).await,
@@ -286,15 +306,30 @@ impl Engine {
     async fn persist_status(&self, run_id: &str, status: RunStatus, error: Option<String>) {
         let (usage, plan) = match self.hub.get(run_id) {
             Some(h) => {
-                let m = h.meta.lock().expect("run meta");
+                let m = h
+                    .meta
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (Some(m.usage), Some(m.plan.clone()))
             }
             None => (None, None),
         };
-        let _ = self
+        // Currently ignored persistence errors are surfaced only through the
+        // gated diagnostics channel; normal behavior is unchanged.
+        let persisted = self
             .db
             .update_run_status(run_id.to_string(), status, error, usage, plan)
             .await;
+        if persisted.is_err() {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::DB_PERSIST_FAILED,
+                &[
+                    ("op", diag::Field::Static("run_status")),
+                    ("run_id", diag::Field::Uuid(run_id)),
+                ],
+            );
+        }
     }
 
     async fn finish(&self, run_id: &str, status: RunStatus, error: Option<String>) {
@@ -315,6 +350,15 @@ impl Engine {
                 error,
             },
         );
+        if status == RunStatus::Failed {
+            // Final run failure boundary: status and id only — the error
+            // detail can embed provider text and stays out of diagnostics.
+            diag::event(
+                tracing::Level::ERROR,
+                diag::RUN_FAILED,
+                &[("run_id", diag::Field::Uuid(run_id))],
+            );
+        }
         self.persist_status(run_id, status, None).await;
     }
 
@@ -366,7 +410,7 @@ impl Engine {
             0,
             spec.cancel.clone(),
         );
-        let _ = self
+        let persisted = self
             .db
             .upsert_run(&RunInfo {
                 id: run_id.clone(),
@@ -384,11 +428,43 @@ impl Engine {
                 updated_at: vortex_core::db::now(),
             })
             .await;
+        if persisted.is_err() {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::DB_PERSIST_FAILED,
+                &[
+                    ("op", diag::Field::Static("run_upsert")),
+                    ("run_id", diag::Field::Uuid(run_id.as_str())),
+                ],
+            );
+        }
         let engine = self.clone();
+        // The coordinator task is detached: without a panic boundary a panic
+        // in `execute_run` would only surface as a dropped JoinHandle. We
+        // record the structured fact — never the payload — and then resume
+        // unwinding so the task still panics exactly as the pre
+        // instrumentation code did: `hub.remove` is skipped on panic, which
+        // preserves the pre-existing stuck-run recovery behavior unchanged.
         tokio::spawn(async move {
             let rid = spec.run_id.clone();
-            let _ = engine.execute_run(spec).await;
-            engine.hub.remove(&rid);
+            let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                engine.execute_run(spec),
+            ))
+            .await;
+            match outcome {
+                Ok(text) => {
+                    let _ = text;
+                    engine.hub.remove(&rid);
+                }
+                Err(payload) => {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::COORDINATOR_TASK_PANIC,
+                        &[("run_id", diag::Field::Uuid(rid.as_str()))],
+                    );
+                    std::panic::resume_unwind(payload);
+                }
+            }
         });
         run_id
     }
@@ -409,12 +485,28 @@ impl Engine {
         let tools_schema = self.registry.schemas(&spec.allowed);
 
         for _iteration in 0..settings.agents.max_iterations.max(1) {
+            // Token budget is enforced *before* each provider call, and the
+            // request's own `max_tokens` is clamped to what remains, so a
+            // single huge completion cannot overshoot the run budget by more
+            // than one clamped completion. The post-tool check below stays as
+            // a backstop.
+            let remaining = settings
+                .agents
+                .max_total_tokens
+                .saturating_sub(total_usage.total_tokens);
+            if remaining == 0 {
+                return Err(RunError::Failed(
+                    "token budget exhausted before the next model call; summarize progress".into(),
+                ));
+            }
             let req = CompletionRequest {
                 model: spec.model.clone(),
                 messages: messages.clone(),
                 tools: tools_schema.clone(),
                 temperature: settings.temperature,
-                max_tokens: settings.max_tokens,
+                max_tokens: settings
+                    .max_tokens
+                    .min(remaining.min(u64::from(u32::MAX)) as u32),
             };
             let (llm_tx, mut llm_rx) = mpsc::channel::<LlmEvent>(256);
             let fwd = {
@@ -433,24 +525,81 @@ impl Engine {
                 })
             };
             let llm = self.llm.clone();
-            let call = tokio::spawn(async move { llm.complete(&req, llm_tx).await });
+            let mut call = tokio::spawn(async move { llm.complete(&req, llm_tx).await });
             let resp = tokio::select! {
-                r = call => r.map_err(|e| RunError::Failed(format!("provider task failed: {e}")))?.map_err(|e| RunError::Failed(e.to_string())),
+                r = &mut call => match r {
+                    Ok(inner) => {
+                        // Provider failure boundary: fixed category + optional
+                        // HTTP status only; the error text stays out of
+                        // diagnostics. Logging is a side effect only — the
+                        // original structure is preserved: the `Result` is
+                        // returned from the select, the delta forwarder below
+                        // drains whatever deltas the provider already queued,
+                        // and only then does the error propagate (`resp?`),
+                        // keeping every delta strictly before the failure
+                        // completion event.
+                        if let Err(e) = &inner {
+                            let mut fields = vec![
+                                ("run_id", diag::Field::Uuid(run_id.as_str())),
+                                ("reason", diag::Field::Static(e.category())),
+                            ];
+                            if let Some(code) = e.status() {
+                                fields.push(("status", diag::Field::Num(u64::from(code))));
+                            }
+                            diag::event(tracing::Level::ERROR, diag::RUN_PROVIDER_FAILED, &fields);
+                        }
+                        inner.map_err(|e| RunError::Failed(e.to_string()))
+                    }
+                    Err(e) => {
+                        // Join error: the original code propagated immediately
+                        // with `?` (the provider task panicked, so no further
+                        // deltas can arrive). Preserve that early-exit path
+                        // exactly; record only the structured panic fact,
+                        // never the payload.
+                        diag::event(
+                            tracing::Level::ERROR,
+                            diag::RUN_PROVIDER_TASK_PANIC,
+                            &[
+                                ("run_id", diag::Field::Uuid(run_id.as_str())),
+                                ("cancelled", diag::Field::Flag(e.is_cancelled())),
+                            ],
+                        );
+                        return Err(RunError::Failed(format!("provider task failed: {e}")));
+                    }
+                },
                 _ = spec.cancel.cancelled() => {
+                    // Abort the provider task: merely dropping the JoinHandle
+                    // would leave the completion running detached, consuming
+                    // (and billing) the stream after cancellation.
+                    call.abort();
                     fwd.abort();
                     return Err(RunError::Cancelled);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
+                    call.abort();
                     fwd.abort();
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::RUN_DEADLINE_EXCEEDED,
+                        &[("run_id", diag::Field::Uuid(run_id.as_str()))],
+                    );
                     return Err(RunError::Failed("run time budget exceeded".into()));
                 }
             };
-            fwd.abort();
+            // The provider task has finished and dropped its `llm_tx`, so the
+            // delta forwarder drains whatever is queued and exits on its own:
+            // no tail deltas are lost (previously `fwd.abort()` dropped them).
+            // The provider error is propagated only after this drain, exactly
+            // as the original code did.
+            let _ = fwd.await;
             let resp = resp?;
             if let Some(u) = resp.usage {
                 total_usage = total_usage + u;
                 if let Some(h) = self.hub.get(&run_id) {
-                    h.meta.lock().expect("run meta").usage = total_usage;
+                    h.meta
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .usage = total_usage;
                 }
                 self.hub.publish(
                     &run_id,
@@ -459,7 +608,7 @@ impl Engine {
                         usage: total_usage,
                     },
                 );
-                let _ = self
+                let persisted = self
                     .db
                     .update_run_status(
                         run_id.clone(),
@@ -469,50 +618,88 @@ impl Engine {
                         None,
                     )
                     .await;
+                if persisted.is_err() {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::DB_PERSIST_FAILED,
+                        &[
+                            ("op", diag::Field::Static("run_usage")),
+                            ("run_id", diag::Field::Uuid(run_id.as_str())),
+                        ],
+                    );
+                }
+            }
+
+            // Normalize provider tool-call ids once, before anything consumes
+            // them: strict OpenAI-compatible APIs reject an empty
+            // `tool_call_id` on the follow-up request, and Started/Finished
+            // events plus DB rows need one stable id per call (previously
+            // Started used a generated UUID while Finished used "", leaving
+            // UI tool rows stuck on "running…" forever).
+            let mut tool_calls = resp.tool_calls;
+            for tc in tool_calls.iter_mut() {
+                if tc.id.trim().is_empty() {
+                    tc.id = uuid::Uuid::new_v4().to_string();
+                }
             }
 
             messages.push(ChatMessage {
                 role: vortex_types::Role::Assistant,
                 content: resp.content.clone(),
-                tool_calls: resp.tool_calls.clone(),
+                tool_calls: tool_calls.clone(),
                 tool_call_id: None,
                 tool_name: None,
             });
 
-            if resp.tool_calls.is_empty() {
+            if tool_calls.is_empty() {
                 if spec.is_root {
                     if let Some(conv) = &spec.conversation_id {
-                        let _ = self
+                        let persisted = self
                             .db
                             .add_message(conv.clone(), ChatMessage::assistant(resp.content.clone()))
                             .await;
-                        let _ = self.db.touch_conversation(conv.clone()).await;
+                        if persisted.is_err() {
+                            diag::event(
+                                tracing::Level::ERROR,
+                                diag::DB_PERSIST_FAILED,
+                                &[
+                                    ("op", diag::Field::Static("message_append")),
+                                    ("run_id", diag::Field::Uuid(run_id.as_str())),
+                                    ("conversation_id", diag::Field::Uuid(conv.as_str())),
+                                ],
+                            );
+                        }
+                        let touched = self.db.touch_conversation(conv.clone()).await;
+                        if touched.is_err() {
+                            diag::event(
+                                tracing::Level::ERROR,
+                                diag::DB_PERSIST_FAILED,
+                                &[
+                                    ("op", diag::Field::Static("conversation_touch")),
+                                    ("run_id", diag::Field::Uuid(run_id.as_str())),
+                                    ("conversation_id", diag::Field::Uuid(conv.as_str())),
+                                ],
+                            );
+                        }
                     }
                 }
                 return Ok(resp.content);
             }
 
-            let outcomes = self
-                .execute_tool_calls(&run_id, &ctx, &resp.tool_calls)
-                .await;
-            for (tc, outcome) in resp.tool_calls.iter().zip(outcomes) {
-                let call_id = if tc.id.is_empty() {
-                    String::new()
-                } else {
-                    tc.id.clone()
-                };
+            let outcomes = self.execute_tool_calls(&run_id, &ctx, &tool_calls).await;
+            for (tc, outcome) in tool_calls.iter().zip(outcomes) {
                 self.hub.publish(
                     &run_id,
                     RunEvent::ToolCallFinished {
                         run_id: run_id.clone(),
-                        call_id: call_id.clone(),
+                        call_id: tc.id.clone(),
                         ok: outcome.ok,
                         summary: outcome.result.summary.clone(),
                         diff: outcome.result.diff.clone(),
                     },
                 );
                 messages.push(ChatMessage::tool_result(
-                    call_id,
+                    tc.id.clone(),
                     tc.name.clone(),
                     outcome.result.text,
                 ));
@@ -534,19 +721,28 @@ impl Engine {
 
 impl Engine {
     /// Validate, persist, and execute one turn's tool calls concurrently.
+    /// Call ids are computed once so the Started event, the DB row and the
+    /// finished-state update always refer to the same id.
     async fn execute_tool_calls(
         self: &Arc<Self>,
         run_id: &str,
         ctx: &ToolContext,
         tool_calls: &[vortex_types::ToolCall],
     ) -> Vec<crate::registry::ToolOutcome> {
+        // Ids are normalized upstream in run_loop; this fallback keeps
+        // Started/Finished consistent even if an empty id ever slips through.
+        let ids: Vec<String> = tool_calls
+            .iter()
+            .map(|tc| {
+                if tc.id.trim().is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    tc.id.clone()
+                }
+            })
+            .collect();
         let mut tasks = Vec::new();
-        for tc in tool_calls {
-            let call_id = if tc.id.is_empty() {
-                uuid::Uuid::new_v4().to_string()
-            } else {
-                tc.id.clone()
-            };
+        for (tc, call_id) in tool_calls.iter().zip(ids.iter()) {
             let args: serde_json::Value =
                 serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
             self.hub.publish(
@@ -569,7 +765,18 @@ impl Engine {
                     summary: "running".into(),
                     created_at: vortex_core::db::now(),
                 })
-                .await;
+                .await
+                .inspect_err(|_| {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::DB_PERSIST_FAILED,
+                        &[
+                            ("op", diag::Field::Static("tool_call_record")),
+                            ("run_id", diag::Field::Uuid(run_id)),
+                            ("call_id", diag::Field::Uuid(call_id.as_str())),
+                        ],
+                    );
+                });
             let registry = self.registry.clone();
             let ctx = ctx.clone();
             let name = tc.name.clone();
@@ -579,28 +786,74 @@ impl Engine {
         }
         let mut out = Vec::new();
         for (i, res) in join_all(tasks).await.into_iter().enumerate() {
-            let outcome = res.unwrap_or_else(|e| crate::registry::ToolOutcome {
-                ok: false,
-                result: crate::registry::ToolResult {
-                    text: format!("error: tool task failed: {e}"),
-                    summary: "tool task failed".into(),
-                    diff: None,
-                },
-            });
-            if let Some(tc) = tool_calls.get(i) {
-                if !tc.id.is_empty() {
-                    let _ = self
-                        .db
-                        .add_tool_call(&ToolCallRecord {
-                            id: tc.id.clone(),
-                            run_id: run_id.to_string(),
-                            tool: tc.name.clone(),
-                            args: serde_json::Value::Null,
-                            ok: outcome.ok,
-                            summary: outcome.result.summary.clone(),
-                            created_at: vortex_core::db::now(),
-                        })
-                        .await;
+            let outcome = match res {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // Tool task panic boundary: never capture the payload or
+                    // message, only the structured flags. The tool name is
+                    // model-chosen, so it is logged only when it matches a
+                    // known registry entry.
+                    if let (Some(tc), Some(call_id)) = (tool_calls.get(i), ids.get(i)) {
+                        let mut fields = vec![
+                            ("run_id", diag::Field::Uuid(run_id)),
+                            ("call_id", diag::Field::Uuid(call_id.as_str())),
+                            ("cancelled", diag::Field::Flag(e.is_cancelled())),
+                        ];
+                        if self.registry.get(&tc.name).is_some() {
+                            fields.push(("tool", diag::Field::Id(tc.name.as_str())));
+                        } else {
+                            fields.push(("tool_known", diag::Field::Flag(false)));
+                        }
+                        diag::event(tracing::Level::ERROR, diag::TOOL_TASK_PANIC, &fields);
+                    }
+                    crate::registry::ToolOutcome {
+                        ok: false,
+                        result: crate::registry::ToolResult {
+                            text: format!("error: tool task failed: {e}"),
+                            summary: "tool task failed".into(),
+                            diff: None,
+                        },
+                    }
+                }
+            };
+            if let (Some(tc), Some(call_id)) = (tool_calls.get(i), ids.get(i)) {
+                let persisted = self
+                    .db
+                    .add_tool_call(&ToolCallRecord {
+                        id: call_id.clone(),
+                        run_id: run_id.to_string(),
+                        tool: tc.name.clone(),
+                        args: serde_json::Value::Null,
+                        ok: outcome.ok,
+                        summary: outcome.result.summary.clone(),
+                        created_at: vortex_core::db::now(),
+                    })
+                    .await;
+                if persisted.is_err() {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::DB_PERSIST_FAILED,
+                        &[
+                            ("op", diag::Field::Static("tool_call_record")),
+                            ("run_id", diag::Field::Uuid(run_id)),
+                            ("call_id", diag::Field::Uuid(call_id.as_str())),
+                        ],
+                    );
+                }
+                if !outcome.ok {
+                    // Tool failure boundary. The tool name is model-chosen, so
+                    // it is only captured when it matches a fixed registry
+                    // entry; no error text, args, or results are captured.
+                    let mut fields = vec![
+                        ("run_id", diag::Field::Uuid(run_id)),
+                        ("call_id", diag::Field::Uuid(call_id.as_str())),
+                    ];
+                    if self.registry.get(&tc.name).is_some() {
+                        fields.push(("tool", diag::Field::Id(tc.name.as_str())));
+                    } else {
+                        fields.push(("tool_known", diag::Field::Flag(false)));
+                    }
+                    diag::event(tracing::Level::WARN, diag::TOOL_FAILED, &fields);
                 }
             }
             out.push(outcome);
@@ -687,7 +940,7 @@ impl Engine {
             spec.depth,
             spec.cancel.clone(),
         );
-        let _ = self
+        let persisted = self
             .db
             .upsert_run(&RunInfo {
                 id: run_id.clone(),
@@ -705,6 +958,16 @@ impl Engine {
                 updated_at: vortex_core::db::now(),
             })
             .await;
+        if persisted.is_err() {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::DB_PERSIST_FAILED,
+                &[
+                    ("op", diag::Field::Static("run_upsert")),
+                    ("run_id", diag::Field::Uuid(run_id.as_str())),
+                ],
+            );
+        }
         let engine = self.clone();
         let rid = run_id.clone();
         let handle = tokio::spawn(async move { engine.execute_run(spec).await });
@@ -722,6 +985,17 @@ impl Engine {
                 Err(ToolError::Execution(format!("sub-agent failed: {msg}")))
             }
             Err(e) => {
+                // Detached-work panic boundary for spawned sub-agents: the
+                // JoinError display (which can embed a panic payload) stays in
+                // the normal error path but never enters diagnostics.
+                diag::event(
+                    tracing::Level::ERROR,
+                    diag::SUBAGENT_TASK_PANIC,
+                    &[
+                        ("run_id", diag::Field::Uuid(rid.as_str())),
+                        ("cancelled", diag::Field::Flag(e.is_cancelled())),
+                    ],
+                );
                 self.hub.remove(&rid);
                 Err(ToolError::Execution(format!("sub-agent task crashed: {e}")))
             }

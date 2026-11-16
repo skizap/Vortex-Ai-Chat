@@ -19,6 +19,10 @@ pub struct BrowserManager {
 struct BrowserProcess {
     conn: Arc<CdpConnection>,
     pid: u32,
+    /// The spawned child must be kept alive here: it was created with
+    /// `kill_on_drop(true)`, so dropping the handle would kill Chromium.
+    /// Holding it also guarantees the browser dies when the manager drops.
+    _child: tokio::process::Child,
 }
 
 /// Common binary names checked in PATH, in order of preference.
@@ -109,7 +113,11 @@ impl BrowserManager {
         let mut child = cmd
             .spawn()
             .map_err(|e| ToolError::Execution(format!("launching Chromium: {e}")))?;
-        let pid = child.id();
+        let pid = child.id().ok_or_else(|| {
+            ToolError::Execution(
+                "Chromium exited immediately after launch (bad binary or sandbox error?)".into(),
+            )
+        })?;
         let stderr = child.stderr.take().expect("stderr piped");
         let ws_url = read_devtools_url(stderr).await.ok_or_else(|| {
             ToolError::Execution(
@@ -121,7 +129,8 @@ impl BrowserManager {
         let conn = Arc::new(CdpConnection::connect(&ws_url).await?);
         *guard = Some(BrowserProcess {
             conn: conn.clone(),
-            pid: pid.unwrap(),
+            pid,
+            _child: child,
         });
         Ok(conn)
     }

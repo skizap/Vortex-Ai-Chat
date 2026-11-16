@@ -1,10 +1,11 @@
-//! Tasks view: plan, tool activity with diffs, sub-agent panel, approvals.
+//! Tasks view: plan, tool activity with diffs, sub-agent panel, approvals,
+//! previews, and file-checkpoint recovery.
 
 use crate::api;
 use crate::state::{AgentDisplay, AppCtx, ToolCallDisplay};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use vortex_types::{ApprovalInfo, RunStatus, StepStatus};
+use vortex_types::{ApprovalInfo, CheckpointInfo, RunStatus, StepStatus};
 
 #[component]
 pub fn TasksView() -> impl IntoView {
@@ -90,6 +91,13 @@ pub fn TasksView() -> impl IntoView {
             <section class="panel">
                 <h3>"Previews"</h3>
                 <PreviewList />
+            </section>
+
+            <section class="panel">
+                <h3>"File checkpoints"
+                    <span class="panel-note">"snapshots taken before agent edits — current conversation"</span>
+                </h3>
+                <CheckpointList />
             </section>
         </div>
     }
@@ -206,10 +214,154 @@ fn PreviewList() -> impl IntoView {
                 let:p
             >
                 <li>
-                    <a href=p.url.clone() target="_blank" rel="noreferrer">{p.url.clone()}</a>
+                    {
+                        // Same scheme allowlist as markdown links: only render
+                        // an href for http(s). Preview URLs are server-controlled
+                        // today, so this is defense-in-depth.
+                        let url = p.url.clone();
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            let href = url.clone();
+                            view! {
+                                <a href=href target="_blank" rel="noreferrer">{url}</a>
+                            }.into_any()
+                        } else {
+                            view! { <span title="blocked link scheme">{url}</span> }.into_any()
+                        }
+                    }
                     <span class="badge">{if p.running { "running" } else { "stopped" }}</span>
                 </li>
             </For>
         </ul>
+    }
+}
+
+/// Page size for the checkpoint list; a full page enables "Load older".
+const CKPT_PAGE: u32 = 20;
+
+/// Load one page of checkpoints. `reset` starts from the newest again;
+/// otherwise the stored cursor (`before`) walks one page further back.
+async fn load_checkpoints(
+    ctx: AppCtx,
+    items: RwSignal<Vec<CheckpointInfo>>,
+    cursor: RwSignal<Option<i64>>,
+    has_more: RwSignal<bool>,
+    reset: bool,
+) {
+    let Some(conv) = ctx.current.get_untracked() else {
+        items.set(Vec::new());
+        cursor.set(None);
+        has_more.set(false);
+        return;
+    };
+    let before = if reset { None } else { cursor.get_untracked() };
+    match api::checkpoints(&conv, before, CKPT_PAGE).await {
+        Ok(page) => {
+            let full = page.len() >= CKPT_PAGE as usize;
+            let next = page.last().map(|c| c.id);
+            if reset {
+                items.set(page);
+            } else {
+                items.update(|l| l.extend(page));
+            }
+            cursor.set(next);
+            has_more.set(full && next.is_some());
+        }
+        Err(e) => ctx.set_toast(format!("could not load checkpoints: {e}")),
+    }
+}
+
+#[component]
+fn CheckpointList() -> impl IntoView {
+    let ctx = use_context::<AppCtx>().expect("ctx provided");
+    let items: RwSignal<Vec<CheckpointInfo>> = RwSignal::new(Vec::new());
+    let cursor: RwSignal<Option<i64>> = RwSignal::new(None);
+    let has_more: RwSignal<bool> = RwSignal::new(false);
+
+    // Reload whenever the open conversation changes (RwSignals are Copy).
+    Effect::new(move |_| {
+        let _ = ctx.current.get();
+        spawn_local(async move {
+            load_checkpoints(ctx, items, cursor, has_more, true).await;
+        });
+    });
+
+    view! {
+        <Show when=move || ctx.current.get().is_none()>
+            <p class="hint">"Open a conversation to see its file checkpoints."</p>
+        </Show>
+        <Show when=move || ctx.current.get().is_some()>
+            <Show when=move || items.get().is_empty()>
+                <p class="hint">"No file snapshots yet. Checkpoints are recorded automatically before the agent writes, edits, or deletes a file."</p>
+            </Show>
+            <ul class="checkpoint-list">
+                <For
+                    each=move || items.get()
+                    key=|c| c.id
+                    let:ckpt
+                >
+                    <CheckpointRow ckpt items cursor has_more />
+                </For>
+            </ul>
+            <Show when=move || has_more.get()>
+                <button class="btn"
+                    on:click=move |_| {
+                        spawn_local(async move {
+                            load_checkpoints(ctx, items, cursor, has_more, false).await;
+                        });
+                    }>"Load older"</button>
+            </Show>
+        </Show>
+    }
+}
+
+#[component]
+fn CheckpointRow(
+    ckpt: CheckpointInfo,
+    items: RwSignal<Vec<CheckpointInfo>>,
+    cursor: RwSignal<Option<i64>>,
+    has_more: RwSignal<bool>,
+) -> impl IntoView {
+    let ctx = use_context::<AppCtx>().expect("ctx provided");
+    let id = ckpt.id;
+    let path = ckpt.path.clone();
+    let path_confirm = path.clone();
+    view! {
+        <li class="checkpoint-row">
+            <div class="ckpt-main">
+                <code class="ckpt-path" title=path.clone()>{path.clone()}</code>
+                <span class="badge">
+                    {if ckpt.has_original { "previous version" } else { "new file" }}
+                </span>
+                <span class="ckpt-time">{ckpt.created_at.clone()}</span>
+            </div>
+            <button class="btn"
+                title="Put the file back to this snapshot (the current content is snapshotted first)"
+                on:click=move |_| {
+                    let confirmed = web_sys::window()
+                        .and_then(|w| {
+                            w.confirm_with_message(&format!(
+                                "Restore {path_confirm}? The current content is snapshotted first."
+                            ))
+                            .ok()
+                        })
+                        .unwrap_or(false);
+                    if !confirmed {
+                        return;
+                    }
+                    spawn_local(async move {
+                        match api::restore_checkpoint(id).await {
+                            Ok(r) => {
+                                ctx.set_toast(if r.action == "trashed" {
+                                    format!("{} removed — the snapshot recorded that it did not exist", r.path)
+                                } else {
+                                    format!("Restored {}", r.path)
+                                });
+                                load_checkpoints(ctx, items, cursor, has_more, true).await;
+                            }
+                            Err(e) => ctx.set_toast(format!("restore failed: {e}")),
+                        }
+                    });
+                }>"Restore"</button>
+        </li>
     }
 }

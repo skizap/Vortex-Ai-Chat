@@ -1,24 +1,64 @@
 //! Typed API client (gloo-net) + SSE event source, both fully in Rust/WASM.
 
+use crate::diagnostics;
 use serde::de::DeserializeOwned;
 use vortex_types::{
-    ApprovalInfo, Capabilities, ChatRequestDto, ConversationSummary, ModelInfo, PreviewInfo,
-    RunInfo, Settings, StoredMessage, ToolCallRecord,
+    ApprovalInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
+    ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
 const BASE: &str = "/api";
 
+/// Server-generated correlation id from a diagnostics-mode response. Only a
+/// strict UUID survives (see `build_report`); everything else is dropped.
+fn request_id_of(resp: &gloo_net::http::Response) -> Option<String> {
+    resp.headers().get(diagnostics::REQUEST_ID_HEADER)
+}
+
 pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    let run_id = diagnostics::extract_run_id(path);
     let resp = gloo_net::http::Request::get(&format!("{BASE}{path}"))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            diagnostics::report_api_failure(
+                BrowserOperation::ApiTransport,
+                None,
+                None,
+                run_id.as_deref(),
+            );
+            e.to_string()
+        })?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    if !(200..400).contains(&status) {
+    let text = resp.text().await.map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiTransport,
+            None,
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        e.to_string()
+    })?;
+    // Only 2xx is success: a 3xx reaching this point means a redirect the
+    // browser did not follow, and its body is not the expected JSON.
+    if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiDecode,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        format!("invalid response: {e}")
+    })
 }
 
 pub async fn send_json<T: DeserializeOwned>(
@@ -34,19 +74,50 @@ pub async fn send_json<T: DeserializeOwned>(
         "DELETE" => gloo_net::http::Request::delete(&url),
         _ => return Err(format!("unsupported method {method}")),
     };
+    let run_id = diagnostics::extract_run_id(path);
     let resp = req
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            diagnostics::report_api_failure(
+                BrowserOperation::ApiTransport,
+                None,
+                None,
+                run_id.as_deref(),
+            );
+            e.to_string()
+        })?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    if !(200..400).contains(&status) {
+    let text = resp.text().await.map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiTransport,
+            None,
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        e.to_string()
+    })?;
+    if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiDecode,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        format!("invalid response: {e}")
+    })
 }
 
 fn parse_error(text: &str) -> String {
@@ -175,6 +246,33 @@ pub async fn runs_for_conversation(id: &str) -> Result<Vec<RunInfo>, String> {
     get_json(&format!("/runs?conversation_id={id}")).await
 }
 
+/// File checkpoints for a conversation, newest first, cursor-paginated
+/// (`before` = smallest id of the previous page).
+pub async fn checkpoints(
+    conv_id: &str,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<CheckpointInfo>, String> {
+    let mut query = format!("limit={limit}");
+    if let Some(b) = before {
+        query.push_str(&format!("&before={b}"));
+    }
+    get_json(&format!("/conversations/{conv_id}/checkpoints?{query}")).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct RestoreResult {
+    pub ok: bool,
+    pub path: String,
+    /// "restored" (content written back) or "trashed" (the snapshot recorded
+    /// that the file did not exist, so the current file was moved to trash).
+    pub action: String,
+}
+
+pub async fn restore_checkpoint(id: i64) -> Result<RestoreResult, String> {
+    send_json("POST", &format!("/checkpoints/{id}/restore"), "").await
+}
+
 pub fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -182,7 +280,9 @@ pub fn urlencode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
-            b' ' => out.push('+'),
+            // %20, not '+': a '+' is only a space in form-encoded bodies; in a
+            // URL path/query a literal '+' decodes ambiguously.
+            b' ' => out.push_str("%20"),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

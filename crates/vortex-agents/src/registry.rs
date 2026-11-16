@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use vortex_core::diag;
 use vortex_core::Db;
 use vortex_types::{RunEvent, Settings};
 
@@ -141,6 +142,19 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> ToolOutcome {
+        // Helper for the gated tool-failure diagnostics. `name` is
+        // model-chosen, so it is logged only when it resolves to a real
+        // registry entry (a fixed, in-binary set); otherwise a boolean says
+        // so. No error text, arguments, or results ever enter diagnostics.
+        let tool_fields = |tool_known: bool| -> Vec<(&'static str, diag::Field<'_>)> {
+            let mut fields = vec![("run_id", diag::Field::Uuid(ctx.run_id.as_str()))];
+            if tool_known {
+                fields.push(("tool", diag::Field::Id(name)));
+            } else {
+                fields.push(("tool_known", diag::Field::Flag(false)));
+            }
+            fields
+        };
         let failure = |e: ToolError| ToolOutcome {
             ok: false,
             result: ToolResult {
@@ -154,20 +168,40 @@ impl ToolRegistry {
             result: r,
         };
         let Some(tool) = self.get(name) else {
+            diag::event(
+                tracing::Level::WARN,
+                diag::TOOL_UNKNOWN,
+                &tool_fields(false),
+            );
             return failure(ToolError::NotPermitted(format!(
                 "tool '{name}' is not available in this session (not enabled, unconfigured, or outside your permission profile)"
             )));
         };
         if !ctx.allowed.contains(name) {
+            diag::event(
+                tracing::Level::WARN,
+                diag::TOOL_NOT_PERMITTED,
+                &tool_fields(true),
+            );
             return failure(ToolError::NotPermitted(format!(
                 "tool '{name}' is not permitted for this agent run"
             )));
         }
         if let Err(e) = tool.available(ctx) {
+            diag::event(
+                tracing::Level::WARN,
+                diag::TOOL_UNAVAILABLE,
+                &tool_fields(true),
+            );
             return failure(e);
         }
         let def = tool.def();
         if let Err(msg) = def.validate(args) {
+            diag::event(
+                tracing::Level::WARN,
+                diag::TOOL_INVALID_ARGS,
+                &tool_fields(true),
+            );
             return failure(ToolError::InvalidArgs(name.to_string(), msg));
         }
         let filtered = def.filter(args.clone());
@@ -177,17 +211,36 @@ impl ToolRegistry {
             match ctx.approvals.request(&ctx.run_id, &title, &payload).await {
                 Ok(true) => {}
                 Ok(false) => {
+                    diag::event(
+                        tracing::Level::INFO,
+                        diag::APPROVAL_DENIED,
+                        &tool_fields(true),
+                    );
                     return failure(ToolError::Denied(format!(
                         "the user declined this action ({})",
                         def.name
-                    )))
+                    )));
                 }
-                Err(e) => return failure(e),
+                Err(e) => {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::APPROVAL_GATE_FAILED,
+                        &tool_fields(true),
+                    );
+                    return failure(e);
+                }
             }
         }
         match tool.execute(ctx, &filtered).await {
             Ok(r) => success(r),
-            Err(e) => failure(e),
+            Err(e) => {
+                // The ToolError text may embed arbitrary dynamic content
+                // (paths, provider output, command messages); it still reaches
+                // the model on the normal path unchanged, but diagnostics get
+                // only the fixed category and the validated tool name.
+                diag::event(tracing::Level::WARN, diag::TOOL_FAILED, &tool_fields(true));
+                failure(e)
+            }
         }
     }
 }

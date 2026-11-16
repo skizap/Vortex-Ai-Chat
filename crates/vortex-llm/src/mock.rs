@@ -15,6 +15,9 @@ use vortex_types::{ModelInfo, ToolCall};
 pub struct MockTurn {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// When set, `complete` fails with `LlmError::Network(msg)` for this turn
+    /// instead of streaming content (used to exercise retry/error paths).
+    pub fail_with: Option<String>,
 }
 
 impl MockTurn {
@@ -22,6 +25,7 @@ impl MockTurn {
         Self {
             content: content.into(),
             tool_calls: Vec::new(),
+            fail_with: None,
         }
     }
 
@@ -37,6 +41,16 @@ impl MockTurn {
                 name: name.into(),
                 arguments: arguments.into(),
             }],
+            fail_with: None,
+        }
+    }
+
+    /// A turn that fails with a retryable network error.
+    pub fn failure(msg: impl Into<String>) -> Self {
+        Self {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            fail_with: Some(msg.into()),
         }
     }
 }
@@ -94,8 +108,19 @@ impl LlmClient for MockLlm {
         // Stream content word-by-word to emulate token streaming.
         let content = turn.content;
         let tool_calls = turn.tool_calls;
+        if let Some(msg) = turn.fail_with {
+            return Err(LlmError::Network(msg));
+        }
         for word in content.split_inclusive(' ') {
-            let _ = events.try_send(LlmEvent::TextDelta(word.to_string()));
+            // Awaited send: deltas are never silently dropped (a closed
+            // consumer just stops delivery attempts).
+            if events
+                .send(LlmEvent::TextDelta(word.to_string()))
+                .await
+                .is_err()
+            {
+                break;
+            }
             if self.per_delta_delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.per_delta_delay_ms)).await;
             }
