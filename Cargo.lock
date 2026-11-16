@@ -3170,6 +3170,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "uuid",
+ "vortex-core",
  "vortex-types",
 ]
 
@@ -3218,6 +3219,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "gloo-net",
+ "js-sys",
  "leptos",
  "pulldown-cmark",
  "serde",

@@ -31,3 +31,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 [dev-dependencies]
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+# Test-only: enables vortex-core's gate override hooks so integration tests
+# can force VORTEX_DIAGNOSTICS on/off deterministically. Production builds of
+# vortex-agents (and everything else) never enable this feature.
+vortex-core = { workspace = true, features = ["diag-test-gate"] }

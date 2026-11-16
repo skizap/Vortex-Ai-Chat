@@ -47,11 +47,19 @@ pub async fn list_conversations(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
 ) -> Json<Vec<ConversationSummary>> {
-    let list = match q.q {
+    let result = match q.q {
         Some(query) if !query.trim().is_empty() => state.db.search_conversations(query).await,
         _ => state.db.list_conversations().await,
-    }
-    .unwrap_or_default();
+    };
+    let list = match result {
+        Ok(list) => list,
+        Err(_) => {
+            // Swallowed to keep the response shape; failure is traced with a
+            // fixed category (never the error string).
+            crate::diagnostics::db_failure("list_conversations", None);
+            Vec::new()
+        }
+    };
     Json(list)
 }
 
@@ -92,7 +100,13 @@ pub async fn get_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    let stored = state.db.get_messages(id).await.unwrap_or_default();
+    let stored = match state.db.get_messages(id.clone()).await {
+        Ok(m) => m,
+        Err(_) => {
+            crate::diagnostics::db_failure("get_messages", Some(&id));
+            Vec::new()
+        }
+    };
     Json(stored).into_response()
 }
 
@@ -110,8 +124,15 @@ pub async fn post_chat(
     if content.len() > 100_000 {
         return bad("message too long (max 100KB)");
     }
-    let Some(conversation) = state.db.get_conversation(id.clone()).await.unwrap_or(None) else {
-        return err_json(StatusCode::NOT_FOUND, "conversation not found");
+    let conversation = match state.db.get_conversation(id.clone()).await {
+        Ok(Some(c)) => c,
+        // DB errors intentionally degrade to "not found" here; the failure
+        // is traced so silent persistence breakage stays visible.
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "conversation not found"),
+        Err(_) => {
+            crate::diagnostics::db_failure("get_conversation", Some(&id));
+            return err_json(StatusCode::NOT_FOUND, "conversation not found");
+        }
     };
     let mode = body.mode.unwrap_or(conversation.mode);
 
@@ -125,11 +146,14 @@ pub async fn post_chat(
     }
 
     // Rebuild conversation history for the model (user + assistant only).
-    let history: Vec<ChatMessage> = state
-        .db
-        .get_messages(id.clone())
-        .await
-        .unwrap_or_default()
+    let stored = match state.db.get_messages(id.clone()).await {
+        Ok(m) => m,
+        Err(_) => {
+            crate::diagnostics::db_failure("get_messages", Some(&id));
+            Vec::new()
+        }
+    };
+    let history: Vec<ChatMessage> = stored
         .into_iter()
         .filter(|m| matches!(m.role, Role::User | Role::Assistant))
         .map(|m| ChatMessage {
@@ -148,7 +172,9 @@ pub async fn post_chat(
     {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    let _ = state.db.touch_conversation(id.clone()).await;
+    if state.db.touch_conversation(id.clone()).await.is_err() {
+        crate::diagnostics::db_failure("touch_conversation", Some(&id));
+    }
 
     let run_id = state
         .engine

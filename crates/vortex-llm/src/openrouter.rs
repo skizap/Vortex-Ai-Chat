@@ -11,6 +11,7 @@ use crate::sse::SseParser;
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use vortex_core::diag;
 use vortex_types::{ChatMessage, ModelInfo, Role, ToolCall, Usage};
 
 const USER_AGENT: &str = concat!("vortex-ai-chat/", env!("CARGO_PKG_VERSION"));
@@ -141,6 +142,7 @@ impl OpenRouterClient {
         body: &serde_json::Value,
         events: &mpsc::Sender<LlmEvent>,
         streamed: &mut bool,
+        attempt: u32,
     ) -> Result<CompletionResponse, LlmError> {
         // Never log headers or the full body: bodies contain user content.
         let resp = self
@@ -156,8 +158,39 @@ impl OpenRouterClient {
                 if e.is_timeout() {
                     // connect_timeout(10s) vs read_timeout(120s): report the
                     // phase that actually failed instead of a hardcoded value.
-                    LlmError::Timeout(if e.is_connect() { 10 } else { 120 })
+                    let connect = e.is_connect();
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::PROVIDER_REQUEST_FAILED,
+                        &[
+                            ("attempt", diag::Field::Num(u64::from(attempt))),
+                            (
+                                "phase",
+                                diag::Field::Static(if connect {
+                                    "connect_timeout"
+                                } else {
+                                    "read_timeout"
+                                }),
+                            ),
+                        ],
+                    );
+                    LlmError::Timeout(if connect { 10 } else { 120 })
                 } else {
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::PROVIDER_REQUEST_FAILED,
+                        &[
+                            ("attempt", diag::Field::Num(u64::from(attempt))),
+                            (
+                                "phase",
+                                diag::Field::Static(if e.is_connect() {
+                                    "connect"
+                                } else {
+                                    "request"
+                                }),
+                            ),
+                        ],
+                    );
                     LlmError::Network("request failed".into())
                 }
             })?;
@@ -184,13 +217,34 @@ impl OpenRouterClient {
                 Some(chunk) => {
                     let bytes = chunk.map_err(|e| {
                         if e.is_timeout() {
+                            diag::event(
+                                tracing::Level::WARN,
+                                diag::SSE_READ_FAILED,
+                                &[
+                                    ("attempt", diag::Field::Num(u64::from(attempt))),
+                                    ("phase", diag::Field::Static("read_timeout")),
+                                ],
+                            );
                             LlmError::Timeout(120)
                         } else {
+                            diag::event(
+                                tracing::Level::WARN,
+                                diag::SSE_READ_FAILED,
+                                &[
+                                    ("attempt", diag::Field::Num(u64::from(attempt))),
+                                    ("phase", diag::Field::Static("read")),
+                                ],
+                            );
                             LlmError::Network("stream read failed".into())
                         }
                     })?;
                     let p = parser.push(&bytes);
                     if parser.take_overflow() {
+                        diag::event(
+                            tracing::Level::WARN,
+                            diag::SSE_OVERFLOW,
+                            &[("attempt", diag::Field::Num(u64::from(attempt)))],
+                        );
                         return Err(LlmError::MalformedStream(
                             "SSE payload exceeded the 1 MiB line / 8 MiB event cap".into(),
                         ));
@@ -244,8 +298,16 @@ impl OpenRouterClient {
                         finish_reason,
                     });
                 }
-                let v: serde_json::Value = serde_json::from_str(&payload)
-                    .map_err(|e| LlmError::MalformedStream(format!("bad chunk: {e}")))?;
+                let v: serde_json::Value = serde_json::from_str(&payload).map_err(|e| {
+                    // Diagnostics carry only the fixed category: the serde
+                    // message is provider-controlled text.
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::SSE_DECODE_FAILED,
+                        &[("attempt", diag::Field::Num(u64::from(attempt)))],
+                    );
+                    LlmError::MalformedStream(format!("bad chunk: {e}"))
+                })?;
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = Some(parse_usage(u));
                 }
@@ -349,7 +411,7 @@ impl LlmClient for OpenRouterClient {
         let mut streamed_any = false;
         loop {
             match self
-                .try_complete_once(&url, &body, &events, &mut streamed_any)
+                .try_complete_once(&url, &body, &events, &mut streamed_any, attempt)
                 .await
             {
                 Ok(resp) => return Ok(resp),
@@ -359,12 +421,25 @@ impl LlmClient for OpenRouterClient {
                         // Bounded backoff: 1s, 3s. Never longer.
                         tokio::time::sleep(Duration::from_secs(1 + 2 * attempt as u64)).await;
                         tracing::warn!(retry = attempt, "retrying provider request");
+                        diag::event(
+                            tracing::Level::WARN,
+                            diag::PROVIDER_RETRY,
+                            &[
+                                ("attempt", diag::Field::Num(u64::from(attempt))),
+                                ("reason", diag::Field::Static(e.category())),
+                            ],
+                        );
                         continue;
                     }
                     if streamed_any && e.is_retryable() {
                         tracing::warn!(
                             "provider failed mid-stream after partial delivery; not retrying \
                              to avoid duplicating streamed output"
+                        );
+                        diag::event(
+                            tracing::Level::WARN,
+                            diag::PROVIDER_MIDSTREAM_ABORT,
+                            &[("reason", diag::Field::Static(e.category()))],
                         );
                     }
                     return Err(e);
@@ -385,18 +460,46 @@ impl LlmClient for OpenRouterClient {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::PROVIDER_MODELS_FAILED,
+                        &[("phase", diag::Field::Static("timeout"))],
+                    );
                     LlmError::Timeout(20)
                 } else {
+                    diag::event(
+                        tracing::Level::WARN,
+                        diag::PROVIDER_MODELS_FAILED,
+                        &[("phase", diag::Field::Static("network"))],
+                    );
                     LlmError::Network("models request failed".into())
                 }
             })?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(Self::map_status(status, text));
+            let err = Self::map_status(status, text);
+            diag::event(
+                tracing::Level::WARN,
+                diag::PROVIDER_MODELS_FAILED,
+                &[
+                    ("reason", diag::Field::Static(err.category())),
+                    ("status", diag::Field::Num(u64::from(status.as_u16()))),
+                ],
+            );
+            return Err(err);
         }
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| LlmError::MalformedStream(format!("models body: {e}")))?;
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                diag::event(
+                    tracing::Level::WARN,
+                    diag::PROVIDER_MODELS_FAILED,
+                    &[("reason", diag::Field::Static("malformed_stream"))],
+                );
+                return Err(LlmError::MalformedStream(format!("models body: {e}")));
+            }
+        };
         let arr = v
             .get("data")
             .and_then(|d| d.as_array())

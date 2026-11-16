@@ -5,6 +5,165 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="dark light"/>
   <title>Vortex-Ai-Chat</title>
+  <script>
+    // Bootstrap diagnostics reporter: registered before any asset loads so
+    // even early load failures can be seen (when the server gate is on), and
+    // it keeps running after the WASM reporter starts. It owns delivery for
+    // bootstrap-origin events only (JS errors, rejections, resource loads,
+    // plus WASM panic reports enqueued while Rust is still probing health);
+    // the Rust reporter owns api/sse/panic events. Coordination contract on
+    // window.__vortexDiag (see crates/vortex-ui/src/diagnostics.rs):
+    //   decided    - health verdict known?
+    //   enabled    - true / false / null (unavailable, with fallback=true)
+    //   fallback   - console-fallback mode (health unreachable)
+    //   setVerdict - fn("enabled"|"disabled"|"unavailable"); also callable
+    //                from Rust to publish the WASM probe verdict
+    //   enqueue    - fn(jsonString); hand-off point for Rust panic reports
+    // Privacy rules: fixed event labels and numeric locations only — never
+    // messages, exception/rejection values, source URLs, or stack text.
+    // Delivery is a single best-effort fetch per event (no retry loops);
+    // identical failures deduplicate for 30 seconds.
+    (function () {
+      "use strict";
+      var events = [], last = Object.create(null);
+      var stash = {
+        decided: false,
+        enabled: null,
+        fallback: false,
+        setVerdict: function (v) {
+          stash.decided = true;
+          probePending = false; // a late early-probe resolution must not override
+          if (v === "enabled") { stash.enabled = true; stash.fallback = false; }
+          else if (v === "disabled") { stash.enabled = false; stash.fallback = false; }
+          else { stash.enabled = null; stash.fallback = true; }
+          tryFlush();
+        },
+        enqueue: function (json) {
+          try {
+            var report = JSON.parse(json);
+            if (report.event !== "panic" || report.operation !== "panic") { return; }
+            var location = report.location || {};
+            push({ event: "panic", operation: "panic",
+              line: location.line, column: location.column });
+          } catch (e) { /* diagnostics must never break the page */ }
+        }
+      };
+      try { window.__vortexDiag = stash; } catch (e) { return; }
+
+      var DEDUP_MS = 30000, CAP = 32;
+      var probePending = true;
+
+      function consoleFallback(json) {
+        try {
+          var o = JSON.parse(json);
+          console.warn("[vortex diagnostics] event=" + o.event +
+            " operation=" + o.operation +
+            (o.status != null ? " status=" + o.status : "") +
+            " (reporting unavailable)");
+        } catch (e) {
+          console.warn("[vortex diagnostics] report (reporting unavailable)");
+        }
+      }
+
+      function sendOne(json) {
+        try {
+          fetch("/api/diagnostics", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: json,
+            keepalive: true
+          }).then(function (r) {
+            if (r.status !== 204) { consoleFallback(json); }
+          }, function () { consoleFallback(json); });
+        } catch (e) { consoleFallback(json); }
+      }
+
+      function tryFlush() {
+        if (!stash.decided || events.length === 0) { return; }
+        var batch = events.splice(0, events.length);
+        if (stash.enabled === true) {
+          batch.forEach(sendOne);
+        } else if (stash.fallback) {
+          batch.forEach(consoleFallback);
+        } else {
+          batch.length = 0; // confirmed disabled: silent
+        }
+      }
+
+      // Bounded numeric location per the shared contract (1..=1_000_000).
+      function num(n) {
+        return (typeof n === "number" && n >= 1 && n <= 1000000 &&
+          n === Math.floor(n)) ? n : null;
+      }
+
+      // Build the exact BrowserReport wire shape (deny-unknown-fields):
+      // fixed enums plus an optional nested numeric-only location object.
+      function toWire(ev) {
+        var body = { event: ev.event, operation: ev.operation };
+        var line = num(ev.line), column = num(ev.column);
+        if (line != null || column != null) {
+          body.location = {};
+          if (line != null) { body.location.line = line; }
+          if (column != null) { body.location.column = column; }
+        }
+        return body;
+      }
+
+      function push(ev) {
+        try {
+          var wire = toWire(ev);
+          var key = wire.event + "|" + wire.operation;
+          var now = Date.now();
+          if (last[key] != null && now - last[key] < DEDUP_MS) { return; }
+          last[key] = now;
+          if (events.length >= CAP) { events.shift(); }
+          events.push(JSON.stringify(wire));
+          tryFlush();
+        } catch (e) { /* diagnostics must never break the page */ }
+      }
+
+      window.addEventListener("error", function (e) {
+        var t = e && e.target;
+        if (t && t !== window && (t.src || t.href)) {
+          // Resource load failure: no URL text, numbers only.
+          push({ event: "resource", operation: "bootstrap" });
+          return;
+        }
+        push({
+          event: "error",
+          operation: "bootstrap",
+          line: e ? e.lineno : null,
+          column: e ? e.colno : null
+        });
+      }, true);
+
+      window.addEventListener("unhandledrejection", function () {
+        // Never record the rejection value.
+        push({ event: "rejection", operation: "bootstrap" });
+      });
+
+      // Early health probe (one try, no retries): decides the session
+      // before the WASM reporter runs. Guard denials and server errors are
+      // "unavailable" (console fallback), not a confirmed "disabled". If the
+      // WASM reporter publishes a verdict first, this probe's resolution is
+      // ignored (probePending cleared by setVerdict).
+      function finishProbe(v) {
+        if (probePending) { stash.setVerdict(v); }
+      }
+      try {
+        fetch("/api/health").then(function (r) {
+          if (r.status === 404) { finishProbe("disabled"); return null; }
+          if (r.status !== 200) { finishProbe("unavailable"); return null; }
+          return r.json();
+        }).then(function (j) {
+          if (j == null) { return; }
+          if (j.diagnostics === true) { finishProbe("enabled"); }
+          else if (j.diagnostics === false) { finishProbe("disabled"); }
+          else { finishProbe("unavailable"); }
+        }, function () { finishProbe("unavailable"); });
+      } catch (e) { finishProbe("unavailable"); }
+    })();
+  </script>
   <link data-trunk rel="css" href="styles.css"/>
   <link data-trunk rel="rust" data-target-name="vortex-ui" data-wasm-opt="0"/>
 </head>

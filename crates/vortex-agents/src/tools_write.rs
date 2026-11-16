@@ -12,6 +12,7 @@ use crate::schema::{ParamSpec, ParamType, ToolDef};
 use crate::tools_files::rel_display;
 use async_trait::async_trait;
 use std::path::Path;
+use vortex_core::diag;
 use vortex_types::PermissionProfile;
 
 fn profile_allows_writes(ctx: &ToolContext) -> Result<(), ToolError> {
@@ -35,11 +36,25 @@ async fn checkpoint(ctx: &ToolContext, ws: &crate::workspace::WorkspaceRoots, pa
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            tracing::warn!(
-                "skipping checkpoint for '{}': the file exists but is not readable as UTF-8 \
-                 text ({e}); a text snapshot could not represent it faithfully",
-                path.display()
-            );
+            // The normal log names the path and the OS error text; in
+            // diagnostics mode both are user-controlled content, so only a
+            // fixed-category event is emitted instead.
+            if diag::enabled() {
+                diag::event(
+                    tracing::Level::WARN,
+                    diag::TOOL_CHECKPOINT_SKIPPED,
+                    &[
+                        ("run_id", diag::Field::Uuid(ctx.run_id.as_str())),
+                        ("reason", diag::Field::Static("not_utf8")),
+                    ],
+                );
+            } else {
+                tracing::warn!(
+                    "skipping checkpoint for '{}': the file exists but is not readable as UTF-8 \
+                     text ({e}); a text snapshot could not represent it faithfully",
+                    path.display()
+                );
+            }
             return;
         }
     };
@@ -53,7 +68,21 @@ async fn checkpoint(ctx: &ToolContext, ws: &crate::workspace::WorkspaceRoots, pa
             )
             .await;
         if let Err(e) = res {
-            tracing::warn!("checkpoint failed: {e}");
+            if diag::enabled() {
+                diag::event(
+                    tracing::Level::ERROR,
+                    diag::DB_PERSIST_FAILED,
+                    &[
+                        ("op", diag::Field::Static("checkpoint_add")),
+                        ("run_id", diag::Field::Uuid(ctx.run_id.as_str())),
+                        ("conversation_id", diag::Field::Uuid(conv.as_str())),
+                    ],
+                );
+            } else {
+                // Normal path keeps the existing message; the DB error text
+                // could echo query internals and is not diagnostics-safe.
+                tracing::warn!("checkpoint failed: {e}");
+            }
         }
     }
     let _ = ws;

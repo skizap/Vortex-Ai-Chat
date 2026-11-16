@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod db;
+pub mod diag;
 pub mod error;
 pub mod paths;
 pub mod store;

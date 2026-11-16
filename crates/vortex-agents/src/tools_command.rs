@@ -227,6 +227,11 @@ pub async fn run_command_scoped(
         .is_err()
     {
         tracing::warn!("output drain timed out; a child process may still hold the pipes open");
+        vortex_core::diag::event(
+            tracing::Level::WARN,
+            vortex_core::diag::TOOL_DRAIN_TIMEOUT,
+            &[("phase", vortex_core::diag::Field::Static("post_exit_drain"))],
+        );
     }
     if out_buf.len() > max_output {
         out_buf.truncate(max_output);

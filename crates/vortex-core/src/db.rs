@@ -52,7 +52,16 @@ impl Db {
             f(&guard).map_err(CoreError::Db)
         })
         .await
-        .map_err(|e| CoreError::Config(format!("db task join error: {e}")))?
+        .map_err(|e| {
+            // Diagnostics carry only the fixed category: a JoinError's display
+            // can embed a panic payload, which must never reach diagnostics.
+            crate::diag::event(
+                tracing::Level::ERROR,
+                crate::diag::DB_JOIN_FAILED,
+                &[("panicked", crate::diag::Field::Flag(e.is_panic()))],
+            );
+            CoreError::Config(format!("db task join error: {e}"))
+        })?
     }
 
     /// Synchronous access for one-shot startup tasks only.

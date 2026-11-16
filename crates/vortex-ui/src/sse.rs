@@ -129,6 +129,10 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
         format!("/api/runs/{run_id}/events")
     };
     let source = web_sys::EventSource::new(&url).map_err(|_| {
+        crate::diagnostics::report_sse_failure(
+            vortex_types::BrowserOperation::SseConnect,
+            Some(&run_id),
+        );
         "the browser refused to open the run event stream \
               (too many open connections?)"
             .to_string()
@@ -146,6 +150,10 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
                 return;
             };
             let Ok(event) = serde_json::from_str::<vortex_types::RunEvent>(&text) else {
+                crate::diagnostics::report_sse_failure(
+                    vortex_types::BrowserOperation::SseDecode,
+                    Some(&run_id_msg),
+                );
                 return;
             };
             handle_event(&ctx_msg, event);
@@ -159,6 +167,10 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
         let run_id = run_id.clone();
         move || {
             let run_id = run_id.clone();
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseGap,
+                Some(&run_id),
+            );
             spawn_local(async move {
                 resync_from_server(&ctx, &run_id).await;
             });
@@ -179,6 +191,10 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
         if !nonterminal {
             return;
         }
+        crate::diagnostics::report_sse_failure(
+            vortex_types::BrowserOperation::SseReconnect,
+            Some(&run_id_err),
+        );
         let closed = source_err.ready_state() == web_sys::EventSource::CLOSED;
         let ctx = ctx_err;
         let run_id = run_id_err.clone();
@@ -199,6 +215,10 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
                             match subscribe_run(ctx, run_id.clone()) {
                                 Ok(sub) => set_new_subscription(sub),
                                 Err(e) => {
+                                    crate::diagnostics::report_sse_failure(
+                                        vortex_types::BrowserOperation::SseReconnect,
+                                        Some(&run_id),
+                                    );
                                     ctx.set_toast(format!("run stream reconnect failed: {e}"))
                                 }
                             }
@@ -220,12 +240,20 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
         .add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref())
         .map_err(|_| {
             source.close();
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseConnect,
+                Some(&run_id),
+            );
             "could not attach to the run event stream".to_string()
         })?;
     source
         .add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
         .map_err(|_| {
             source.close();
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseConnect,
+                Some(&run_id),
+            );
             "could not attach to the run event stream".to_string()
         })?;
     // Legacy name (older servers) — same resync semantics as `replay_gap`.
@@ -233,12 +261,20 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
         .add_event_listener_with_callback("lagged", on_lagged.as_ref().unchecked_ref())
         .map_err(|_| {
             source.close();
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseConnect,
+                Some(&run_id),
+            );
             "could not attach to the run event stream".to_string()
         })?;
     source
         .add_event_listener_with_callback("replay_gap", on_replay_gap.as_ref().unchecked_ref())
         .map_err(|_| {
             source.close();
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseConnect,
+                Some(&run_id),
+            );
             "could not attach to the run event stream".to_string()
         })?;
 
@@ -298,7 +334,13 @@ async fn resync_from_server(ctx: &AppCtx, run_id: &str) {
                     .collect(),
             );
         }
-        Err(e) => ctx.set_toast(format!("lost connection to the run stream ({e})")),
+        Err(e) => {
+            crate::diagnostics::report_sse_failure(
+                vortex_types::BrowserOperation::SseResync,
+                Some(run_id),
+            );
+            ctx.set_toast(format!("lost connection to the run stream ({e})"))
+        }
     }
 }
 

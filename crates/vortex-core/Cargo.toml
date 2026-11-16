@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Test-only hook that lets test binaries force the diagnostics gate on or off
+# deterministically. Never enable it in production builds: a normal release
+# binary can only turn diagnostics on through the VORTEX_DIAGNOSTICS
+# environment variable, and the override API below does not even compile
+# without this feature. Enabled only by dev-dependencies (e.g. vortex-agents
+# integration tests).
+diag-test-gate = []
+
 [dependencies]
 vortex-types = { workspace = true }
 tokio = { workspace = true }

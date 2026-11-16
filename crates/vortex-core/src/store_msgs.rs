@@ -74,13 +74,26 @@ impl Db {
                     Ok(s) => Ok(s),
                     Err(e) => {
                         // Never silently discard user data: keep the corrupt
-                        // blob for inspection/recovery and say so loudly.
-                        tracing::error!(
-                            error = %e,
-                            "stored settings could not be parsed; falling back to defaults. \
-                             The original blob was preserved under settings key \
-                             'settings_corrupt_backup'."
-                        );
+                        // blob for inspection/recovery and say so loudly. In
+                        // diagnostics mode the loud log is replaced by a
+                        // fixed-category event: the serde message is
+                        // attacker/blob-controlled text and must not be
+                        // captured. Normal (non-diagnostic) behavior is
+                        // unchanged.
+                        if crate::diag::enabled() {
+                            crate::diag::event(
+                                tracing::Level::ERROR,
+                                crate::diag::SETTINGS_CORRUPT_DEFAULTS,
+                                &[],
+                            );
+                        } else {
+                            tracing::error!(
+                                error = %e,
+                                "stored settings could not be parsed; falling back to defaults. \
+                                 The original blob was preserved under settings key \
+                                 'settings_corrupt_backup'."
+                            );
+                        }
                         let _ = c.execute(
                             "INSERT INTO settings (key, value) VALUES ('settings_corrupt_backup', ?1)
                              ON CONFLICT(key) DO UPDATE SET value = ?1",

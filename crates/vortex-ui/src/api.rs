@@ -1,26 +1,64 @@
 //! Typed API client (gloo-net) + SSE event source, both fully in Rust/WASM.
 
+use crate::diagnostics;
 use serde::de::DeserializeOwned;
 use vortex_types::{
-    ApprovalInfo, Capabilities, ChatRequestDto, CheckpointInfo, ConversationSummary, ModelInfo,
-    PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
+    ApprovalInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
+    ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
 const BASE: &str = "/api";
 
+/// Server-generated correlation id from a diagnostics-mode response. Only a
+/// strict UUID survives (see `build_report`); everything else is dropped.
+fn request_id_of(resp: &gloo_net::http::Response) -> Option<String> {
+    resp.headers().get(diagnostics::REQUEST_ID_HEADER)
+}
+
 pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    let run_id = diagnostics::extract_run_id(path);
     let resp = gloo_net::http::Request::get(&format!("{BASE}{path}"))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            diagnostics::report_api_failure(
+                BrowserOperation::ApiTransport,
+                None,
+                None,
+                run_id.as_deref(),
+            );
+            e.to_string()
+        })?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let text = resp.text().await.map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiTransport,
+            None,
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        e.to_string()
+    })?;
     // Only 2xx is success: a 3xx reaching this point means a redirect the
     // browser did not follow, and its body is not the expected JSON.
     if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiDecode,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        format!("invalid response: {e}")
+    })
 }
 
 pub async fn send_json<T: DeserializeOwned>(
@@ -36,19 +74,50 @@ pub async fn send_json<T: DeserializeOwned>(
         "DELETE" => gloo_net::http::Request::delete(&url),
         _ => return Err(format!("unsupported method {method}")),
     };
+    let run_id = diagnostics::extract_run_id(path);
     let resp = req
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .map_err(|e| e.to_string())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            diagnostics::report_api_failure(
+                BrowserOperation::ApiTransport,
+                None,
+                None,
+                run_id.as_deref(),
+            );
+            e.to_string()
+        })?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let text = resp.text().await.map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiTransport,
+            None,
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        e.to_string()
+    })?;
     if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiDecode,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            run_id.as_deref(),
+        );
+        format!("invalid response: {e}")
+    })
 }
 
 fn parse_error(text: &str) -> String {

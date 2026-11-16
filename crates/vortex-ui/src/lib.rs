@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod chat;
+pub mod diagnostics;
 pub mod markdown;
 pub mod settings_ui;
 pub mod sidebar;

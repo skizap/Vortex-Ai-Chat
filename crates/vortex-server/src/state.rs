@@ -1,5 +1,6 @@
 //! Shared application state for the server.
 
+use crate::guard::GuardSettings;
 use std::sync::Arc;
 use vortex_agents::{Engine, Hub, PreviewRegistry};
 use vortex_core::{AppConfig, Db};
@@ -15,6 +16,10 @@ pub struct AppState {
     pub previews: Arc<PreviewRegistry>,
     pub is_mock_llm: bool,
     pub version: &'static str,
+    /// Inputs for the Host/Origin/LAN guard (split out for testability).
+    pub guard: GuardSettings,
+    /// Session-scoped diagnostics (env-only opt-in; never persisted).
+    pub diagnostics: crate::diagnostics::DiagnosticsState,
 }
 
 impl AppState {
@@ -37,6 +42,7 @@ impl AppState {
             version: self.version.to_string(),
             openrouter: self.is_mock_llm || self.config.api_key().is_some(),
             mock_llm: self.is_mock_llm,
+            diagnostics: self.diagnostics.enabled,
             search: search_configured && settings.tools.search,
             search_provider,
             search_hint,

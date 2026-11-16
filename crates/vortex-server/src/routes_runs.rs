@@ -14,7 +14,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use vortex_agents::Hub;
-use vortex_types::{Role, RunEvent, RunInfo, RunStatus};
+use vortex_types::{Mode, Role, RunEvent, RunInfo, RunStatus};
 
 /// Replay cursor for an SSE (re-)subscription: the `Last-Event-ID` header
 /// (sent automatically by the browser's EventSource on reconnect) and the
@@ -52,14 +52,16 @@ pub async fn run_events(
     // filtered per connection below).
     let Some(rx) = state.hub.subscribe(&id) else {
         // Terminal/unknown runs replay a single final event so the UI settles.
-        let final_status = state
-            .db
-            .get_run(id.clone())
-            .await
-            .ok()
-            .flatten()
-            .map(|r| r.status)
-            .unwrap_or(RunStatus::Interrupted);
+        let final_status = match state.db.get_run(id.clone()).await {
+            Ok(Some(r)) => r.status,
+            Ok(None) => RunStatus::Interrupted,
+            Err(_) => {
+                // Same degraded response as "unknown run"; the DB failure is
+                // traced so it is not silently invisible.
+                crate::diagnostics::db_failure("get_run", Some(&id));
+                RunStatus::Interrupted
+            }
+        };
         let event = RunEvent::RunFinished {
             run_id: id,
             status: final_status,
@@ -162,15 +164,28 @@ pub async fn run_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    let Some(run) = state.db.get_run(id.clone()).await.unwrap_or(None) else {
-        return err_json(StatusCode::NOT_FOUND, "run not found");
+    let run = match state.db.get_run(id.clone()).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "run not found"),
+        Err(_) => {
+            crate::diagnostics::db_failure("get_run", Some(&id));
+            return err_json(StatusCode::NOT_FOUND, "run not found");
+        }
     };
-    let children = state
-        .db
-        .list_child_runs(id.clone())
-        .await
-        .unwrap_or_default();
-    let tool_calls = state.db.list_tool_calls(id).await.unwrap_or_default();
+    let children = match state.db.list_child_runs(id.clone()).await {
+        Ok(children) => children,
+        Err(_) => {
+            crate::diagnostics::db_failure("list_child_runs", Some(&id));
+            Vec::new()
+        }
+    };
+    let tool_calls = match state.db.list_tool_calls(id.clone()).await {
+        Ok(calls) => calls,
+        Err(_) => {
+            crate::diagnostics::db_failure("list_tool_calls", Some(&id));
+            Vec::new()
+        }
+    };
     Json(serde_json::json!({
         "run": run,
         "agents": children,
@@ -185,10 +200,15 @@ pub async fn list_runs(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<Vec<RunInfo>> {
     let list = match q.get("conversation_id") {
-        Some(conv) => state.db.list_runs_for_conversation(conv.clone()).await,
-        None => Ok(Vec::new()),
-    }
-    .unwrap_or_default();
+        Some(conv) => match state.db.list_runs_for_conversation(conv.clone()).await {
+            Ok(list) => list,
+            Err(_) => {
+                crate::diagnostics::db_failure("list_runs_for_conversation", Some(conv));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     Json(list)
 }
 
@@ -198,8 +218,13 @@ pub async fn retry_run(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    let Some(run) = state.db.get_run(id.clone()).await.unwrap_or(None) else {
-        return err_json(StatusCode::NOT_FOUND, "run not found");
+    let run = match state.db.get_run(id.clone()).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "run not found"),
+        Err(_) => {
+            crate::diagnostics::db_failure("get_run", Some(&id));
+            return err_json(StatusCode::NOT_FOUND, "run not found");
+        }
     };
     let Some(conv_id) = run.conversation_id.clone() else {
         return err_json(StatusCode::BAD_REQUEST, "run has no conversation to retry");
@@ -215,22 +240,25 @@ pub async fn retry_run(
         );
     }
 
-    let messages = state
-        .db
-        .get_messages(conv_id.clone())
-        .await
-        .unwrap_or_default();
+    let messages = match state.db.get_messages(conv_id.clone()).await {
+        Ok(m) => m,
+        Err(_) => {
+            crate::diagnostics::db_failure("get_messages", Some(&conv_id));
+            Vec::new()
+        }
+    };
     let Some(last_user_idx) = messages.iter().rposition(|m| m.role == Role::User) else {
         return err_json(StatusCode::BAD_REQUEST, "no user message to retry");
     };
     let retry_content = messages[last_user_idx].content.clone();
-    let mode = state
-        .db
-        .get_conversation(conv_id.clone())
-        .await
-        .unwrap_or(None)
-        .map(|c| c.mode)
-        .unwrap_or_default();
+    let mode = match state.db.get_conversation(conv_id.clone()).await {
+        Ok(Some(c)) => c.mode,
+        Ok(None) => Mode::default(),
+        Err(_) => {
+            crate::diagnostics::db_failure("get_conversation", Some(&conv_id));
+            Mode::default()
+        }
+    };
     // History = everything *before* the last user message (start_chat_run
     // appends the retried user message itself — including it here would send
     // it twice), filtered to user/assistant roles like post_chat does:

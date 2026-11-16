@@ -1,17 +1,45 @@
 //! Request guards: Host allow-list (DNS-rebinding defense), Origin checks
 //! (CSRF defense), bearer-token auth for LAN mode, and body limits.
 
-use crate::state::AppState;
 use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
+/// The guard's inputs, split out of `AppState` so the exact guard semantics
+/// can be exercised by lightweight tests. Semantics are identical to the
+/// previous `AppState`-based version.
+#[derive(Clone)]
+pub struct GuardSettings {
+    pub lan_enabled: bool,
+    pub lan_token: Arc<str>,
+}
+
+/// Fixed, non-content labels a denial is tagged with. The correlation
+/// middleware logs only this category — never the Host/Origin/token values
+/// themselves.
+#[derive(Debug, Clone, Copy)]
+pub enum DenialCategory {
+    Host,
+    Origin,
+    Auth,
+}
+
+impl DenialCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DenialCategory::Host => "host",
+            DenialCategory::Origin => "origin",
+            DenialCategory::Auth => "auth",
+        }
+    }
+}
+
 /// Host header must be a loopback name unless LAN mode is explicitly enabled.
 /// This blocks DNS-rebinding attacks where a public domain resolves to 127.0.0.1.
-pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    let lan = state.config.server.lan.enabled;
+pub async fn guard(State(gs): State<GuardSettings>, req: Request, next: Next) -> Response {
+    let lan = gs.lan_enabled;
 
     if !lan {
         let host = req
@@ -21,10 +49,13 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
             .unwrap_or_default();
         let host_only = host.split(':').next().unwrap_or_default();
         if !matches!(host_only, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
-            return denied(format!(
-                "refusing request for host '{host}': this server only accepts localhost access \
-                 (see docs/SECURITY.md)"
-            ));
+            return denied(
+                DenialCategory::Host,
+                format!(
+                    "refusing request for host '{host}': this server only accepts localhost access \
+                     (see docs/SECURITY.md)"
+                ),
+            );
         }
     }
 
@@ -44,9 +75,10 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
                 matches!(o.split(':').next(), Some("127.0.0.1") | Some("localhost"))
             };
             if !ok {
-                return denied(format!(
-                    "cross-origin request from '{origin}' is not allowed"
-                ));
+                return denied(
+                    DenialCategory::Origin,
+                    format!("cross-origin request from '{origin}' is not allowed"),
+                );
             }
         }
     }
@@ -54,7 +86,7 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
     // LAN mode: every request must carry the token (query param works for
     // EventSource, which cannot set headers).
     if lan {
-        let token = &state.config.server.lan.token;
+        let token = &gs.lan_token;
         let provided = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -71,7 +103,12 @@ pub async fn guard(State(state): State<Arc<AppState>>, req: Request, next: Next)
             });
         match provided {
             Some(t) if ct_eq(t.as_bytes(), token.as_bytes()) => {}
-            _ => return denied("missing or invalid LAN access token".to_string()),
+            _ => {
+                return denied(
+                    DenialCategory::Auth,
+                    "missing or invalid LAN access token".to_string(),
+                )
+            }
         }
     }
 
@@ -99,12 +136,15 @@ fn urldecode(s: &str) -> String {
         .to_string()
 }
 
-fn denied(msg: String) -> Response {
-    (
+fn denied(category: DenialCategory, msg: String) -> Response {
+    let mut resp = (
         StatusCode::FORBIDDEN,
         axum::Json(serde_json::json!({ "error": msg })),
     )
-        .into_response()
+        .into_response();
+    // Visible to the outer correlation middleware as a fixed label only.
+    resp.extensions_mut().insert(category);
+    resp
 }
 
 #[cfg(test)]

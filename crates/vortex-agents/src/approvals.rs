@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
+use vortex_core::diag;
 use vortex_core::Db;
 use vortex_types::{ApprovalStatus, RunEvent};
 
@@ -46,10 +47,20 @@ impl ApprovalManager {
         let Some(sender) = sender else { return false };
         if sender.send(approve).is_err() {
             // Waiter timed out between the timeout firing and this call.
-            let _ = self
+            let resolved = self
                 .db
                 .resolve_approval(id.to_string(), ApprovalStatus::Expired)
                 .await;
+            if resolved.is_err() {
+                diag::event(
+                    tracing::Level::ERROR,
+                    diag::APPROVAL_RESOLVE_FAILED,
+                    &[
+                        ("approval_id", diag::Field::Uuid(id)),
+                        ("outcome", diag::Field::Static("expired")),
+                    ],
+                );
+            }
             return false;
         }
         let status = if approve {
@@ -57,7 +68,20 @@ impl ApprovalManager {
         } else {
             ApprovalStatus::Denied
         };
-        let _ = self.db.resolve_approval(id.to_string(), status).await;
+        let resolved = self.db.resolve_approval(id.to_string(), status).await;
+        if resolved.is_err() {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::APPROVAL_RESOLVE_FAILED,
+                &[
+                    ("approval_id", diag::Field::Uuid(id)),
+                    (
+                        "outcome",
+                        diag::Field::Static(if approve { "approved" } else { "denied" }),
+                    ),
+                ],
+            );
+        }
         true
     }
 
@@ -76,7 +100,8 @@ impl ApprovalGate for ApprovalManager {
             .get(run_id)
             .map(|h| h.agent())
             .unwrap_or_else(|| "agent".into());
-        self.db
+        let persisted = self
+            .db
             .add_approval(
                 id.clone(),
                 run_id.to_string(),
@@ -84,8 +109,20 @@ impl ApprovalGate for ApprovalManager {
                 title.to_string(),
                 payload.to_string(),
             )
-            .await
-            .map_err(|e| ToolError::Execution(format!("persisting approval: {e}")))?;
+            .await;
+        if let Err(e) = persisted {
+            // Diagnostics note only the boundary; the error text (which can
+            // echo DB internals) stays on the normal path only.
+            diag::event(
+                tracing::Level::ERROR,
+                diag::APPROVAL_PERSIST_FAILED,
+                &[
+                    ("approval_id", diag::Field::Uuid(id.as_str())),
+                    ("run_id", diag::Field::Uuid(run_id)),
+                ],
+            );
+            return Err(ToolError::Execution(format!("persisting approval: {e}")));
+        }
         self.hub.publish(
             run_id,
             RunEvent::ApprovalRequested {
@@ -103,10 +140,25 @@ impl ApprovalGate for ApprovalManager {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => {
                 // Sender dropped without a decision (manager shutting down).
-                let _ = self
+                let resolved = self
                     .db
                     .resolve_approval(id.clone(), ApprovalStatus::Expired)
                     .await;
+                if resolved.is_err() {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::APPROVAL_RESOLVE_FAILED,
+                        &[
+                            ("approval_id", diag::Field::Uuid(id.as_str())),
+                            ("outcome", diag::Field::Static("expired")),
+                        ],
+                    );
+                }
+                diag::event(
+                    tracing::Level::WARN,
+                    diag::APPROVAL_WAITER_DROPPED,
+                    &[("approval_id", diag::Field::Uuid(id.as_str()))],
+                );
                 false
             }
             Err(_) => {
@@ -116,12 +168,27 @@ impl ApprovalGate for ApprovalManager {
                 // and a second write here could overwrite the user's choice.
                 let owned = self.pending.lock().await.remove(&id).is_some();
                 if owned {
-                    let _ = self
+                    let resolved = self
                         .db
                         .resolve_approval(id.clone(), ApprovalStatus::Expired)
                         .await;
+                    if resolved.is_err() {
+                        diag::event(
+                            tracing::Level::ERROR,
+                            diag::APPROVAL_RESOLVE_FAILED,
+                            &[
+                                ("approval_id", diag::Field::Uuid(id.as_str())),
+                                ("outcome", diag::Field::Static("expired")),
+                            ],
+                        );
+                    }
                 }
                 tracing::info!(approval_id = %id, "approval timed out and was auto-denied");
+                diag::event(
+                    tracing::Level::INFO,
+                    diag::APPROVAL_TIMEOUT,
+                    &[("approval_id", diag::Field::Uuid(id.as_str()))],
+                );
                 false
             }
         };
