@@ -4,8 +4,8 @@
 //! never blocked on SQLite. SQLite is configured in WAL mode for safe
 //! concurrent reads/writes from the async runtime.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{CoreError, Result};
 
@@ -14,6 +14,9 @@ use crate::error::{CoreError, Result};
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Attachment storage root, registered once at startup so conversation
+    /// deletion can clean up files after the row cascade commits.
+    pub(crate) attachments_root: Arc<OnceLock<PathBuf>>,
 }
 
 impl Db {
@@ -30,9 +33,16 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            attachments_root: Arc::new(OnceLock::new()),
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Register the attachment storage root (idempotent; first call wins).
+    /// Enables best-effort file cleanup inside `delete_conversation`.
+    pub fn set_attachments_root(&self, root: PathBuf) {
+        let _ = self.attachments_root.set(root);
     }
 
     /// Run one blocking closure against the connection.
@@ -72,6 +82,16 @@ impl Db {
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(SCRIPT)?;
+        // `CREATE TABLE IF NOT EXISTS` never alters an existing `messages`
+        // table, so the attachments column is added explicitly when missing.
+        let has_attachments = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'attachments'")?
+            .exists([])?;
+        if !has_attachments {
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
         Ok(())
     }
 }
@@ -151,6 +171,44 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation ON checkpoints(conversation_id);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id              TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    origin          TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    filename        TEXT NOT NULL,
+    media_type      TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL DEFAULT 0,
+    storage_path    TEXT NOT NULL DEFAULT '',
+    job_id          TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_conversation ON attachments(conversation_id);
+
+CREATE TABLE IF NOT EXISTS video_jobs (
+    id              TEXT PRIMARY KEY,
+    provider_job_id TEXT,
+    conversation_id TEXT NOT NULL,
+    attachment_id   TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    prompt          TEXT NOT NULL DEFAULT '',
+    params_json     TEXT NOT NULL DEFAULT '{}',
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_jobs_conversation ON video_jobs(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_video_jobs_status ON video_jobs(status);
+
+CREATE TABLE IF NOT EXISTS file_annotations (
+    attachment_id    TEXT PRIMARY KEY,
+    annotations_json TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
 "#;
 
 /// Mark runs that were live when the process died as honestly interrupted,
@@ -238,5 +296,51 @@ mod tests {
             })
             .unwrap();
         assert!(decided.is_some(), "expired approvals get a decided_at");
+    }
+
+    #[test]
+    fn migrate_adds_attachments_column_to_old_messages_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        // Fixture: the pre-attachments schema, with an existing row.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     conversation_id TEXT NOT NULL,
+                     role            TEXT NOT NULL,
+                     content         TEXT NOT NULL,
+                     tool_calls      TEXT NOT NULL DEFAULT '[]',
+                     created_at      TEXT NOT NULL
+                 );
+                 INSERT INTO messages (conversation_id, role, content, created_at)
+                 VALUES ('c1', 'user', 'legacy message', '2026-01-01T00:00:00.000Z');",
+            )
+            .unwrap();
+        }
+        // Opening through Db runs the migration.
+        let db = Db::open(&path).unwrap();
+        let conn = db.raw_connection();
+        let has: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name='attachments'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(has, "attachments column must be added");
+        let att: String = conn
+            .query_row("SELECT attachments FROM messages WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(att, "[]", "existing rows default to no attachments");
+        let content: String = conn
+            .query_row("SELECT content FROM messages WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(content, "legacy message", "existing data is preserved");
+        // Re-opening is idempotent (no duplicate-column error).
+        drop(conn);
+        drop(db);
+        Db::open(&path).unwrap();
     }
 }

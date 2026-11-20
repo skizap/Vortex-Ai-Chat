@@ -26,6 +26,7 @@ similar = { workspace = true }
 libc = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
+base64 = "0.22"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 
 [dev-dependencies]

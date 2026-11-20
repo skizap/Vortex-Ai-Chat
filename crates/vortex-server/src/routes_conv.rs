@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
-use vortex_types::{ChatMessage, ChatRequestDto, ConversationSummary, Mode, Role, Settings};
+use vortex_types::{ChatMessage, ChatRequestDto, ConversationSummary, Mode, Settings};
 
 fn bad(msg: impl Into<String>) -> axum::response::Response {
     err_json(StatusCode::BAD_REQUEST, msg)
@@ -118,8 +118,15 @@ pub async fn post_chat(
     Json(body): Json<ChatRequestDto>,
 ) -> axum::response::Response {
     let content = body.content.trim();
-    if content.is_empty() {
-        return bad("message content must not be empty");
+    let attachment_ids = body.attachment_ids;
+    if attachment_ids.len() > crate::routes_attachments::MAX_PER_MESSAGE {
+        return bad(format!(
+            "at most {} attachments per message",
+            crate::routes_attachments::MAX_PER_MESSAGE
+        ));
+    }
+    if content.is_empty() && attachment_ids.is_empty() {
+        return bad("message content must not be empty (or attach a file)");
     }
     if content.len() > 100_000 {
         return bad("message too long (max 100KB)");
@@ -145,6 +152,37 @@ pub async fn post_chat(
         );
     }
 
+    // Validate attachments: each must exist, belong to this conversation, and
+    // be ready. Deduplicate while preserving order.
+    let mut refs: Vec<vortex_types::AttachmentRef> = Vec::new();
+    for aid in &attachment_ids {
+        if refs.iter().any(|r| &r.id == aid) {
+            continue;
+        }
+        match state.attachments.get_meta(aid).await {
+            Ok(Some(m))
+                if m.conversation_id == id && m.status == vortex_types::AttachmentStatus::Ready =>
+            {
+                refs.push(vortex_types::AttachmentRef {
+                    id: m.id,
+                    kind: m.kind,
+                    filename: m.filename,
+                    media_type: m.media_type,
+                    status: m.status,
+                });
+            }
+            Ok(Some(_)) => {
+                return bad("attachment does not belong to this conversation or is not ready yet");
+            }
+            _ => return bad(format!("attachment '{aid}' not found")),
+        }
+    }
+
+    let preflight = match state.engine.preflight_chat(&id, &refs).await {
+        Ok(preflight) => preflight,
+        Err(message) => return bad(message),
+    };
+
     // Rebuild conversation history for the model (user + assistant only).
     let stored = match state.db.get_messages(id.clone()).await {
         Ok(m) => m,
@@ -153,23 +191,9 @@ pub async fn post_chat(
             Vec::new()
         }
     };
-    let history: Vec<ChatMessage> = stored
-        .into_iter()
-        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-        .map(|m| ChatMessage {
-            role: m.role,
-            content: m.content,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        })
-        .collect();
-
-    if let Err(e) = state
-        .db
-        .add_message(id.clone(), ChatMessage::user(content))
-        .await
-    {
+    let mut user_msg = ChatMessage::user(content);
+    user_msg.attachments = refs.clone();
+    if let Err(e) = state.db.add_message(id.clone(), user_msg).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     if state.db.touch_conversation(id.clone()).await.is_err() {
@@ -178,7 +202,7 @@ pub async fn post_chat(
 
     let run_id = state
         .engine
-        .start_chat_run(&id, mode, history, content)
+        .start_preflighted_chat_run(&id, mode, stored, content, refs, preflight)
         .await;
     Json(serde_json::json!({"run_id": run_id})).into_response()
 }

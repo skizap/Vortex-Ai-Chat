@@ -2,7 +2,7 @@
 
 use crate::db::{now, Db};
 use crate::error::Result;
-use vortex_types::{ChatMessage, Role, Settings, StoredMessage, ToolCall};
+use vortex_types::{AttachmentRef, ChatMessage, Role, Settings, StoredMessage, ToolCall};
 
 impl Db {
     // ---- messages ---------------------------------------------------------
@@ -10,14 +10,17 @@ impl Db {
     pub async fn add_message(&self, conversation_id: String, msg: ChatMessage) -> Result<i64> {
         self.with_conn(move |c| {
             let tool_calls = serde_json::to_string(&msg.tool_calls).unwrap_or_else(|_| "[]".into());
+            let attachments =
+                serde_json::to_string(&msg.attachments).unwrap_or_else(|_| "[]".into());
             c.execute(
-                "INSERT INTO messages (conversation_id, role, content, tool_calls, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO messages (conversation_id, role, content, tool_calls, attachments, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     conversation_id,
                     msg.role.as_str(),
                     msg.content,
                     tool_calls,
+                    attachments,
                     now()
                 ],
             )?;
@@ -29,20 +32,23 @@ impl Db {
     pub async fn get_messages(&self, conversation_id: String) -> Result<Vec<StoredMessage>> {
         self.with_conn(move |c| {
             let mut st = c.prepare(
-                "SELECT id, role, content, tool_calls, created_at
+                "SELECT id, role, content, tool_calls, attachments, created_at
                      FROM messages WHERE conversation_id = ?1 ORDER BY id",
             )?;
             let rows = st
                 .query_map(rusqlite::params![conversation_id], |r| {
                     let role: String = r.get(1)?;
                     let tc: String = r.get(3)?;
+                    let att: String = r.get(4)?;
                     Ok(StoredMessage {
                         id: r.get(0)?,
                         role: serde_json::from_value(serde_json::Value::String(role))
                             .unwrap_or(Role::Assistant),
                         content: r.get(2)?,
                         tool_calls: serde_json::from_str::<Vec<ToolCall>>(&tc).unwrap_or_default(),
-                        created_at: r.get(4)?,
+                        attachments: serde_json::from_str::<Vec<AttachmentRef>>(&att)
+                            .unwrap_or_default(),
+                        created_at: r.get(5)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;

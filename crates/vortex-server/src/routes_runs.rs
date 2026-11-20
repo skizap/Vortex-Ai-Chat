@@ -240,7 +240,7 @@ pub async fn retry_run(
         );
     }
 
-    let messages = match state.db.get_messages(conv_id.clone()).await {
+    let mut messages = match state.db.get_messages(conv_id.clone()).await {
         Ok(m) => m,
         Err(_) => {
             crate::diagnostics::db_failure("get_messages", Some(&conv_id));
@@ -259,26 +259,28 @@ pub async fn retry_run(
             Mode::default()
         }
     };
-    // History = everything *before* the last user message (start_chat_run
-    // appends the retried user message itself — including it here would send
-    // it twice), filtered to user/assistant roles like post_chat does:
-    // stored tool-role rows have no tool_call_id and strict providers
-    // reject them.
-    let history: Vec<vortex_types::ChatMessage> = messages
-        .iter()
-        .take(last_user_idx)
-        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-        .map(|m| vortex_types::ChatMessage {
-            role: m.role,
-            content: m.content.clone(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        })
-        .collect();
+    let retry_attachments = messages[last_user_idx].attachments.clone();
+    // Start with everything before the retried message; the engine appends
+    // the retried user turn and filters out stored tool-role rows.
+    messages.truncate(last_user_idx);
+    let preflight = match state
+        .engine
+        .preflight_chat(&conv_id, &retry_attachments)
+        .await
+    {
+        Ok(preflight) => preflight,
+        Err(message) => return err_json(StatusCode::BAD_REQUEST, message),
+    };
     let run_id = state
         .engine
-        .start_chat_run(&conv_id, mode, history, &retry_content)
+        .start_preflighted_chat_run(
+            &conv_id,
+            mode,
+            messages,
+            &retry_content,
+            retry_attachments,
+            preflight,
+        )
         .await;
     Json(serde_json::json!({"run_id": run_id})).into_response()
 }

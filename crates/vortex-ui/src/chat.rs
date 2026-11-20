@@ -1,28 +1,59 @@
 //! Chat view: message list with safe markdown, streaming bubble,
-//! composer with stop and retry.
+//! composer with attachments, stop and retry.
 
 use crate::api;
-use crate::state::AppCtx;
+use crate::state::{AppCtx, UploadChip, UploadState};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use vortex_types::{ChatRequestDto, Role, RunStatus, StoredMessage};
+use vortex_types::chat::MAX_ATTACHMENT_UPLOAD_BYTES;
+use vortex_types::{
+    AttachmentInfo, AttachmentKind, AttachmentRef, AttachmentStatus, ChatRequestDto, Role,
+    RunStatus, StoredMessage,
+};
 
 #[component]
 pub fn ChatView() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
     let input = RwSignal::new(String::new());
+    let file_input: NodeRef<leptos::html::Input> = NodeRef::new();
 
-    let send = move || {
+    // Shared submit path for the Send button and Enter key.
+    let submit = move || {
         let text = input.get_untracked();
-        if !text.trim().is_empty() {
-            input.set(String::new());
-            let ctx = ctx;
-            let mode = ctx.mode.get_untracked();
-            spawn_local(async move {
-                crate::chat::send_message(ctx, text, mode).await;
-            });
+        let chips = ctx.pending_attachments.get_untracked();
+        if chips
+            .iter()
+            .any(|c| matches!(c.state, UploadState::Uploading))
+        {
+            ctx.set_toast("Waiting for uploads to finish…");
+            return;
         }
+        let ready: Vec<AttachmentRef> = chips
+            .iter()
+            .filter_map(|c| match &c.state {
+                UploadState::Ready(info) => Some(AttachmentRef {
+                    id: info.id.clone(),
+                    kind: info.kind,
+                    filename: info.filename.clone(),
+                    media_type: info.media_type.clone(),
+                    status: info.status,
+                }),
+                _ => None,
+            })
+            .collect();
+        if text.trim().is_empty() && ready.is_empty() {
+            return;
+        }
+        input.set(String::new());
+        ctx.pending_attachments.set(Vec::new());
+        let mode = ctx.mode.get_untracked();
+        spawn_local(async move {
+            crate::chat::send_message(ctx, text, mode, ready).await;
+        });
     };
+
+    let submit_key = submit;
+    let attach_input = file_input;
 
     view! {
         <div class="chat">
@@ -56,32 +87,185 @@ pub fn ChatView() -> impl IntoView {
                         </div>
                     </Show>
                 </div>
-                <div class="composer">
+                <div class="composer"
+                    on:dragover=move |ev| { ev.prevent_default(); }
+                    on:drop=move |ev| {
+                        ev.prevent_default();
+                        if let Some(files) = ev.data_transfer().and_then(|dt| dt.files()) {
+                            start_uploads(ctx, files);
+                        }
+                    }
+                >
                     <RunControls />
-                    <textarea
-                        rows="2"
-                        placeholder="Message Vortex… (Enter to send, Shift+Enter for a new line)"
-                        prop:value=move || input.get()
-                        on:input=move |ev| input.set(event_target_value(&ev))
-                        on:keydown=move |ev| {
-                            if ev.key() == "Enter" && !ev.shift_key() {
-                                ev.prevent_default();
-                                let text = input.get_untracked();
-                                if !text.trim().is_empty() {
-                                    input.set(String::new());
-                                    let ctx = ctx;
-                                    let mode = ctx.mode.get_untracked();
-                                    spawn_local(async move {
-                                        crate::chat::send_message(ctx, text, mode).await;
-                                    });
+                    <Show when=move || !ctx.pending_attachments.get().is_empty()>
+                        <div class="composer-chips">
+                            <For
+                                each=move || ctx.pending_attachments.get()
+                                key=|c| (c.local_id, matches!(c.state, UploadState::Uploading))
+                                let:chip
+                            >
+                                <ChipView chip />
+                            </For>
+                        </div>
+                        <p class="attachment-notice">"Uploads stay local until you send. Sending shares eligible files with the configured model provider."</p>
+                    </Show>
+                    <div class="composer-row">
+                        <button class="icon-btn attach" aria-label="Attach files" title="Attach images, videos, PDFs, or text files"
+                            on:click=move |_| {
+                                if let Some(el) = attach_input.get() { el.click(); }
+                            }>"📎"</button>
+                        <input node_ref=file_input type="file" multiple
+                            accept=".png,.jpg,.jpeg,.jpe,.jfif,.webp,.gif,.bmp,.tiff,.tif,.ico,.mp4,.m4v,.webm,.mov,.mpeg,.mpg,.mpe,.pdf,.txt,.md,.csv,.json,.xml,.yaml,.yml,.toml,.log,image/png,image/jpeg,image/webp,image/gif,image/bmp,image/tiff,image/vnd.microsoft.icon,video/mp4,video/webm,video/quicktime,video/mpeg,application/pdf,text/*"
+                            style="display:none"
+                            on:change=move |ev| {
+                                let target = event_target::<web_sys::HtmlInputElement>(&ev);
+                                if let Some(files) = target.files() {
+                                    start_uploads(ctx, files);
+                                }
+                                if let Some(el) = file_input.get() { el.set_value(""); }
+                            }
+                        />
+                        <textarea
+                            rows="2"
+                            placeholder="Message Vortex… (Enter to send, Shift+Enter for a new line)"
+                            prop:value=move || input.get()
+                            on:input=move |ev| input.set(event_target_value(&ev))
+                            on:keydown=move |ev| {
+                                if ev.key() == "Enter" && !ev.shift_key() {
+                                    ev.prevent_default();
+                                    submit_key();
                                 }
                             }
-                        }
-                    ></textarea>
-                    <button class="btn primary" on:click=move |_| send()>"Send"</button>
+                        ></textarea>
+                        <button class="btn primary" on:click=move |_| submit()>"Send"</button>
+                    </div>
                 </div>
             </Show>
         </div>
+    }
+}
+
+thread_local! {
+    static CHIP_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn next_chip_id() -> u64 {
+    CHIP_ID.with(|c| {
+        let next = c.get() + 1;
+        c.set(next);
+        next
+    })
+}
+
+/// Leave format validation and per-kind size limits to the upload endpoint.
+fn precheck(size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("File is empty.".into());
+    }
+    if size > MAX_ATTACHMENT_UPLOAD_BYTES as u64 {
+        let mib = MAX_ATTACHMENT_UPLOAD_BYTES / (1024 * 1024);
+        return Err(format!(
+            "Files must be at most {mib} MiB. Trim or compress large videos."
+        ));
+    }
+    Ok(())
+}
+
+/// Stage files as chips. Separate requests keep each file within the upload
+/// body limit even when their combined size exceeds it.
+fn start_uploads(ctx: AppCtx, files: web_sys::FileList) {
+    let Some(conv) = ctx.current.get_untracked() else {
+        return;
+    };
+    let mut chips = ctx.pending_attachments.get_untracked();
+    let mut accepted: Vec<(u64, web_sys::File)> = Vec::new();
+    for i in 0..files.length() {
+        if chips.len() >= 8 {
+            ctx.set_toast("At most eight files per message");
+            break;
+        }
+        let Some(file) = files.get(i) else { continue };
+        let name = file.name();
+        let size = file.size() as u64;
+        let local_id = next_chip_id();
+        match precheck(size) {
+            Err(msg) => chips.push(UploadChip {
+                local_id,
+                filename: name,
+                size_bytes: size,
+                state: UploadState::Error(msg),
+            }),
+            Ok(()) => {
+                chips.push(UploadChip {
+                    local_id,
+                    filename: name.clone(),
+                    size_bytes: size,
+                    state: UploadState::Uploading,
+                });
+                accepted.push((local_id, file));
+            }
+        }
+    }
+    ctx.pending_attachments.set(chips);
+    spawn_local(async move {
+        for (id, file) in accepted {
+            if !ctx
+                .pending_attachments
+                .with_untracked(|chips| chips.iter().any(|c| c.local_id == id))
+            {
+                continue;
+            }
+            let result = api::upload_attachment(&conv, &file).await;
+            ctx.pending_attachments.update(|chips| {
+                if let Some(c) = chips.iter_mut().find(|c| c.local_id == id) {
+                    c.state = match result {
+                        Ok(info) => {
+                            c.filename.clone_from(&info.filename);
+                            c.size_bytes = info.size_bytes;
+                            UploadState::Ready(info)
+                        }
+                        Err(error) => UploadState::Error(error),
+                    };
+                }
+            });
+        }
+    });
+}
+
+#[component]
+fn ChipView(chip: UploadChip) -> impl IntoView {
+    let ctx = use_context::<AppCtx>().expect("ctx provided");
+    let local_id = chip.local_id;
+    let filename = chip.filename.clone();
+    let state = chip.state.clone();
+    let status_icon = match &state {
+        UploadState::Uploading => "…",
+        UploadState::Ready(_) => "✓",
+        UploadState::Error(_) => "⚠",
+    };
+    let title = match &state {
+        UploadState::Error(e) => e.clone(),
+        _ => format!("{} ({})", filename, human_size(chip.size_bytes)),
+    };
+    let class = match &state {
+        UploadState::Error(_) => "chip error",
+        UploadState::Uploading => "chip uploading",
+        UploadState::Ready(_) => "chip ready",
+    };
+    let error = match state {
+        UploadState::Error(error) => Some(error),
+        _ => None,
+    };
+    view! {
+        <span class=class title=title>
+            <span class="chip-status">{status_icon}</span>
+            <span class="chip-name">{filename}</span>
+            {error.map(|error| view! { <span class="chip-error-message" role="status">{error}</span> })}
+            <button class="chip-x" title="Remove"
+                on:click=move |_| {
+                    ctx.pending_attachments.update(|v| v.retain(|c| c.local_id != local_id));
+                }>"×"</button>
+        </span>
     }
 }
 
@@ -103,10 +287,16 @@ fn next_optimistic_id() -> i64 {
 }
 
 /// Send a message: optimistic user bubble + POST + SSE subscription.
-pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
+pub async fn send_message(
+    ctx: AppCtx,
+    text: String,
+    mode: vortex_types::Mode,
+    attachments: Vec<AttachmentRef>,
+) {
     let Some(conv_id) = ctx.current.get_untracked() else {
         return;
     };
+    let attachment_ids: Vec<String> = attachments.iter().map(|a| a.id.clone()).collect();
     // Optimistic user bubble.
     let optimistic_id = next_optimistic_id();
     ctx.messages.update(|m| {
@@ -115,6 +305,7 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
             role: Role::User,
             content: text.clone(),
             tool_calls: Vec::new(),
+            attachments: attachments.clone(),
             created_at: String::new(),
         })
     });
@@ -128,8 +319,13 @@ pub async fn send_message(ctx: AppCtx, text: String, mode: vortex_types::Mode) {
     let dto = ChatRequestDto {
         content: text,
         mode: Some(mode),
+        attachment_ids,
     };
-    match api::send_chat(&conv_id, &dto).await {
+    let result = api::send_chat(&conv_id, &dto).await;
+    if ctx.current.get_untracked().as_deref() != Some(conv_id.as_str()) {
+        return;
+    }
+    match result {
         Ok(r) => start_stream(ctx, r.run_id),
         Err(e) => {
             ctx.run_status.set(None);
@@ -205,6 +401,7 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
     let markdown = crate::markdown::render_markdown(&msg.content);
     let raw = msg.content.clone();
     let is_user = msg.role == Role::User;
+    let attachments = msg.attachments.clone();
     view! {
         <div class=if is_user { "msg user" } else { "msg assistant" }>
             <div class="msg-head">
@@ -214,6 +411,11 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
                     on:click=move |_| copy_text(&raw)>"⧉"</button>
             </div>
             <div class="msg-body markdown" inner_html=markdown></div>
+            {(!attachments.is_empty()).then(|| view! {
+                <div class="attachments">
+                    {attachments.iter().map(|a| view! { <AttachmentView att=a.clone() /> }).collect::<Vec<_>>()}
+                </div>
+            })}
             {(!msg.tool_calls.is_empty()).then(|| view! {
                 <details class="tool-calls-in-msg">
                     <summary>{format!("{} tool call(s)", msg.tool_calls.len())}</summary>
@@ -225,6 +427,134 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
                 </details>
             })}
         </div>
+    }
+}
+
+/// Renders one attachment by kind, fetching its metadata to detect deletion
+/// (tombstone), size, and video job status.
+#[component]
+fn AttachmentView(att: AttachmentRef) -> impl IntoView {
+    let state = RwSignal::new(None::<Result<Option<AttachmentInfo>, String>>);
+    let loading = RwSignal::new(false);
+    let url = api::attachment_url(&att.id);
+    let kind = att.kind;
+    let fetch = move || {
+        if loading.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        let id = att.id.clone();
+        spawn_local(async move {
+            let result = api::attachment_meta(&id).await;
+            let _ = state.try_set(Some(result));
+            let _ = loading.try_set(false);
+        });
+    };
+    fetch();
+    if kind == AttachmentKind::Video {
+        if let Ok(handle) = set_interval_with_handle(
+            move || {
+                if !matches!(state.get_untracked(), Some(Ok(None)))
+                    && !matches!(state.get_untracked(), Some(Ok(Some(m))) if m.status != AttachmentStatus::Pending)
+                {
+                    fetch();
+                }
+            },
+            std::time::Duration::from_secs(15),
+        ) {
+            on_cleanup(move || handle.clear());
+        }
+    }
+    move || match state.get() {
+        None => {
+            view! { <span class="att-chip" role="status">"Loading attachment…"</span> }.into_any()
+        }
+        Some(Ok(None)) => {
+            view! { <span class="att-tombstone">"Attachment removed"</span> }.into_any()
+        }
+        Some(Err(_)) => {
+            view! { <span class="att-tombstone">"Could not load attachment"</span> }.into_any()
+        }
+        Some(Ok(Some(meta))) => {
+            let url = url.clone();
+            match meta.status {
+                AttachmentStatus::Pending => view! { <div class="att-video pending" role="status"><span class="spinner" aria-hidden="true"></span>" Video pending"</div> }.into_any(),
+                AttachmentStatus::Failed => view! { <div class="att-video failed">{meta.error.unwrap_or_else(|| "Attachment generation failed".into())}</div> }.into_any(),
+                AttachmentStatus::Ready => match kind {
+                    AttachmentKind::Image => view! { <ImageThumb url filename=meta.filename /> }.into_any(),
+                    AttachmentKind::Video => view! {
+                        <div class="att-video-wrap">
+                            <video class="att-video" controls preload="metadata" src=url.clone()></video>
+                            <FileChip meta url />
+                        </div>
+                    }.into_any(),
+                    _ => view! { <FileChip meta url /> }.into_any(),
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn ImageThumb(url: String, filename: String) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let failed = RwSignal::new(false);
+    let full = url.clone();
+    let dl = url.clone();
+    let alt = filename.clone();
+    view! {
+        <Show when=move || !failed.get()>
+            <button class="att-thumb-button" title="Open image" on:click=move |_| open.set(true)>
+                <img class="att-thumb" src=url.clone() loading="lazy" alt=alt.clone()
+                    on:error=move |_| failed.set(true) />
+            </button>
+        </Show>
+        <Show when=move || failed.get()>
+            <div class="att-tombstone">"image unavailable"</div>
+        </Show>
+        <Show when=move || open.get()>
+            <div class="lightbox" on:click=move |_| open.set(false)>
+                <div class="lightbox-inner" role="dialog" aria-modal="true" aria-label="Image preview"
+                    on:click=move |ev| { ev.stop_propagation(); }>
+                    <img src=full.clone() alt=filename.clone() />
+                    <div class="lightbox-actions">
+                        <a class="btn" href=dl.clone() download>"Download"</a>
+                        <button class="btn" on:click=move |_| open.set(false)>"Close"</button>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn FileChip(meta: AttachmentInfo, url: String) -> impl IntoView {
+    let icon = match meta.kind {
+        AttachmentKind::Pdf => "PDF",
+        AttachmentKind::Video => "Video",
+        _ => "Text",
+    };
+    let dl_name = meta.filename.clone();
+    view! {
+        <div class="att-chip">
+            <span class="att-icon">{icon}</span>
+            <span class="att-name">{meta.filename}</span>
+            <span class="att-size">{human_size(meta.size_bytes)}</span>
+            <a class="att-dl" href=url.clone() download=dl_name title="Download">"⬇"</a>
+        </div>
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let b = bytes as f64;
+    if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

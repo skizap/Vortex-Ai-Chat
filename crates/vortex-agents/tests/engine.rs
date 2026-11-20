@@ -66,6 +66,7 @@ impl LlmClient for ScenarioLlm {
                     total_tokens: 10,
                 }),
                 finish_reason: "stop".into(),
+                annotations: None,
             });
         }
         // Blocker child: hold the slot open until released.
@@ -88,6 +89,7 @@ impl LlmClient for ScenarioLlm {
                 total_tokens: 2,
             }),
             finish_reason: "stop".into(),
+            annotations: None,
         })
     }
 
@@ -138,6 +140,7 @@ async fn test_engine(
         search,
         http,
         settings,
+        None,
     );
     let _ = engine_slot.set(engine.clone());
     (engine, db)
@@ -169,7 +172,13 @@ async fn six_subagents_run_concurrently_plus_coordinator() {
     .unwrap();
 
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Coding, Vec::new(), "run 10 agents")
+        .start_chat_run(
+            &conv.id,
+            Mode::Coding,
+            Vec::new(),
+            "run 10 agents",
+            Vec::new(),
+        )
         .await;
     let mut events = engine.hub.subscribe(&run_id).expect("root run registered");
 
@@ -380,7 +389,13 @@ async fn unapproved_command_times_out_and_is_denied() {
         .await
         .unwrap();
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Coding, Vec::new(), "run a command")
+        .start_chat_run(
+            &conv.id,
+            Mode::Coding,
+            Vec::new(),
+            "run a command",
+            Vec::new(),
+        )
         .await;
 
     let mut events = engine.hub.subscribe(&run_id).unwrap();
@@ -435,7 +450,13 @@ async fn stopping_root_cancels_children_and_releases_slots() {
         .await
         .unwrap();
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Coding, Vec::new(), "run agents then stop")
+        .start_chat_run(
+            &conv.id,
+            Mode::Coding,
+            Vec::new(),
+            "run agents then stop",
+            Vec::new(),
+        )
         .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -489,7 +510,13 @@ async fn tool_events_are_delivered_before_run_finished() {
     let (engine, db) = test_engine(llm, settings).await;
     let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "plan something")
+        .start_chat_run(
+            &conv.id,
+            Mode::Chat,
+            Vec::new(),
+            "plan something",
+            Vec::new(),
+        )
         .await;
     let mut events = engine.hub.subscribe(&run_id).unwrap();
 
@@ -554,7 +581,7 @@ async fn token_budget_is_enforced_before_the_next_call() {
     let (engine, db) = test_engine(llm.clone(), settings).await;
     let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "budget")
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "budget", Vec::new())
         .await;
     let mut events = engine.hub.subscribe(&run_id).unwrap();
 
@@ -619,6 +646,7 @@ impl LlmClient for AbortProbeLlm {
             tool_calls: Vec::new(),
             usage: None,
             finish_reason: "stop".into(),
+            annotations: None,
         })
     }
 
@@ -643,7 +671,13 @@ async fn cancel_aborts_the_provider_task() {
     let (engine, db) = test_engine(probe.clone(), settings).await;
     let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
     let run_id = engine
-        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "long completion")
+        .start_chat_run(
+            &conv.id,
+            Mode::Chat,
+            Vec::new(),
+            "long completion",
+            Vec::new(),
+        )
         .await;
     let mut events = engine.hub.subscribe(&run_id).unwrap();
 

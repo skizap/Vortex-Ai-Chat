@@ -39,6 +39,11 @@ impl SseParser {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            if pos > MAX_BUFFER {
+                self.buf.clear();
+                self.overflowed = true;
+                break;
+            }
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
             let line = &line[..line.len() - 1]; // strip \n
             let line = if line.last() == Some(&b'\r') {
@@ -92,6 +97,10 @@ impl SseParser {
                 self.event_bytes += value.len();
                 self.data_lines.push(value);
             }
+        }
+        if self.event_bytes > MAX_EVENT {
+            self.overflowed = true;
+            self.data_lines.clear();
         }
         self.dispatch()
     }

@@ -128,7 +128,7 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
     } else {
         format!("/api/runs/{run_id}/events")
     };
-    let source = web_sys::EventSource::new(&url).map_err(|_| {
+    let source = web_sys::EventSource::new(&crate::api::with_lan_token(&url)).map_err(|_| {
         crate::diagnostics::report_sse_failure(
             vortex_types::BrowserOperation::SseConnect,
             Some(&run_id),
@@ -532,7 +532,13 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 let current = ctx.current.get_untracked();
                 if let Some(conv) = current {
                     spawn_local(async move {
-                        if let Ok(msgs) = crate::api::messages(&conv).await {
+                        let messages = crate::api::messages(&conv).await;
+                        if ctx2.current.get_untracked().as_deref() != Some(conv.as_str())
+                            || ctx2.run_id.get_untracked().as_deref() != Some(run_id.as_str())
+                        {
+                            return;
+                        }
+                        if let Ok(msgs) = messages {
                             ctx2.messages.set(msgs);
                         }
                         ctx2.stream_text.set(String::new());

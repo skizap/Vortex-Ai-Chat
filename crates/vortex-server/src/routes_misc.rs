@@ -22,6 +22,12 @@ pub async fn put_settings(
     Json(mut settings): Json<Settings>,
 ) -> axum::response::Response {
     // Validate and clamp before accepting anything.
+    if vortex_llm::llm::PdfEngine::parse(&settings.media.pdf_engine).is_none() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "PDF parser must be cloudflare-ai or mistral-ocr",
+        );
+    }
     settings.agents.max_concurrent = settings
         .agents
         .max_concurrent
@@ -64,9 +70,9 @@ pub async fn put_settings(
 /// GET /api/models — server-side OpenRouter catalog; honest fallback with
 /// manual-ID instructions when retrieval fails.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> axum::response::Response {
-    match state.llm.models().await {
+    match state.engine.models().await {
         Ok(models) => Json(serde_json::json!({
-            "models": models,
+            "models": models.as_ref(),
             "configured": state.is_mock_llm || state.config.api_key().is_some(),
         }))
         .into_response(),

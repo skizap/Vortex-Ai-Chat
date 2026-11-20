@@ -4,9 +4,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use vortex_llm::llm::{CompletionRequest, CompletionResponse, LlmClient, LlmEvent, ToolSchema};
+use serde_json::{json, Value};
+use vortex_llm::llm::{
+    CompletionRequest, CompletionResponse, LlmClient, LlmEvent, PdfEngine, ToolSchema,
+};
 use vortex_llm::openrouter::OpenRouterClient;
-use vortex_types::ChatMessage;
+use vortex_types::{ChatMessage, ContentPart, FileContent, ImageUrlContent, VideoUrlContent};
 
 use axum::extract::State;
 use axum::routing::{get, post};
@@ -16,6 +19,7 @@ use tokio::sync::mpsc;
 struct MockServerState {
     chat_calls: AtomicUsize,
     responses: tokio::sync::Mutex<Vec<MockResponse>>,
+    requests: tokio::sync::Mutex<Vec<Value>>,
 }
 
 #[derive(Clone)]
@@ -28,9 +32,10 @@ enum MockResponse {
 
 async fn chat_handler(
     State(state): axum::extract::State<Arc<MockServerState>>,
-    axum::extract::Json(_body): axum::extract::Json<serde_json::Value>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> axum::response::Response {
     state.chat_calls.fetch_add(1, Ordering::SeqCst);
+    state.requests.lock().await.push(body);
     let resp = state.responses.lock().await.remove(0);
     match resp {
         MockResponse::Sse(body) => axum::http::Response::builder()
@@ -82,6 +87,7 @@ async fn spawn_server(responses: Vec<MockResponse>) -> (String, Arc<MockServerSt
     let state = Arc::new(MockServerState {
         chat_calls: AtomicUsize::new(0),
         responses: tokio::sync::Mutex::new(responses),
+        requests: tokio::sync::Mutex::new(Vec::new()),
     });
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(chat_handler))
@@ -106,6 +112,7 @@ async fn streams_text_and_parses_models() {
     let resp = client.complete(&req(), tx).await.unwrap();
     assert_eq!(resp.content, "Hi there");
     assert_eq!(resp.finish_reason, "stop");
+    assert!(resp.annotations.is_none());
     assert_eq!(resp.usage.unwrap().total_tokens, 10);
     let mut deltas = Vec::new();
     while let Ok(LlmEvent::TextDelta(d)) = rx.try_recv() {
@@ -119,6 +126,12 @@ async fn streams_text_and_parses_models() {
     assert_eq!(models[0].supports_tools, Some(true));
     assert_eq!(models[1].supports_tools, Some(false));
     assert_eq!(state.chat_calls.load(Ordering::SeqCst), 1);
+    let requests = state.requests.lock().await;
+    assert_eq!(
+        requests[0]["messages"],
+        json!([{"role":"user","content":"hello"}])
+    );
+    assert!(requests[0].get("plugins").is_none());
 }
 
 #[tokio::test]
@@ -327,5 +340,157 @@ fn req() -> CompletionRequest {
         )],
         temperature: 0.5,
         max_tokens: 128,
+        pdf_engine: None,
+        assistant_annotations: Default::default(),
     }
+}
+
+fn pdf_req() -> CompletionRequest {
+    let mut req = req();
+    req.messages[0].parts = Some(vec![
+        ContentPart::Text {
+            text: "hello".into(),
+        },
+        ContentPart::ImageUrl {
+            image_url: ImageUrlContent {
+                url: "data:image/png;base64,AAAA".into(),
+            },
+        },
+        ContentPart::File {
+            file: FileContent {
+                filename: "fixture.pdf".into(),
+                file_data: "data:application/pdf;base64,JVBERg==".into(),
+            },
+        },
+    ]);
+    req
+}
+
+fn annotation(name: &str) -> Value {
+    json!({"type":"file","file":{"name":name,"hash":"opaque-fixture","content":[{"type":"text","text":"fixture"}]}})
+}
+
+#[tokio::test]
+async fn mixed_parts_and_complete_streamed_annotations_round_trip() {
+    let first = annotation("fixture.pdf");
+    let tail = annotation("tail.pdf");
+    let frame = json!({"choices":[{"delta":{"content":"hi","annotations":[first, {"type":"file","file":{"name":"incomplete.pdf"}}]}}]});
+    let final_frame = json!({"choices":[{"message":{"annotations":[first,tail]},"delta":{"content":"!"},"finish_reason":"stop"}]});
+    let (base, state) = spawn_server(vec![
+        MockResponse::Sse(format!("data: {frame}\n\ndata: {final_frame}")),
+        MockResponse::Sse("data: [DONE]\n\n".into()),
+    ])
+    .await;
+    let llm = OpenRouterClient::new(base, Some("key".into())).unwrap();
+    let mut req = pdf_req();
+    let (tx, mut rx) = mpsc::channel(8);
+    let resp = llm.complete(&req, tx).await.unwrap();
+    assert_eq!(resp.content, "hi!");
+    assert!(matches!(rx.try_recv(), Ok(LlmEvent::TextDelta(t)) if t == "hi"));
+    assert!(rx.try_recv().is_err()); // Legacy text tail is final-response-only.
+    assert_eq!(resp.annotations.as_ref().unwrap(), &[first.clone(), tail]);
+    req.pdf_engine = Some(PdfEngine::MistralOcr);
+    req.messages.push(ChatMessage::assistant(resp.content));
+    req.assistant_annotations.insert(1, vec![first.clone()]);
+    req.assistant_annotations.insert(0, vec![first.clone()]);
+    let (tx, _rx) = mpsc::channel(8);
+    assert!(llm.complete(&req, tx).await.unwrap().annotations.is_none());
+    let bodies = state.requests.lock().await;
+    assert_eq!(
+        bodies[0]["messages"][0]["content"],
+        json!(req.messages[0].parts)
+    );
+    assert_eq!(
+        bodies[0]["plugins"],
+        json!([{"id":"file-parser","pdf":{"engine":"cloudflare-ai"}}])
+    );
+    assert_eq!(bodies[1]["plugins"][0]["pdf"]["engine"], "mistral-ocr");
+    assert_eq!(bodies[1]["messages"][1]["annotations"], json!([first]));
+    assert!(bodies[1]["messages"][0].get("annotations").is_none());
+}
+
+#[tokio::test]
+async fn attachment_failures_redact_http_and_sse_bodies_without_parser_fallback() {
+    let (base, state) = spawn_server(vec![
+        MockResponse::Error(422, "private data:application/pdf;base64,AAAA".into()),
+        MockResponse::Sse("data: {\"error\":{\"code\":400,\"message\":\"private data\"}}".into()),
+    ])
+    .await;
+    let llm = OpenRouterClient::new(base, Some("key".into())).unwrap();
+    for _ in 0..2 {
+        let (tx, _rx) = mpsc::channel(8);
+        let err = llm.complete(&pdf_req(), tx).await.unwrap_err().to_string();
+        assert!(err.contains("PDF parser"));
+        assert!(!err.contains("private"));
+    }
+    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn annotation_capture_overflow_does_not_interrupt_the_answer() {
+    let annotations: Vec<_> = (0..33).map(|n| annotation(&format!("{n}.pdf"))).collect();
+    let frame = json!({"choices":[{"delta":{"content":"answer","annotations":annotations}}]});
+    let (base, _) = spawn_server(vec![MockResponse::Sse(format!(
+        "data: {frame}\n\ndata: [DONE]\n\n"
+    ))])
+    .await;
+    let llm = OpenRouterClient::new(base, Some("key".into())).unwrap();
+    let (tx, _rx) = mpsc::channel(8);
+    let resp = llm.complete(&pdf_req(), tx).await.unwrap();
+    assert_eq!(resp.content, "answer");
+    assert!(resp.annotations.is_none());
+}
+
+#[tokio::test]
+async fn video_on_auto_router_keeps_tool_wire_fields_and_omits_the_pdf_parser() {
+    let (base, state) = spawn_server(vec![MockResponse::Sse("data: [DONE]\n\n".into())]).await;
+    let llm = OpenRouterClient::new(base, Some("key".into())).unwrap();
+    let mut req = pdf_req();
+    req.model = "openrouter/auto".into();
+    req.pdf_engine = Some(PdfEngine::MistralOcr);
+    let parts = req.messages[0].parts.as_mut().unwrap();
+    parts.pop();
+    parts.push(ContentPart::VideoUrl {
+        video_url: VideoUrlContent {
+            url: "data:video/mp4;base64,AAAA".into(),
+        },
+    });
+    let mut assistant = ChatMessage::assistant("");
+    assistant.tool_calls.push(vortex_types::ToolCall {
+        id: "fixture-call".into(),
+        name: "fixture-tool".into(),
+        arguments: "{}".into(),
+    });
+    req.messages.push(assistant);
+    req.messages.push(ChatMessage::tool_result(
+        "fixture-call",
+        "fixture-tool",
+        "fixture result",
+    ));
+    let (tx, _rx) = mpsc::channel(8);
+    llm.complete(&req, tx).await.unwrap();
+    let requests = state.requests.lock().await;
+    let wire = &requests[0];
+    assert!(wire.get("plugins").is_none());
+    assert_eq!(wire["model"], "openrouter/auto");
+    let parts = wire["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[2],
+        json!({"type":"video_url","video_url":{"url":"data:video/mp4;base64,AAAA"}})
+    );
+    assert_eq!(
+        wire["messages"][1],
+        json!({
+            "role":"assistant", "content":"", "tool_calls":[{
+                "type":"function", "id":"fixture-call", "function":{"name":"fixture-tool", "arguments":"{}"}
+            }]
+        })
+    );
+    assert_eq!(
+        wire["messages"][2],
+        json!({
+            "role":"tool", "tool_call_id":"fixture-call", "content":"fixture result"
+        })
+    );
 }

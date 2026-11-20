@@ -20,6 +20,12 @@ pub fn Sidebar() -> impl IntoView {
                             match api::create_conversation("New chat", mode).await {
                                 Ok(c) => {
                                     ctx.conversations.update(|l| l.insert(0, c.clone()));
+                                    ctx.pending_attachments.set(Vec::new());
+                                    ctx.run_id.set(None);
+                                    ctx.run_status.set(None);
+                                    crate::sse::close_subscription();
+                                    ctx.stream_text.set(String::new());
+                                    ctx.stream_display.set(String::new());
                                     ctx.current.set(Some(c.id));
                                     ctx.messages.set(Vec::new());
                                     ctx.tab.set(crate::state::Tab::Chat);
@@ -97,6 +103,7 @@ pub fn Sidebar() -> impl IntoView {
                                                     Ok(()) => {
                                                         ctx.conversations.update(|l| l.retain(|c| c.id != id));
                                                         if ctx.current.get_untracked().as_deref() == Some(id.as_str()) {
+                                                            ctx.pending_attachments.set(Vec::new());
                                                             ctx.current.set(None);
                                                             ctx.messages.set(Vec::new());
                                                             ctx.run_id.set(None);
@@ -124,6 +131,11 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
     view! {
         <button class="conv-open" title=title.clone()
             on:click=move |_| {
+                if ctx.current.get_untracked().as_deref() == Some(conv_id.as_str()) {
+                    return;
+                }
+                ctx.pending_attachments.set(Vec::new());
+                ctx.messages.set(Vec::new());
                 ctx.current.set(Some(conv_id.clone()));
                 ctx.stream_text.set(String::new());
                 ctx.stream_display.set(String::new());
@@ -141,7 +153,8 @@ fn ConvButton(conv_id: String, title: String, mode: &'static str) -> impl IntoVi
                 let id = conv_id.clone();
                 spawn_local(async move {
                     match api::messages(&id).await {
-                        Ok(m) => ctx.messages.set(m),
+                        Ok(m) if ctx.current.get_untracked().as_deref() == Some(id.as_str()) => ctx.messages.set(m),
+                        Ok(_) => return,
                         Err(e) => ctx.set_toast(format!("could not load messages: {e}")),
                     }
                     if let Ok(runs) = api::runs_for_conversation(&id).await {

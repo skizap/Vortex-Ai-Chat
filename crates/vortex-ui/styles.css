@@ -59,8 +59,42 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 .streaming .cursor { color: var(--accent); animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .working { color: var(--fg-dim); }
-.composer { display: flex; align-items: flex-end; gap: 0.6rem; padding: 0.8rem 1rem 1rem; border-top: 1px solid var(--border); background: var(--bg2); }
-.composer textarea { flex: 1; resize: none; }
+.composer { display: flex; flex-direction: column; gap: 0.5rem; padding: 0.8rem 1rem 1rem; border-top: 1px solid var(--border); background: var(--bg2); }
+.composer-row { display: flex; align-items: flex-end; gap: 0.6rem; }
+.composer-row textarea { flex: 1; resize: none; }
+.composer-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.attachment-notice { margin: 0; font-size: 0.8rem; color: var(--fg-dim); }
+.chip { display: inline-flex; align-items: center; gap: 0.35rem; background: var(--bg3); border: 1px solid var(--border); border-radius: 999px; padding: 0.2rem 0.5rem; font-size: 0.8rem; max-width: 16rem; }
+.chip.ready { border-color: var(--accent-2); }
+.chip.error { border-color: var(--danger); color: var(--danger); flex-wrap: wrap; max-width: min(100%, 32rem); border-radius: 8px; }
+.chip.error .chip-name { flex: 1; }
+.chip-error-message { flex-basis: 100%; order: 1; overflow-wrap: anywhere; }
+.chip.uploading { opacity: 0.7; }
+.chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-status { font-size: 0.75rem; }
+.chip-x { background: none; border: 0; color: var(--fg-dim); padding: 0 0.15rem; }
+.chip-x:hover { color: var(--danger); }
+.icon-btn.attach { font-size: 1.1rem; }
+/* Attachments */
+.attachments { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+.att-thumb { width: 120px; height: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); cursor: zoom-in; background: var(--bg3); }
+.att-thumb-button { border: 0; background: none; padding: 0; }
+.att-chip { display: inline-flex; align-items: center; gap: 0.4rem; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+.att-name { max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-size { color: var(--fg-dim); font-size: 0.75rem; }
+.att-dl { color: var(--accent); text-decoration: none; }
+.att-tombstone { color: var(--fg-dim); font-size: 0.8rem; font-style: italic; padding: 0.3rem 0.5rem; border: 1px dashed var(--border); border-radius: 8px; }
+.att-video-wrap { display: flex; flex-direction: column; gap: 0.4rem; max-width: min(100%, 320px); }
+.att-video { max-width: min(100%, 320px); border-radius: 8px; border: 1px solid var(--border); }
+.att-video.pending, .att-video.failed { display: flex; align-items: center; gap: 0.5rem; padding: 0.8rem 1rem; font-size: 0.85rem; color: var(--fg-dim); background: var(--bg3); }
+.att-video.failed { color: var(--danger); }
+.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.lightbox-inner { max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; gap: 0.6rem; align-items: center; }
+.lightbox-inner img { max-width: 90vw; max-height: 78vh; object-fit: contain; border-radius: 8px; }
+.lightbox-actions { display: flex; gap: 0.6rem; }
+.md-image { max-width: 100%; border-radius: 8px; }
 .empty-state { margin: auto; max-width: 34rem; text-align: center; padding: 2rem; }
 .empty-state h2 { color: var(--accent); margin-bottom: 0.4rem; }
 /* Markdown */
@@ -133,4 +167,3 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { max-height: 44vh; }
 }
-

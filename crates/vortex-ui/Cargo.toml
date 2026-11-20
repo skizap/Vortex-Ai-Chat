@@ -27,6 +27,14 @@ web-sys = { version = "0.3", features = [
     "KeyboardEvent",
     "Navigator",
     "Clipboard",
+    "Location",
+    "UrlSearchParams",
+    "FormData",
+    "File",
+    "FileList",
+    "Blob",
+    "DataTransfer",
+    "DragEvent",
 ] }
 gloo-net = "0.6"
 serde = { workspace = true }

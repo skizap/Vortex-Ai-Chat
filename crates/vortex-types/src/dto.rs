@@ -1,6 +1,6 @@
 //! Data transfer objects for the REST API and SSE snapshots.
 
-use crate::chat::{ToolCall, Usage};
+use crate::chat::{AttachmentKind, AttachmentRef, AttachmentStatus, ToolCall, Usage};
 use crate::events::{PlanStep, RunStatus};
 use crate::Mode;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ pub struct StoredMessage {
     pub content: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
     pub created_at: String,
 }
 
@@ -31,6 +33,142 @@ pub struct ChatRequestDto {
     pub content: String,
     #[serde(default)]
     pub mode: Option<Mode>,
+    /// Attachments (already uploaded, `ready`) to include with this message.
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
+}
+
+/// Where an attachment came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentOrigin {
+    Upload,
+    Generated,
+}
+
+impl AttachmentOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttachmentOrigin::Upload => "upload",
+            AttachmentOrigin::Generated => "generated",
+        }
+    }
+}
+
+/// Full attachment metadata (the UI fetches this by id; messages carry only
+/// lightweight `AttachmentRef`s).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentInfo {
+    pub id: String,
+    pub conversation_id: String,
+    pub kind: AttachmentKind,
+    pub origin: AttachmentOrigin,
+    pub status: AttachmentStatus,
+    pub filename: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+/// Whether a media model generates images or videos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+impl MediaKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Video => "video",
+        }
+    }
+}
+
+/// A media-generation model from the provider catalog, with the parameters it
+/// supports so the UI can constrain pickers honestly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub kind: MediaKind,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub output_modalities: Vec<String>,
+    #[serde(default)]
+    pub resolutions: Vec<String>,
+    #[serde(default)]
+    pub aspect_ratios: Vec<String>,
+    #[serde(default)]
+    pub durations: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_hint: Option<String>,
+}
+
+/// Lifecycle of an async video-generation job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoJobStatus {
+    /// Panel flow: created, awaiting explicit human confirmation.
+    PendingConfirmation,
+    Submitted,
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+impl VideoJobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VideoJobStatus::PendingConfirmation => "pending_confirmation",
+            VideoJobStatus::Submitted => "submitted",
+            VideoJobStatus::InProgress => "in_progress",
+            VideoJobStatus::Completed => "completed",
+            VideoJobStatus::Failed => "failed",
+            VideoJobStatus::Cancelled => "cancelled",
+            VideoJobStatus::Expired => "expired",
+        }
+    }
+
+    /// True while the provider may still be working (poller keeps watching).
+    pub fn is_live(&self) -> bool {
+        matches!(self, VideoJobStatus::Submitted | VideoJobStatus::InProgress)
+    }
+
+    /// True once no further transition is possible.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            VideoJobStatus::Completed
+                | VideoJobStatus::Failed
+                | VideoJobStatus::Cancelled
+                | VideoJobStatus::Expired
+        )
+    }
+}
+
+/// A video job as exposed to the UI (polls this while live).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoJobInfo {
+    pub id: String,
+    pub conversation_id: String,
+    pub status: VideoJobStatus,
+    pub model: String,
+    pub prompt: String,
+    pub attachment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
 }
 
 /// A run (coordinator or sub-agent) as exposed to the UI.
@@ -299,5 +437,103 @@ mod tests {
         ))
         .unwrap();
         assert!(caps.diagnostics);
+    }
+
+    #[test]
+    fn stored_message_old_payload_defaults_attachments() {
+        let json = r#"{"id":1,"role":"user","content":"hi","tool_calls":[],"created_at":"t"}"#;
+        let m: StoredMessage = serde_json::from_str(json).unwrap();
+        assert!(m.attachments.is_empty());
+    }
+
+    #[test]
+    fn chat_request_old_payload_defaults_attachment_ids() {
+        let json = r#"{"content":"hi"}"#;
+        let r: ChatRequestDto = serde_json::from_str(json).unwrap();
+        assert!(r.attachment_ids.is_empty());
+        assert!(r.mode.is_none());
+        let json = r#"{"content":"hi","attachment_ids":["a","b"],"mode":"chat"}"#;
+        let r: ChatRequestDto = serde_json::from_str(json).unwrap();
+        assert_eq!(r.attachment_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn attachment_info_roundtrip() {
+        let info = AttachmentInfo {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            conversation_id: "00000000-0000-4000-8000-000000000002".into(),
+            kind: AttachmentKind::Video,
+            origin: AttachmentOrigin::Generated,
+            status: AttachmentStatus::Pending,
+            filename: "clip.mp4".into(),
+            media_type: "video/mp4".into(),
+            size_bytes: 0,
+            job_id: Some("00000000-0000-4000-8000-000000000003".into()),
+            error: None,
+            created_at: "t".into(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"origin\":\"generated\""));
+        assert!(json.contains("\"status\":\"pending\""));
+        assert!(!json.contains("error"));
+        let back: AttachmentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, info.id);
+        assert_eq!(back.kind, AttachmentKind::Video);
+        assert_eq!(back.job_id, info.job_id);
+    }
+
+    #[test]
+    fn media_model_info_roundtrip_and_defaults() {
+        let json = r#"{"id":"google/veo-3.1-lite","kind":"video"}"#;
+        let m: MediaModelInfo = serde_json::from_str(json).unwrap();
+        assert!(m.resolutions.is_empty());
+        assert!(m.durations.is_empty());
+        assert!(m.pricing_hint.is_none());
+        let m = MediaModelInfo {
+            id: "google/gemini-2.5-flash-image".into(),
+            name: "Gemini Image".into(),
+            kind: MediaKind::Image,
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["image".into()],
+            resolutions: vec!["1024x1024".into()],
+            aspect_ratios: vec!["1:1".into(), "16:9".into()],
+            durations: vec![],
+            pricing_hint: Some("~$0.03/image".into()),
+        };
+        let back: MediaModelInfo =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.aspect_ratios, vec!["1:1", "16:9"]);
+        assert_eq!(back.kind, MediaKind::Image);
+    }
+
+    #[test]
+    fn video_job_status_wire_names_and_lifecycle() {
+        assert_eq!(
+            serde_json::to_string(&VideoJobStatus::PendingConfirmation).unwrap(),
+            "\"pending_confirmation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VideoJobStatus::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+        assert!(VideoJobStatus::Submitted.is_live());
+        assert!(VideoJobStatus::InProgress.is_live());
+        assert!(!VideoJobStatus::PendingConfirmation.is_live());
+        assert!(VideoJobStatus::Completed.is_terminal());
+        assert!(VideoJobStatus::Expired.is_terminal());
+        assert!(!VideoJobStatus::InProgress.is_terminal());
+        let info = VideoJobInfo {
+            id: "j".into(),
+            conversation_id: "c".into(),
+            status: VideoJobStatus::Submitted,
+            model: "google/veo-3.1-lite".into(),
+            prompt: "a cat".into(),
+            attachment_id: "a".into(),
+            error: None,
+            created_at: "t".into(),
+        };
+        let back: VideoJobInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(back.status, VideoJobStatus::Submitted);
     }
 }

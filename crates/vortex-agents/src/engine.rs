@@ -10,6 +10,7 @@ use crate::browser::BrowserManager;
 use crate::errors::ToolError;
 use crate::file_state::FileState;
 use crate::hub::Hub;
+use crate::media_context::{self, MediaContext, MediaSupport, ModelCatalog, PdfReplay};
 use crate::preview::PreviewRegistry;
 use crate::registry::{ToolContext, ToolRegistry};
 use crate::safe_http::SafeHttp;
@@ -21,7 +22,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use vortex_core::diag;
-use vortex_core::Db;
+use vortex_core::{AttachmentStore, Db};
+use vortex_llm::llm::PdfEngine;
 use vortex_llm::{CompletionRequest, LlmClient, LlmEvent};
 use vortex_types::{
     ChatMessage, Mode, RunEvent, RunInfo, RunStatus, Settings, ToolCallRecord, Usage,
@@ -39,6 +41,8 @@ pub struct Engine {
     pub search: Option<Arc<dyn SearchProvider>>,
     pub http: SafeHttp,
     pub file_state: Arc<FileState>,
+    attachments: Option<Arc<AttachmentStore>>,
+    catalog: ModelCatalog,
     settings: tokio::sync::RwLock<Settings>,
     /// Engine self-reference for the delegate tool (set once after Arc::new).
     pub self_ref: Arc<OnceLock<Arc<Engine>>>,
@@ -136,6 +140,18 @@ pub struct RunSpec {
     pub needs_slot: bool,
 }
 
+/// Settings and model input support captured before accepting a turn.
+pub struct ChatPreflight {
+    settings: Settings,
+    support: Option<MediaSupport>,
+}
+
+#[derive(Default)]
+struct ChatRunMedia {
+    support: Option<MediaSupport>,
+    assistant_ids: std::collections::HashMap<i64, usize>,
+}
+
 impl Engine {
     /// Composition root: every subsystem is a shared handle. Arguments are
     /// grouped into [`Engine`] by design (single composition point).
@@ -152,6 +168,7 @@ impl Engine {
         search: Option<Arc<dyn SearchProvider>>,
         http: SafeHttp,
         settings: Settings,
+        attachments: Option<Arc<AttachmentStore>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             llm,
@@ -165,6 +182,8 @@ impl Engine {
             search,
             http,
             file_state: Arc::new(FileState::new()),
+            attachments,
+            catalog: ModelCatalog::default(),
             settings: tokio::sync::RwLock::new(settings),
             self_ref: Arc::new(OnceLock::new()),
         })
@@ -172,6 +191,33 @@ impl Engine {
 
     pub async fn current_settings(&self) -> Settings {
         self.settings.read().await.clone()
+    }
+
+    pub async fn models(&self) -> Result<Arc<Vec<vortex_types::ModelInfo>>, vortex_llm::LlmError> {
+        self.catalog.get(self.llm.as_ref()).await
+    }
+
+    pub async fn preflight_chat(
+        &self,
+        conversation_id: &str,
+        attachments: &[vortex_types::AttachmentRef],
+    ) -> Result<ChatPreflight, &'static str> {
+        let settings = self.current_settings().await;
+        let support = match &self.attachments {
+            Some(store) => {
+                media_context::preflight(
+                    store,
+                    &self.catalog,
+                    self.llm.as_ref(),
+                    &settings.model,
+                    conversation_id,
+                    attachments,
+                )
+                .await?
+            }
+            None => None,
+        };
+        Ok(ChatPreflight { settings, support })
     }
 
     pub async fn update_settings(&self, settings: Settings) {
@@ -198,6 +244,7 @@ impl Engine {
             approvals: self.approvals.clone(),
             workspace,
             db: Some(self.db.clone()),
+            attachments: self.attachments.clone(),
             conversation_id: spec.conversation_id.clone(),
             file_state: self.file_state.clone(),
             http: self.http.clone(),
@@ -210,6 +257,14 @@ impl Engine {
 
     /// Drive one run to completion. Returns the final assistant text.
     pub async fn execute_run(self: &Arc<Self>, spec: RunSpec) -> Result<String, RunError> {
+        self.execute_with_media(spec, ChatRunMedia::default()).await
+    }
+
+    async fn execute_with_media(
+        self: &Arc<Self>,
+        spec: RunSpec,
+        media: ChatRunMedia,
+    ) -> Result<String, RunError> {
         let run_id = spec.run_id.clone();
         let settings = spec.settings.clone();
         let deadline = tokio::time::Instant::now()
@@ -263,7 +318,7 @@ impl Engine {
             })
         };
 
-        let result = self.run_loop(&spec, ctx, deadline).await;
+        let result = self.run_loop(&spec, ctx, deadline, media).await;
         // Drain instead of abort: `run_loop` owns `ctx` and every tool task is
         // joined inside `execute_tool_calls`, so all `ctx.events` senders are
         // dropped by the time `run_loop` returns — the forwarder delivers
@@ -370,27 +425,87 @@ impl Engine {
         mode: Mode,
         history: Vec<ChatMessage>,
         user_message: &str,
+        user_attachments: Vec<vortex_types::AttachmentRef>,
     ) -> String {
-        let settings = self.current_settings().await;
+        let preflight = ChatPreflight {
+            settings: self.current_settings().await,
+            support: None,
+        };
+        let mut user = ChatMessage::user(user_message);
+        user.attachments = user_attachments;
+        self.start_chat_with_history(
+            conversation_id,
+            mode,
+            history.into_iter().map(|m| (m, None)).collect(),
+            user,
+            preflight,
+        )
+        .await
+    }
+
+    pub async fn start_preflighted_chat_run(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        mode: Mode,
+        history: Vec<vortex_types::StoredMessage>,
+        user_message: &str,
+        user_attachments: Vec<vortex_types::AttachmentRef>,
+        preflight: ChatPreflight,
+    ) -> String {
+        let mut user = ChatMessage::user(user_message);
+        user.attachments = user_attachments;
+        let history = history
+            .into_iter()
+            .filter_map(|m| {
+                let mut message = match m.role {
+                    vortex_types::Role::User => ChatMessage::user(m.content),
+                    vortex_types::Role::Assistant => ChatMessage::assistant(m.content),
+                    _ => return None,
+                };
+                message.attachments = m.attachments;
+                Some((message, Some(m.id)))
+            })
+            .collect();
+        self.start_chat_with_history(conversation_id, mode, history, user, preflight)
+            .await
+    }
+
+    async fn start_chat_with_history(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        mode: Mode,
+        history: Vec<(ChatMessage, Option<i64>)>,
+        user: ChatMessage,
+        preflight: ChatPreflight,
+    ) -> String {
+        let ChatPreflight { settings, support } = preflight;
         let run_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
         let allowed = allowed_for_mode(mode, &settings, self.browser.is_available());
         let system = crate::prompts::coordinator_system_prompt(mode, &settings);
         let mut messages = vec![ChatMessage::system(system)];
         // Keep context bounded: the most recent 40 turns.
-        let mut history = history;
-        if history.len() > 40 {
-            history = history.split_off(history.len() - 40);
+        let skip = history.len().saturating_sub(40);
+        let mut assistant_ids = std::collections::HashMap::new();
+        for (message, id) in history.into_iter().skip(skip) {
+            if let Some(id) = id.filter(|_| message.role == vortex_types::Role::Assistant) {
+                assistant_ids.insert(id, messages.len());
+            }
+            messages.push(message);
         }
-        messages.extend(history);
-        messages.push(ChatMessage::user(user_message));
+        let task = if user.content.trim().is_empty() {
+            "[attached files]".to_string()
+        } else {
+            user.content.chars().take(120).collect()
+        };
+        messages.push(user);
         let spec = RunSpec {
             run_id: run_id.clone(),
             root_run_id: run_id.clone(),
             conversation_id: Some(conversation_id.to_string()),
             parent_run_id: None,
             agent: "coordinator".into(),
-            task: user_message.chars().take(120).collect(),
+            task,
             depth: 0,
             allowed,
             messages,
@@ -448,7 +563,13 @@ impl Engine {
         tokio::spawn(async move {
             let rid = spec.run_id.clone();
             let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-                engine.execute_run(spec),
+                engine.execute_with_media(
+                    spec,
+                    ChatRunMedia {
+                        support,
+                        assistant_ids,
+                    },
+                ),
             ))
             .await;
             match outcome {
@@ -477,12 +598,25 @@ impl Engine {
         spec: &RunSpec,
         ctx: ToolContext,
         deadline: tokio::time::Instant,
+        chat_media: ChatRunMedia,
     ) -> Result<String, RunError> {
         let run_id = spec.run_id.clone();
         let settings = spec.settings.clone();
         let mut messages = spec.messages.clone();
         let mut total_usage = Usage::default();
         let tools_schema = self.registry.schemas(&spec.allowed);
+        let mut media = MediaContext {
+            store: ctx.attachments.as_deref(),
+            conversation: ctx.conversation_id.as_deref(),
+            catalog: &self.catalog,
+            llm: self.llm.as_ref(),
+            model: &spec.model,
+            support: chat_media.support,
+        };
+        let mut pdfs = PdfReplay::new(
+            PdfEngine::parse(&settings.media.pdf_engine).unwrap_or_default(),
+            chat_media.assistant_ids,
+        );
 
         for _iteration in 0..settings.agents.max_iterations.max(1) {
             // Token budget is enforced *before* each provider call, and the
@@ -499,7 +633,7 @@ impl Engine {
                     "token budget exhausted before the next model call; summarize progress".into(),
                 ));
             }
-            let req = CompletionRequest {
+            let mut req = CompletionRequest {
                 model: spec.model.clone(),
                 messages: messages.clone(),
                 tools: tools_schema.clone(),
@@ -507,7 +641,24 @@ impl Engine {
                 max_tokens: settings
                     .max_tokens
                     .min(remaining.min(u64::from(u32::MAX)) as u32),
+                pdf_engine: Some(pdfs.parser()),
+                assistant_annotations: Default::default(),
             };
+            let sent_pdfs = tokio::select! {
+                biased;
+                _ = spec.cancel.cancelled() => return Err(RunError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(RunError::Failed("run time budget exceeded".into())),
+                prepared = async {
+                    let remaining = media.hydrate(&mut req.messages).await?;
+                    Ok(pdfs.prepare(&media, &mut req, remaining).await)
+                } => prepared.map_err(|e: &'static str| RunError::Failed(e.into()))?,
+            };
+            if spec.cancel.is_cancelled() {
+                return Err(RunError::Cancelled);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RunError::Failed("run time budget exceeded".into()));
+            }
             let (llm_tx, mut llm_rx) = mpsc::channel::<LlmEvent>(256);
             let fwd = {
                 let hub = self.hub.clone();
@@ -593,6 +744,7 @@ impl Engine {
             // as the original code did.
             let _ = fwd.await;
             let resp = resp?;
+            let annotations = sent_pdfs.match_annotations(resp.annotations);
             if let Some(u) = resp.usage {
                 total_usage = total_usage + u;
                 if let Some(h) = self.hub.get(&run_id) {
@@ -649,6 +801,8 @@ impl Engine {
                 tool_calls: tool_calls.clone(),
                 tool_call_id: None,
                 tool_name: None,
+                attachments: Vec::new(),
+                parts: None,
             });
 
             if tool_calls.is_empty() {
@@ -658,7 +812,15 @@ impl Engine {
                             .db
                             .add_message(conv.clone(), ChatMessage::assistant(resp.content.clone()))
                             .await;
-                        if persisted.is_err() {
+                        if let Ok(assistant_id) = persisted {
+                            let save = pdfs.persist(&media, assistant_id, annotations);
+                            tokio::select! {
+                                biased;
+                                _ = spec.cancel.cancelled() => {},
+                                _ = tokio::time::sleep_until(deadline) => {},
+                                _ = save => {},
+                            }
+                        } else {
                             diag::event(
                                 tracing::Level::ERROR,
                                 diag::DB_PERSIST_FAILED,
@@ -686,6 +848,7 @@ impl Engine {
                 return Ok(resp.content);
             }
 
+            pdfs.remember(messages.len() - 1, annotations);
             let outcomes = self.execute_tool_calls(&run_id, &ctx, &tool_calls).await;
             for (tc, outcome) in tool_calls.iter().zip(outcomes) {
                 self.hub.publish(

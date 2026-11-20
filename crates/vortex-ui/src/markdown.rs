@@ -20,8 +20,34 @@ pub fn render_markdown(md: &str) -> String {
     let mut code_lang = String::new();
     let mut code_text = String::new();
     let mut ordered: Vec<bool> = Vec::new();
+    // Image handling: only relative attachment URLs are allowed; the alt text
+    // is collected from the inner events and everything else is neutralized.
+    let mut image_depth = 0;
+    let mut image_src: Option<String> = None;
+    let mut image_alt = String::new();
 
     for ev in parser {
+        if image_depth > 0 {
+            match ev {
+                Event::Start(Tag::Image { .. }) => image_depth += 1,
+                Event::End(TagEnd::Image) => {
+                    image_depth -= 1;
+                    if image_depth == 0 {
+                        if let Some(src) = image_src.take() {
+                            out.push_str(&format!(
+                                "<img src=\"{}\" alt=\"{}\" loading=\"lazy\" class=\"md-image\">",
+                                esc(&src),
+                                esc(&image_alt)
+                            ));
+                        }
+                    }
+                }
+                Event::Text(t) | Event::Code(t) | Event::InlineHtml(t) => image_alt.push_str(&t),
+                Event::SoftBreak | Event::HardBreak => image_alt.push(' '),
+                _ => {}
+            }
+            continue;
+        }
         match ev {
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_code = true;
@@ -86,6 +112,18 @@ pub fn render_markdown(md: &str) -> String {
             Event::End(TagEnd::Strong) => out.push_str("</strong>"),
             Event::Start(Tag::Strikethrough) => out.push_str("<s>"),
             Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                image_depth = 1;
+                image_alt.clear();
+                let dest = dest_url.as_ref();
+                image_src = is_allowed_image_url(dest).then(|| {
+                    if dest.contains('?') {
+                        dest.to_owned()
+                    } else {
+                        crate::api::with_lan_token(dest)
+                    }
+                });
+            }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let dest = dest_url.as_ref();
                 if dest.starts_with("http://")
@@ -127,6 +165,35 @@ fn heading_tag(level: HeadingLevel) -> &'static str {
     }
 }
 
+/// Only relative attachment URLs are renderable as images:
+/// `^/api/attachments/[0-9a-f-]{36}(\?token=[A-Za-z0-9]+)?$`.
+/// External image URLs stay blocked (deliberate — no remote tracking pixels).
+fn is_allowed_image_url(url: &str) -> bool {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (url, None),
+    };
+    let Some(rest) = path.strip_prefix("/api/attachments/") else {
+        return false;
+    };
+    if rest.len() != 36
+        || !rest
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f' | '-'))
+    {
+        return false;
+    }
+    if let Some(q) = query {
+        let Some(tok) = q.strip_prefix("token=") else {
+            return false;
+        };
+        if tok.is_empty() || !tok.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn highlighted_code(lang: &str, code: &str) -> String {
     let ss = syntax_set();
     let syntax = ss
@@ -165,4 +232,69 @@ fn theme_set() -> &'static syntect::highlighting::ThemeSet {
     use std::sync::OnceLock;
     static TS: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
     TS.get_or_init(syntect::highlighting::ThemeSet::load_defaults)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn allowed_image_urls() {
+        assert!(is_allowed_image_url(&format!("/api/attachments/{UUID}")));
+        assert!(is_allowed_image_url(&format!(
+            "/api/attachments/{UUID}?token=abc123"
+        )));
+    }
+
+    #[test]
+    fn blocked_image_urls() {
+        assert!(!is_allowed_image_url("https://evil.example/x.png"));
+        assert!(!is_allowed_image_url("http://127.0.0.1/api/attachments/x"));
+        assert!(!is_allowed_image_url("data:image/png;base64,AAAA"));
+        assert!(!is_allowed_image_url("javascript:alert(1)"));
+        assert!(!is_allowed_image_url("/api/attachments/../../etc/passwd"));
+        assert!(!is_allowed_image_url("/api/attachments/not-a-uuid"));
+        assert!(!is_allowed_image_url(&format!(
+            "/api/attachments/{UUID}?token=a b"
+        )));
+        assert!(!is_allowed_image_url(&format!(
+            "/api/attachments/{UUID}?redirect=evil"
+        )));
+        // Uppercase hex is outside the policy class.
+        assert!(!is_allowed_image_url(
+            "/api/attachments/00000000-0000-4000-8000-00000000000A"
+        ));
+    }
+
+    #[test]
+    fn renders_attachment_image_with_alt() {
+        let md = format!("![a cat](/api/attachments/{UUID})");
+        let html = render_markdown(&md);
+        assert!(html.contains(&format!("src=\"/api/attachments/{UUID}\"")));
+        assert!(html.contains("alt=\"a cat\""));
+        assert!(html.contains("loading=\"lazy\""));
+    }
+
+    #[test]
+    fn external_image_is_neutralized() {
+        let html = render_markdown("![x](https://evil.example/pixel.png)");
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("evil.example"));
+    }
+
+    #[test]
+    fn image_alt_is_escaped() {
+        let md = format!("![\"><script>](/api/attachments/{UUID})");
+        let html = render_markdown(&md);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&quot;&gt;&lt;script&gt;"));
+    }
+
+    #[test]
+    fn nested_image_in_blocked_alt_cannot_emit_markup() {
+        let md = format!("![outer ![inner](/api/attachments/{UUID})](https://example.test/image)");
+        assert_eq!(render_markdown(&md), "<p></p>");
+    }
 }

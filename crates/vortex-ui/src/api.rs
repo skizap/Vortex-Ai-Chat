@@ -3,7 +3,7 @@
 use crate::diagnostics;
 use serde::de::DeserializeOwned;
 use vortex_types::{
-    ApprovalInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
+    ApprovalInfo, AttachmentInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
     ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
@@ -16,8 +16,17 @@ fn request_id_of(resp: &gloo_net::http::Response) -> Option<String> {
 }
 
 pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    get_json_optional(path, false)
+        .await?
+        .ok_or_else(|| "resource not found".into())
+}
+
+async fn get_json_optional<T: DeserializeOwned>(
+    path: &str,
+    allow_404: bool,
+) -> Result<Option<T>, String> {
     let run_id = diagnostics::extract_run_id(path);
-    let resp = gloo_net::http::Request::get(&format!("{BASE}{path}"))
+    let resp = authorize(gloo_net::http::Request::get(&format!("{BASE}{path}")))
         .send()
         .await
         .map_err(|e| {
@@ -30,6 +39,9 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
             e.to_string()
         })?;
     let status = resp.status();
+    if allow_404 && status == 404 {
+        return Ok(None);
+    }
     let text = resp.text().await.map_err(|e| {
         diagnostics::report_api_failure(
             BrowserOperation::ApiTransport,
@@ -50,7 +62,7 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
         );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| {
+    serde_json::from_str(&text).map(Some).map_err(|e| {
         diagnostics::report_api_failure(
             BrowserOperation::ApiDecode,
             Some(status),
@@ -75,7 +87,7 @@ pub async fn send_json<T: DeserializeOwned>(
         _ => return Err(format!("unsupported method {method}")),
     };
     let run_id = diagnostics::extract_run_id(path);
-    let resp = req
+    let resp = authorize(req)
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .map_err(|e| e.to_string())?
@@ -195,6 +207,94 @@ pub async fn send_chat(id: &str, dto: &ChatRequestDto) -> Result<RunId, String> 
 #[derive(serde::Deserialize)]
 pub struct RunId {
     pub run_id: String,
+}
+
+// ---- attachments ----------------------------------------------------------
+
+/// Upload one file as multipart/form-data. The browser sets the Content-Type
+/// (with boundary) automatically — it must NOT be set manually here.
+pub async fn upload_attachment(
+    conv_id: &str,
+    file: &web_sys::File,
+) -> Result<AttachmentInfo, String> {
+    let form = web_sys::FormData::new().map_err(|e| format!("form: {e:?}"))?;
+    form.append_with_blob_and_filename("file", file, &file.name())
+        .map_err(|e| format!("form append: {e:?}"))?;
+    let url = format!("{BASE}/conversations/{conv_id}/attachments");
+    let resp = authorize(gloo_net::http::Request::post(&url))
+        .body(form)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| {
+            diagnostics::report_api_failure(BrowserOperation::ApiTransport, None, None, None);
+            e.to_string()
+        })?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            None,
+        );
+        return Err(parse_error(&text));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+}
+
+pub async fn attachment_meta(id: &str) -> Result<Option<AttachmentInfo>, String> {
+    get_json_optional(&format!("/attachments/{id}/meta"), true).await
+}
+
+pub async fn attachment_list(conv_id: &str) -> Result<Vec<AttachmentInfo>, String> {
+    get_json(&format!("/conversations/{conv_id}/attachments")).await
+}
+
+pub async fn attachment_delete(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("DELETE", &format!("/attachments/{id}"), "")
+        .await
+        .map(|_| ())
+}
+
+/// The LAN access token from the page URL (`?token=...`), if present. Media
+/// URLs must carry it because `<img>`/`<video>` cannot set auth headers.
+fn page_lan_token() -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return None;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let search = web_sys::window()?.location().search().ok()?;
+        web_sys::UrlSearchParams::new_with_str(&search)
+            .ok()?
+            .get("token")
+            .filter(|token| !token.is_empty())
+    }
+}
+
+pub(crate) fn authorize(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
+    match page_lan_token() {
+        Some(t) => req.header("Authorization", &format!("Bearer {t}")),
+        None => req,
+    }
+}
+
+/// Append the LAN token to a relative API URL when the page carries one.
+pub(crate) fn with_lan_token(url: &str) -> String {
+    match page_lan_token() {
+        Some(t) => format!(
+            "{url}{}token={}",
+            if url.contains('?') { '&' } else { '?' },
+            urlencode(&t)
+        ),
+        None => url.to_string(),
+    }
+}
+
+/// Serve URL for an attachment (token-aware).
+pub fn attachment_url(id: &str) -> String {
+    with_lan_token(&format!("/api/attachments/{id}"))
 }
 
 pub async fn stop_run(id: &str) -> Result<(), String> {

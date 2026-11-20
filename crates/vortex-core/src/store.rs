@@ -125,10 +125,13 @@ impl Db {
 
     /// Delete a conversation and everything that belongs to it, atomically:
     /// messages, the run tree (including sub-agent runs), their tool calls
-    /// and approvals, and checkpoints. Previously this was three unlinked
-    /// DELETEs that orphaned `tool_calls`/`approvals`/`checkpoints` rows
-    /// forever and could leave a partial deletion on failure.
+    /// and approvals, checkpoints, attachments, video jobs and file
+    /// annotations. Previously this was three unlinked DELETEs that orphaned
+    /// `tool_calls`/`approvals`/`checkpoints` rows forever and could leave a
+    /// partial deletion on failure. Attachment files are removed after the
+    /// transaction commits (best-effort, traced).
     pub async fn delete_conversation(&self, id: String) -> Result<bool> {
+        let attachments_root = self.attachments_root.get().cloned();
         self.with_conn(move |c| {
             let tx = c.unchecked_transaction()?;
             // Collect the whole run tree (runs of this conversation plus all
@@ -166,6 +169,19 @@ impl Db {
                 rusqlite::params![id],
             )?;
             tx.execute(
+                "DELETE FROM file_annotations WHERE attachment_id IN
+                     (SELECT id FROM attachments WHERE conversation_id = ?1)",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM video_jobs WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM attachments WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
                 "DELETE FROM messages WHERE conversation_id = ?1",
                 rusqlite::params![id],
             )?;
@@ -177,6 +193,24 @@ impl Db {
                 rusqlite::params![id],
             )? > 0;
             tx.commit()?;
+            // Best-effort file cleanup after the rows are gone. The directory
+            // name is the conversation UUID (validated), never user input.
+            if deleted {
+                if let Some(root) = attachments_root {
+                    if uuid::Uuid::parse_str(&id).is_ok() {
+                        let dir = root.join(&id);
+                        if dir.exists() {
+                            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                                tracing::warn!(
+                                    conversation_id = %id,
+                                    error = %e,
+                                    "could not remove attachment files for deleted conversation"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Ok(deleted)
         })
         .await

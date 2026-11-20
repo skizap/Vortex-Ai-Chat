@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use vortex_core::diag;
-use vortex_core::Db;
+use vortex_core::{AttachmentStore, Db};
 use vortex_types::{RunEvent, Settings};
 
 /// Human-in-the-loop approval gate. The concrete implementation lives in the
@@ -35,6 +35,7 @@ pub struct ToolContext {
     pub approvals: Arc<dyn ApprovalGate>,
     pub workspace: Option<Arc<WorkspaceRoots>>,
     pub db: Option<Db>,
+    pub attachments: Option<Arc<AttachmentStore>>,
     pub conversation_id: Option<String>,
     pub file_state: Arc<crate::file_state::FileState>,
     pub http: crate::safe_http::SafeHttp,
@@ -299,6 +300,7 @@ pub fn test_context(
         approvals: Arc::new(AutoApproveGate),
         workspace: None,
         db: None,
+        attachments: None,
         conversation_id: None,
         file_state: Arc::new(crate::file_state::FileState::new()),
         http: crate::safe_http::SafeHttp::new(false),

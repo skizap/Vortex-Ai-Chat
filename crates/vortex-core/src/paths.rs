@@ -53,6 +53,13 @@ impl Paths {
     pub fn trash_dir(&self) -> PathBuf {
         self.data_dir.join("trash")
     }
+
+    /// Server-side attachment storage (uploads + generated media). Files live
+    /// at `attachments/{conversation_id}/{attachment_id}.{ext}` with both path
+    /// segments server-generated UUIDs.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.data_dir.join("attachments")
+    }
 }
 
 fn base_dir(vortex_var: &str, xdg_var: &str, default_rel: &str) -> std::io::Result<PathBuf> {

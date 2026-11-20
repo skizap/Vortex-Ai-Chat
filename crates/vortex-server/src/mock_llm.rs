@@ -80,6 +80,7 @@ impl LlmClient for DemoMockLlm {
                 }],
                 usage,
                 finish_reason: "tool_calls".to_string(),
+                annotations: None,
             });
         }
 
@@ -109,6 +110,7 @@ impl LlmClient for DemoMockLlm {
             tool_calls: Vec::new(),
             usage,
             finish_reason: "stop".to_string(),
+            annotations: None,
         })
     }
 
@@ -120,6 +122,8 @@ impl LlmClient for DemoMockLlm {
             supports_tools: Some(true),
             pricing_prompt: None,
             pricing_completion: None,
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
         }])
     }
 

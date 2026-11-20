@@ -6,6 +6,7 @@
 mod diagnostics;
 mod guard;
 mod mock_llm;
+mod routes_attachments;
 mod routes_ckpts;
 mod routes_conv;
 mod routes_misc;
@@ -63,6 +64,13 @@ async fn main() -> anyhow::Result<()> {
         Ok(s) => s,
         Err(e) => return Err(diagnostics::stage_fatal("settings", e.into())),
     };
+
+    // Attachment storage (uploads + generated media). Registers its root with
+    // the Db so conversation deletion cleans up files after the row cascade.
+    let attachments = Arc::new(
+        vortex_core::AttachmentStore::new(paths.attachments_dir(), db.clone())
+            .map_err(|e| diagnostics::stage_fatal("attachments", e.into()))?,
+    );
 
     // LLM provider: real OpenRouter or the offline mock (explicit opt-in).
     // The base URL is configuration-derived and could carry credential-
@@ -126,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = vortex_agents::build_registry(previews.clone(), engine_slot.clone());
     let http = vortex_agents::safe_http::SafeHttp::new(false); // model URLs never touch local nets
     let engine = vortex_agents::Engine::new(
-        llm.clone(),
+        llm,
         registry,
         hub.clone(),
         scheduler.clone(),
@@ -137,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         search.clone(),
         http,
         settings.clone(),
+        Some(attachments.clone()),
     );
     let _ = engine_slot.set(engine.clone());
 
@@ -151,9 +160,9 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         engine: engine.clone(),
         hub: hub.clone(),
-        llm,
         config,
         previews: previews.clone(),
+        attachments: attachments.clone(),
         is_mock_llm,
         version: env!("CARGO_PKG_VERSION"),
         guard: guard_settings,
@@ -217,6 +226,22 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
             get(routes_conv::get_messages),
         )
         .route("/api/conversations/{id}/chat", post(routes_conv::post_chat))
+        .route(
+            "/api/conversations/{id}/attachments",
+            get(routes_attachments::list_attachments).post(
+                post(routes_attachments::upload_attachments)
+                    .layer(routes_attachments::upload_body_limit()),
+            ),
+        )
+        .route(
+            "/api/attachments/{id}",
+            get(routes_attachments::get_attachment_bytes)
+                .delete(routes_attachments::delete_attachment),
+        )
+        .route(
+            "/api/attachments/{id}/meta",
+            get(routes_attachments::get_attachment_meta),
+        )
         .route(
             "/api/conversations/{id}/checkpoints",
             get(routes_ckpts::list_checkpoints),

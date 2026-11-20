@@ -101,6 +101,7 @@ impl LlmClient for MockLlm {
                     tool_calls: Vec::new(),
                     usage: None,
                     finish_reason: "stop".into(),
+                    annotations: None,
                 });
             }
             guard.remove(0)
@@ -135,6 +136,7 @@ impl LlmClient for MockLlm {
                 completion_tokens,
                 total_tokens: 10 + completion_tokens,
             }),
+            annotations: None,
             finish_reason: if has_tool_calls {
                 "tool_calls".into()
             } else {
@@ -151,6 +153,8 @@ impl LlmClient for MockLlm {
             supports_tools: Some(true),
             pricing_prompt: None,
             pricing_completion: None,
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
         }])
     }
 

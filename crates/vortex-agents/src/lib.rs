@@ -9,6 +9,7 @@ pub mod errors;
 pub mod file_state;
 pub mod html;
 pub mod hub;
+mod media_context;
 pub mod preview;
 pub mod preview_server;
 pub mod prompts;

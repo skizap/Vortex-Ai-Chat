@@ -34,6 +34,22 @@ pub struct AgentDisplay {
     pub usage: Option<vortex_types::Usage>,
 }
 
+/// A file staged in the composer before sending.
+#[derive(Debug, Clone)]
+pub struct UploadChip {
+    pub local_id: u64,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub state: UploadState,
+}
+
+#[derive(Debug, Clone)]
+pub enum UploadState {
+    Uploading,
+    Ready(vortex_types::AttachmentInfo),
+    Error(String),
+}
+
 /// All fields are Copy `RwSignal`s, so the context itself is `Copy` —
 /// required for Leptos 0.8 view closures (which re-run and must only
 /// capture `Copy` state).
@@ -61,6 +77,8 @@ pub struct AppCtx {
     pub agents: RwSignal<Vec<AgentDisplay>>,
     pub approvals: RwSignal<Vec<ApprovalInfo>>,
     pub error_banner: RwSignal<Option<String>>,
+    /// Files staged in the composer (uploading / ready / failed).
+    pub pending_attachments: RwSignal<Vec<UploadChip>>,
 }
 
 impl AppCtx {
@@ -84,6 +102,7 @@ impl AppCtx {
             agents: RwSignal::new(Vec::new()),
             approvals: RwSignal::new(Vec::new()),
             error_banner: RwSignal::new(None),
+            pending_attachments: RwSignal::new(Vec::new()),
         };
         // Default the mode from the persisted settings on FIRST load only.
         // Re-applying on every settings write used to reset the user's mode

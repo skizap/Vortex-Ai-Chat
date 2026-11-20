@@ -9,15 +9,19 @@ pub mod dto;
 pub mod events;
 pub mod settings;
 
-pub use chat::{ChatMessage, ModelInfo, Role, ToolCall, Usage};
+pub use chat::{
+    AttachmentKind, AttachmentRef, AttachmentStatus, ChatMessage, ContentPart, FileContent,
+    ImageUrlContent, ModelInfo, Role, ToolCall, Usage, VideoUrlContent,
+};
 pub use dto::{
-    ApprovalInfo, ApprovalStatus, BrowserEventKind, BrowserOperation, BrowserReport,
-    BrowserSourceLocation, Capabilities, ChatRequestDto, CheckpointInfo, ConversationSummary,
-    PreviewInfo, RunInfo, StoredMessage, ToolCallRecord,
+    ApprovalInfo, ApprovalStatus, AttachmentInfo, AttachmentOrigin, BrowserEventKind,
+    BrowserOperation, BrowserReport, BrowserSourceLocation, Capabilities, ChatRequestDto,
+    CheckpointInfo, ConversationSummary, MediaKind, MediaModelInfo, PreviewInfo, RunInfo,
+    StoredMessage, ToolCallRecord, VideoJobInfo, VideoJobStatus,
 };
 pub use events::{PlanStep, RunEvent, RunStatus, StepStatus};
 pub use settings::{
-    AgentSettings, PermissionProfile, SearchSettings, Settings, Theme, ToolSettings,
+    AgentSettings, MediaSettings, PermissionProfile, SearchSettings, Settings, Theme, ToolSettings,
 };
 
 /// Interaction modes shown in the UI. Each mode changes which tools the
