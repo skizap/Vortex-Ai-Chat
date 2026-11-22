@@ -14,6 +14,85 @@ pub struct ConversationSummary {
     pub workspace: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Per-conversation model preference for future sends: `None` inherits
+    /// the Settings default, [`crate::VORTEX_AUTO_MODEL`] selects server-side
+    /// Auto routing, any other value pins that provider model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Effective budget bounds behind the recommended shortlist, echoed by
+/// `GET /api/models` so clients can show exactly what was applied. USD per
+/// million tokens; a published zero rate is within bounds, an unknown price
+/// never is.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RecommendedBounds {
+    pub max_input_usd_per_mtok: f64,
+    pub max_output_usd_per_mtok: f64,
+}
+
+impl Default for RecommendedBounds {
+    /// Documented default budget bounds: at most $1 input and $3 output per
+    /// million tokens (published zero rates are within bounds).
+    fn default() -> Self {
+        Self {
+            max_input_usd_per_mtok: 1.0,
+            max_output_usd_per_mtok: 3.0,
+        }
+    }
+}
+
+impl RecommendedBounds {
+    /// Client-editable bounds are clamped, never rejected: NaN/negative or
+    /// absurd values fall back to the documented defaults per field.
+    pub fn clamped(max_input: f64, max_output: f64) -> Self {
+        let d = Self::default();
+        let clamp = |v: f64, fallback: f64| {
+            if v.is_finite() && v >= 0.0 {
+                v.min(1000.0)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            max_input_usd_per_mtok: clamp(max_input, d.max_input_usd_per_mtok),
+            max_output_usd_per_mtok: clamp(max_output, d.max_output_usd_per_mtok),
+        }
+    }
+}
+
+/// `GET /api/models` response: the provider catalog plus honest freshness
+/// metadata. `stale: true` means the last provider refresh failed and
+/// `models`/`fetched_at` describe the last-known-good catalog instead.
+/// On cold-start failure the route keeps returning its 502 error shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsResponse {
+    pub models: Vec<crate::chat::ModelInfo>,
+    /// True when an API key is configured (or the offline mock is active).
+    pub configured: bool,
+    /// Unix seconds of the last successful provider fetch; `None` if never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
+    #[serde(default)]
+    pub stale: bool,
+    /// Presentable refresh error when `stale`; `None` on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Verified open-weights shortlist within the effective bounds, ordered by
+    /// weekly token-usage rank (unranked entries last, by id). Ids reference
+    /// `models`; models outside the shortlist stay visible there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<String>,
+    /// Bounds actually applied to `recommended` (clamped request or defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_bounds: Option<RecommendedBounds>,
+    /// Shortlist size actually applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_limit: Option<u32>,
+    /// Ranking provenance (e.g. `openrouter sort=top-weekly`) when weekly
+    /// ranks are present; `None` when ranking is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +105,38 @@ pub struct StoredMessage {
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
     pub created_at: String,
+    /// Run that produced this message (assistant replies). `None` for user
+    /// messages and for rows persisted before provenance tracking existed;
+    /// old replies are never inferred from timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Model id sent to the provider when this message was generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Provider-reported model that actually answered. `None` means the
+    /// provider never reported one ("serving model not reported").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_summary: Option<ReplySummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplySummary {
+    pub finish: ReplyFinish,
+    pub requested_output_tokens: u32,
+    pub completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyFinish {
+    Stop,
+    Length,
+    ContentFilter,
+    Error,
+    NotReported,
+    Other,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +305,36 @@ pub struct RunInfo {
     pub depth: u32,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Aggregated provider-reported usage for one conversation
+/// (`GET /api/conversations/{id}/usage`). Fetched on conversation switch and
+/// reconnect, then reconciled against live `UsageUpdate` events by run id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationUsage {
+    pub conversation_id: String,
+    /// One entry per distinct run in the conversation's run tree: coordinator
+    /// runs, retries, and every delegated sub-agent run.
+    #[serde(default)]
+    pub runs: Vec<ConversationRunUsage>,
+}
+
+/// One run's latest cumulative provider-reported usage. Cumulative SSE events
+/// are never summed: a run contributes its most recent total exactly once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationRunUsage {
+    pub run_id: String,
+    /// Latest cumulative usage for the run; `None` when the provider never
+    /// reported any for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// `true` when this run's totals are permanently partial: a completion
+    /// in it never reported usage, or the run is terminal with no reported
+    /// usage at all. An active run that simply has not called the provider
+    /// yet is *not* incomplete. Totals across runs are then "reported
+    /// tokens"; missing history is never zero.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,10 +581,163 @@ mod tests {
     }
 
     #[test]
+    fn conversation_summary_model_is_optional_and_skipped_when_none() {
+        let json = r#"{"id":"c1","title":"t","mode":"chat","created_at":"x","updated_at":"y"}"#;
+        let s: ConversationSummary = serde_json::from_str(json).unwrap();
+        assert!(s.model.is_none());
+        assert!(!serde_json::to_string(&s).unwrap().contains("model"));
+        let pinned = ConversationSummary {
+            model: Some("anthropic/claude-sonnet-4".into()),
+            ..s
+        };
+        let out = serde_json::to_string(&pinned).unwrap();
+        assert!(out.contains(r#""model":"anthropic/claude-sonnet-4""#));
+    }
+
+    #[test]
+    fn models_response_defaults_and_roundtrip() {
+        // Old/compact payloads: stale defaults false, fetched_at/error absent.
+        let json = r#"{"models":[],"configured":true}"#;
+        let r: ModelsResponse = serde_json::from_str(json).unwrap();
+        assert!(!r.stale);
+        assert!(r.fetched_at.is_none());
+        assert!(r.error.is_none());
+        assert!(r.recommended.is_empty());
+        assert!(r.recommended_bounds.is_none());
+        assert!(r.recommended_limit.is_none());
+        assert!(r.ranking_source.is_none());
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(!out.contains("fetched_at"));
+        assert!(!out.contains("error"));
+        assert!(!out.contains("recommended"));
+        assert!(!out.contains("ranking_source"));
+        let stale = ModelsResponse {
+            models: Vec::new(),
+            configured: true,
+            fetched_at: Some(1_750_000_000),
+            stale: true,
+            error: Some("provider offline".into()),
+            recommended: vec!["qwen/qwen3-32b".into()],
+            recommended_bounds: Some(RecommendedBounds::default()),
+            recommended_limit: Some(5),
+            ranking_source: Some("openrouter sort=top-weekly".into()),
+        };
+        let back: ModelsResponse =
+            serde_json::from_str(&serde_json::to_string(&stale).unwrap()).unwrap();
+        assert!(back.stale);
+        assert_eq!(back.fetched_at, Some(1_750_000_000));
+        assert_eq!(back.error.as_deref(), Some("provider offline"));
+        assert_eq!(back.recommended, vec!["qwen/qwen3-32b".to_string()]);
+        assert_eq!(back.recommended_bounds, Some(RecommendedBounds::default()));
+        assert_eq!(back.recommended_limit, Some(5));
+        assert_eq!(
+            back.ranking_source.as_deref(),
+            Some("openrouter sort=top-weekly")
+        );
+    }
+
+    #[test]
+    fn recommended_bounds_defaults_and_clamping() {
+        let d = RecommendedBounds::default();
+        assert_eq!(d.max_input_usd_per_mtok, 1.0);
+        assert_eq!(d.max_output_usd_per_mtok, 3.0);
+        // Edited values pass through unchanged.
+        assert_eq!(
+            RecommendedBounds::clamped(0.5, 10.0),
+            RecommendedBounds {
+                max_input_usd_per_mtok: 0.5,
+                max_output_usd_per_mtok: 10.0,
+            }
+        );
+        // Zero is a legal bound (free-only shortlists).
+        assert_eq!(
+            RecommendedBounds::clamped(0.0, 0.0).max_input_usd_per_mtok,
+            0.0
+        );
+        // NaN, negative or non-finite per-field values fall back to defaults;
+        // absurd values clamp to the ceiling.
+        assert_eq!(
+            RecommendedBounds::clamped(f64::NAN, -2.0),
+            RecommendedBounds::default()
+        );
+        assert_eq!(
+            RecommendedBounds::clamped(f64::INFINITY, 5000.0).max_output_usd_per_mtok,
+            1000.0
+        );
+    }
+
+    #[test]
     fn stored_message_old_payload_defaults_attachments() {
         let json = r#"{"id":1,"role":"user","content":"hi","tool_calls":[],"created_at":"t"}"#;
         let m: StoredMessage = serde_json::from_str(json).unwrap();
         assert!(m.attachments.is_empty());
+    }
+
+    #[test]
+    fn stored_message_legacy_rows_keep_null_provenance() {
+        // Rows persisted before provenance tracking decode as null — old
+        // replies are never inferred — and null keys are omitted on the wire.
+        let json = r#"{"id":1,"role":"assistant","content":"hi","tool_calls":[],"created_at":"t"}"#;
+        let m: StoredMessage = serde_json::from_str(json).unwrap();
+        assert!(m.run_id.is_none());
+        assert!(m.requested_model.is_none());
+        assert!(m.serving_model.is_none());
+        assert!(m.reply_summary.is_none());
+        let out = serde_json::to_string(&m).unwrap();
+        assert!(!out.contains("run_id"));
+        assert!(!out.contains("serving_model"));
+
+        let full = StoredMessage {
+            run_id: Some("00000000-0000-4000-8000-0000000000aa".into()),
+            requested_model: Some("requested/model".into()),
+            serving_model: Some("provider/served".into()),
+            ..m
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"serving_model\":\"provider/served\""));
+        let back: StoredMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.run_id, full.run_id);
+        assert_eq!(back.requested_model, full.requested_model);
+        assert_eq!(back.serving_model, full.serving_model);
+    }
+
+    #[test]
+    fn conversation_usage_roundtrip_and_legacy_defaults() {
+        let usage = ConversationUsage {
+            conversation_id: "c1".into(),
+            runs: vec![
+                ConversationRunUsage {
+                    run_id: "r1".into(),
+                    usage: Some(Usage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                    }),
+                    incomplete: false,
+                },
+                ConversationRunUsage {
+                    run_id: "r2".into(),
+                    usage: None,
+                    incomplete: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        // A run without reported usage serializes null usage + incomplete.
+        assert!(json.contains("\"incomplete\":true"));
+        assert!(
+            !json.contains("\"usage\":null"),
+            "null usage is omitted: {json}"
+        );
+        let back: ConversationUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runs.len(), 2);
+        assert_eq!(back.runs[0].usage.unwrap().total_tokens, 15);
+        assert!(back.runs[1].incomplete);
+        // Payloads missing the new keys entirely still decode.
+        let minimal = r#"{"run_id":"r3"}"#;
+        let run: ConversationRunUsage = serde_json::from_str(minimal).unwrap();
+        assert!(run.usage.is_none());
+        assert!(!run.incomplete);
     }
 
     #[test]

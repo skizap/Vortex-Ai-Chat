@@ -12,6 +12,7 @@ pub mod store_calls;
 pub mod store_ckpts;
 pub mod store_msgs;
 pub mod store_runs;
+pub mod title;
 
 pub use config::AppConfig;
 pub use db::Db;

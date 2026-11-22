@@ -29,6 +29,10 @@ pub struct ToolContext {
     pub root_run_id: String,
     pub depth: u32,
     pub settings: Settings,
+    /// The run's resolved model id (Auto already resolved to a concrete
+    /// provider id before the run started). Delegates inherit this verbatim,
+    /// never `settings.model`, so the whole run tree shares one resolution.
+    pub model: String,
     pub allowed: HashSet<String>,
     pub events: mpsc::Sender<RunEvent>,
     pub cancel: CancellationToken,
@@ -289,11 +293,13 @@ pub fn test_context(
 ) -> (ToolContext, mpsc::Receiver<RunEvent>, CancellationToken) {
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
+    let model = settings.model.clone();
     let ctx = ToolContext {
         run_id: "test-run".into(),
         root_run_id: "test-run".into(),
         depth: 0,
         settings,
+        model,
         allowed: allowed.iter().map(|s| s.to_string()).collect(),
         events: tx,
         cancel: cancel.clone(),

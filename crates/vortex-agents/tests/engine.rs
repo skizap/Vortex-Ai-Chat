@@ -66,7 +66,9 @@ impl LlmClient for ScenarioLlm {
                     total_tokens: 10,
                 }),
                 finish_reason: "stop".into(),
+                reported_completion_tokens: None,
                 annotations: None,
+                model: turn.serving_model,
             });
         }
         // Blocker child: hold the slot open until released.
@@ -89,7 +91,9 @@ impl LlmClient for ScenarioLlm {
                 total_tokens: 2,
             }),
             finish_reason: "stop".into(),
+            reported_completion_tokens: None,
             annotations: None,
+            model: None,
         })
     }
 
@@ -252,6 +256,7 @@ fn turn_with_ten_delegates() -> vortex_llm::MockTurn {
         content: String::new(),
         tool_calls: calls,
         fail_with: None,
+        serving_model: None,
     }
 }
 
@@ -380,6 +385,7 @@ async fn unapproved_command_times_out_and_is_denied() {
                 arguments: serde_json::json!({ "cmd": ["cargo", "--version"] }).to_string(),
             }],
             fail_with: None,
+            serving_model: None,
         },
         vortex_llm::MockTurn::text("done after command"),
     ]);
@@ -499,12 +505,14 @@ async fn stopping_root_cancels_children_and_releases_slots() {
 #[tokio::test]
 async fn tool_events_are_delivered_before_run_finished() {
     let (settings, _dir) = settings_with_workspace();
+    let mut planning = vortex_llm::MockTurn::tool_call(
+        "update_plan",
+        "c1",
+        serde_json::json!({ "steps": ["[in_progress] do the thing"] }).to_string(),
+    );
+    planning.content = "plan".into();
     let llm = Arc::new(vortex_llm::MockLlm::new(vec![
-        vortex_llm::MockTurn::tool_call(
-            "update_plan",
-            "c1",
-            serde_json::json!({ "steps": ["[in_progress] do the thing"] }).to_string(),
-        ),
+        planning,
         vortex_llm::MockTurn::text("all done"),
     ]));
     let (engine, db) = test_engine(llm, settings).await;
@@ -559,6 +567,10 @@ async fn tool_events_are_delivered_before_run_finished() {
         tool < finished,
         "ToolCallFinished must arrive before RunFinished: {tool} vs {finished}"
     );
+    let reply = db.get_messages(conv.id).await.unwrap().pop().unwrap();
+    assert_eq!(reply.reply_summary.unwrap().completion_tokens, Some(2));
+    let total = db.get_run(run_id).await.unwrap().unwrap().usage.unwrap();
+    assert_eq!(total.completion_tokens, 3);
 }
 
 /// ACCEPTANCE (P15): once the run's token budget is used up, the engine must
@@ -646,7 +658,9 @@ impl LlmClient for AbortProbeLlm {
             tool_calls: Vec::new(),
             usage: None,
             finish_reason: "stop".into(),
+            reported_completion_tokens: None,
             annotations: None,
+            model: None,
         })
     }
 
@@ -724,4 +738,272 @@ async fn cancel_aborts_the_provider_task() {
         }
     }
     assert!(finished, "cancelled run must publish RunFinished");
+}
+
+/// Plan step 5: the final assistant reply persists model provenance — the
+/// run that produced it, the requested model, and the provider-reported
+/// serving model (which may legitimately differ from the request).
+#[tokio::test]
+async fn assistant_message_persists_model_provenance() {
+    let (mut settings, _dir) = settings_with_workspace();
+    settings.model = "coordinator-model".into();
+    let scenario = scenario(vec![vortex_llm::MockTurn {
+        serving_model: Some("provider/actually-served".into()),
+        ..vortex_llm::MockTurn::text("final answer")
+    }]);
+    let (engine, db) = test_engine(scenario, settings).await;
+    let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+    let run_id = engine
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "hello", Vec::new())
+        .await;
+    let mut events = engine.hub.subscribe(&run_id).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match events.try_recv() {
+            Ok((_, vortex_types::RunEvent::RunFinished { status, .. })) => {
+                assert_eq!(status, RunStatus::Completed);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                if std::time::Instant::now() > deadline {
+                    panic!("run never finished");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let msgs = db.get_messages(conv.id.clone()).await.unwrap();
+    let assistant = msgs
+        .iter()
+        .find(|m| m.role == vortex_types::Role::Assistant)
+        .expect("assistant reply persisted");
+    assert_eq!(assistant.content, "final answer");
+    assert_eq!(assistant.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(
+        assistant.requested_model.as_deref(),
+        Some("coordinator-model")
+    );
+    assert_eq!(
+        assistant.serving_model.as_deref(),
+        Some("provider/actually-served"),
+        "serving model comes from the provider, not the request"
+    );
+    // The run's latest cumulative usage is persisted and reported complete.
+    let usage = db.conversation_usage(conv.id).await.unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].run_id, run_id);
+    assert_eq!(usage[0].usage.map(|u| u.total_tokens), Some(10));
+    assert!(!usage[0].incomplete);
+}
+
+/// A provider that never reports usage: the run is marked permanently
+/// incomplete (its totals are partial, never zero), while the assistant
+/// reply still records requested-model provenance and a null serving model.
+struct NoUsageLlm;
+
+struct LongReplyLlm;
+
+#[async_trait]
+impl LlmClient for LongReplyLlm {
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        events: mpsc::Sender<LlmEvent>,
+    ) -> Result<CompletionResponse, vortex_llm::LlmError> {
+        let needed = 8_000;
+        let tokens = req.max_tokens.min(needed);
+        let limited = tokens < needed;
+        let mut content = " word".repeat(tokens as usize);
+        if !limited {
+            content.push_str("\nEND OF LONG REPLY");
+        }
+        for chunk in content.as_bytes().chunks(512) {
+            events
+                .send(LlmEvent::TextDelta(
+                    String::from_utf8(chunk.to_vec()).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        Ok(CompletionResponse {
+            content,
+            tool_calls: Vec::new(),
+            usage: Some(vortex_types::Usage {
+                prompt_tokens: 12,
+                completion_tokens: u64::from(tokens),
+                total_tokens: u64::from(tokens) + 12,
+            }),
+            finish_reason: if limited { "length" } else { "stop" }.into(),
+            reported_completion_tokens: Some(u64::from(tokens)),
+            annotations: None,
+            model: Some("test/long".into()),
+        })
+    }
+
+    async fn models(&self) -> Result<Vec<vortex_types::ModelInfo>, vortex_llm::LlmError> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self) -> &'static str {
+        "long-reply"
+    }
+}
+
+#[tokio::test]
+async fn long_reply_hits_old_limit_but_finishes_with_new_default() {
+    for (limit, expected) in [
+        (4096, RunStatus::Failed),
+        (Settings::default().max_tokens, RunStatus::Completed),
+    ] {
+        let (mut settings, _dir) = settings_with_workspace();
+        settings.max_tokens = limit;
+        let (engine, db) = test_engine(Arc::new(LongReplyLlm), settings).await;
+        let conv = db
+            .create_conversation("long", Mode::Chat, None)
+            .await
+            .unwrap();
+        let run_id = engine
+            .start_chat_run(
+                &conv.id,
+                Mode::Chat,
+                Vec::new(),
+                "Produce a long reply",
+                Vec::new(),
+            )
+            .await;
+        let mut events = engine.hub.subscribe(&run_id).unwrap();
+        let (streamed, status, error) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut streamed = String::new();
+                loop {
+                    match events.recv().await.unwrap().1 {
+                        vortex_types::RunEvent::TextDelta { delta, .. } => {
+                            streamed.push_str(&delta)
+                        }
+                        vortex_types::RunEvent::RunFinished { status, error, .. } => {
+                            break (streamed, status, error)
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, expected);
+        let run = db.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(run.error, error);
+        assert_eq!(
+            run.usage.unwrap().completion_tokens,
+            u64::from(limit.min(8000))
+        );
+        let messages = db.get_messages(conv.id).await.unwrap();
+        assert_eq!(messages[0].content, streamed);
+        use vortex_types::dto::ReplyFinish;
+        let summary = messages[0].reply_summary.as_ref().unwrap();
+        assert_eq!(summary.requested_output_tokens, limit);
+        assert_eq!(summary.completion_tokens, Some(u64::from(limit.min(8000))));
+        assert_eq!(
+            summary.finish,
+            if expected == RunStatus::Completed {
+                ReplyFinish::Stop
+            } else {
+                ReplyFinish::Length
+            }
+        );
+        if expected == RunStatus::Completed {
+            assert!(error.is_none());
+            assert!(streamed.ends_with("END OF LONG REPLY"));
+            assert!(streamed.len() > 40_000);
+        } else {
+            assert!(error.unwrap().contains("output limit"));
+            assert!(!streamed.ends_with("END OF LONG REPLY"));
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for NoUsageLlm {
+    async fn complete(
+        &self,
+        _req: &CompletionRequest,
+        _events: mpsc::Sender<LlmEvent>,
+    ) -> Result<CompletionResponse, vortex_llm::LlmError> {
+        Ok(CompletionResponse {
+            content: "answer without usage".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: "stop".into(),
+            reported_completion_tokens: None,
+            annotations: None,
+            model: None,
+        })
+    }
+
+    async fn models(&self) -> Result<Vec<vortex_types::ModelInfo>, vortex_llm::LlmError> {
+        Ok(Vec::new())
+    }
+
+    fn describe(&self) -> &'static str {
+        "no-usage"
+    }
+}
+
+#[tokio::test]
+async fn completion_without_usage_marks_run_permanently_incomplete() {
+    let (settings, _dir) = settings_with_workspace();
+    let requested = settings.model.clone();
+    let (engine, db) = test_engine(Arc::new(NoUsageLlm), settings).await;
+    let conv = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+    let run_id = engine
+        .start_chat_run(&conv.id, Mode::Chat, Vec::new(), "hello", Vec::new())
+        .await;
+    let mut events = engine.hub.subscribe(&run_id).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match events.try_recv() {
+            Ok((_, vortex_types::RunEvent::RunFinished { status, .. })) => {
+                assert_eq!(status, RunStatus::Completed);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                if std::time::Instant::now() > deadline {
+                    panic!("run never finished");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let usage = db.conversation_usage(conv.id.clone()).await.unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].usage, None);
+    assert!(
+        usage[0].incomplete,
+        "a completion that never reported usage makes the run's totals permanently partial"
+    );
+
+    let msgs = db.get_messages(conv.id).await.unwrap();
+    let assistant = msgs
+        .iter()
+        .find(|m| m.role == vortex_types::Role::Assistant)
+        .expect("assistant reply persisted");
+    assert_eq!(assistant.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(
+        assistant.requested_model.as_deref(),
+        Some(requested.as_str())
+    );
+    assert!(
+        assistant.serving_model.is_none(),
+        "unreported serving model stays null"
+    );
+    let summary = assistant.reply_summary.as_ref().unwrap();
+    assert_eq!(summary.finish, vortex_types::dto::ReplyFinish::Stop);
+    assert_eq!(summary.completion_tokens, None);
 }

@@ -2,6 +2,7 @@
 
 use crate::diagnostics;
 use serde::de::DeserializeOwned;
+use vortex_types::dto::ModelsResponse;
 use vortex_types::{
     ApprovalInfo, AttachmentInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
     ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
@@ -156,14 +157,44 @@ pub async fn save_settings(s: &Settings) -> Result<Settings, String> {
     send_json("PUT", "/settings", &body).await
 }
 
+/// Client-editable recommended-shortlist query for `GET /api/models`. All
+/// parameters are optional; the server applies documented defaults, clamps
+/// values and echoes the effective ones in the response. Session-only: the
+/// UI never persists these.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CatalogQuery {
+    pub max_input_usd_per_mtok: Option<f64>,
+    pub max_output_usd_per_mtok: Option<f64>,
+    pub recommended_limit: Option<u32>,
+}
+
+impl CatalogQuery {
+    fn to_query_string(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = self.max_input_usd_per_mtok {
+            parts.push(format!("max_input_usd_per_mtok={v}"));
+        }
+        if let Some(v) = self.max_output_usd_per_mtok {
+            parts.push(format!("max_output_usd_per_mtok={v}"));
+        }
+        if let Some(v) = self.recommended_limit {
+            parts.push(format!("recommended_limit={v}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        }
+    }
+}
+
 pub async fn models() -> Result<Vec<ModelInfo>, String> {
-    let resp = get_json::<ModelsResp>("/models").await?;
+    let resp = model_catalog(CatalogQuery::default()).await?;
     Ok(resp.models)
 }
 
-#[derive(serde::Deserialize)]
-struct ModelsResp {
-    models: Vec<ModelInfo>,
+pub(crate) async fn model_catalog(q: CatalogQuery) -> Result<ModelsResponse, String> {
+    get_json(&format!("/models{}", q.to_query_string())).await
 }
 
 pub async fn conversations(q: &str) -> Result<Vec<ConversationSummary>, String> {
@@ -182,11 +213,18 @@ pub async fn create_conversation(
     send_json("POST", "/conversations", &body).await
 }
 
-pub async fn rename_conversation(id: &str, title: &str) -> Result<(), String> {
+/// Rename a conversation. Resolves with the canonical (trimmed, normalized)
+/// title as stored by the server — callers must use that value, never the
+/// raw draft, so the row and the DB can never disagree.
+pub async fn rename_conversation(id: &str, title: &str) -> Result<String, String> {
     let body = serde_json::json!({ "title": title }).to_string();
-    send_json::<serde_json::Value>("PATCH", &format!("/conversations/{id}"), &body)
-        .await
-        .map(|_| ())
+    let resp = send_json::<RenameResp>("PATCH", &format!("/conversations/{id}"), &body).await?;
+    Ok(resp.title)
+}
+
+#[derive(serde::Deserialize)]
+struct RenameResp {
+    title: String,
 }
 
 pub async fn delete_conversation(id: &str) -> Result<(), String> {
@@ -207,6 +245,12 @@ pub async fn send_chat(id: &str, dto: &ChatRequestDto) -> Result<RunId, String> 
 #[derive(serde::Deserialize)]
 pub struct RunId {
     pub run_id: String,
+    /// Present when the server auto-titled this conversation on its first
+    /// accepted turn (placeholder origin only; manual titles never change).
+    /// The chat UI may apply it to the sidebar row; the sidebar additionally
+    /// refreshes the summary list on run start, so this is a fast path only.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 // ---- attachments ----------------------------------------------------------

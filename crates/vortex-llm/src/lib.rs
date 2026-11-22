@@ -1,5 +1,6 @@
 //! LLM provider abstraction: OpenRouter streaming client and mock provider.
 
+pub mod catalog;
 pub mod error;
 pub mod llm;
 pub mod mock;

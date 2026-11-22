@@ -24,6 +24,9 @@ const USER_AGENT: &str = concat!("vortex-ai-chat/", env!("CARGO_PKG_VERSION"));
 const MAX_TOOL_CALL_SLOTS: usize = 64;
 const MAX_ANNOTATIONS: usize = 32;
 const MAX_ANNOTATION_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+/// Cap on the provider-reported serving-model string that is captured from
+/// completion chunks and persisted with assistant messages.
+const MAX_SERVING_MODEL_CHARS: usize = 256;
 
 #[derive(Clone, Copy)]
 enum MediaRequest {
@@ -52,7 +55,6 @@ pub struct OpenRouterClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
-    max_retries: u32,
 }
 
 impl OpenRouterClient {
@@ -72,7 +74,6 @@ impl OpenRouterClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.unwrap_or_default(),
-            max_retries: 2,
         })
     }
 
@@ -182,9 +183,7 @@ fn extract_error_message(body: &str) -> Option<String> {
     Some(msg.chars().take(500).collect())
 }
 impl OpenRouterClient {
-    /// One attempt. `streamed` is set to true as soon as any delta has been
-    /// forwarded to the caller; the retry loop uses it to avoid re-delivering
-    /// text the consumer has already seen (duplicate output + double billing).
+    /// A single attempt; a failed request can still have consumed paid tokens.
     async fn try_complete_once(
         &self,
         url: &str,
@@ -259,10 +258,14 @@ impl OpenRouterClient {
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut usage = None;
+        let mut reported_completion_tokens = None;
         let mut finish_reason = String::new();
         let mut annotations = Vec::new();
         let mut annotation_bytes = 0;
         let mut annotation_overflow = false;
+        // Provider-reported serving model: first non-empty `model` field wins
+        // (a hostile late chunk must not rewrite the recorded provenance).
+        let mut serving_model: Option<String> = None;
         // Once the event consumer is gone, stop trying to deliver deltas but
         // keep accumulating so the final response stays complete.
         let mut sink_alive = true;
@@ -327,7 +330,9 @@ impl OpenRouterClient {
                         tool_calls,
                         usage,
                         finish_reason,
+                        reported_completion_tokens,
                         annotations: (!annotations.is_empty()).then_some(annotations),
+                        model: serving_model,
                     });
                 }
                 let v: serde_json::Value = match serde_json::from_str(&payload) {
@@ -351,19 +356,32 @@ impl OpenRouterClient {
                         ));
                     }
                 };
-                if !matches!(media, MediaRequest::None)
-                    && v.get("error").is_some_and(|e| !e.is_null())
-                {
+                if v.get("error").is_some_and(|e| !e.is_null()) {
                     let code = v
                         .pointer("/error/code")
                         .and_then(|c| c.as_u64().or_else(|| c.as_str()?.parse().ok()))
                         .and_then(|c| u16::try_from(c).ok())
                         .filter(|c| (400..600).contains(c))
                         .unwrap_or(502);
-                    return Err(media.error(code));
+                    if !matches!(media, MediaRequest::None) {
+                        return Err(media.error(code));
+                    }
+                    // OpenRouter can report an error after sending HTTP 200 and
+                    // some text. Persist the partial reply, but never treat it as a stop.
+                    finish_reason = "error".into();
                 }
                 if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                     usage = Some(parse_usage(u));
+                    if let Some(tokens) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
+                        reported_completion_tokens = Some(tokens);
+                    }
+                }
+                if serving_model.is_none() {
+                    if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                        if !m.is_empty() {
+                            serving_model = Some(m.chars().take(MAX_SERVING_MODEL_CHARS).collect());
+                        }
+                    }
                 }
                 let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
                     continue;
@@ -398,7 +416,9 @@ impl OpenRouterClient {
                     if reason == "error" && !matches!(media, MediaRequest::None) {
                         return Err(media.error(502));
                     }
-                    finish_reason = reason.to_string();
+                    if finish_reason != "error" {
+                        finish_reason = reason.to_string();
+                    }
                 }
                 let delta = choice.get("delta");
                 if let Some(txt) = delta
@@ -473,7 +493,9 @@ impl OpenRouterClient {
                     tool_calls,
                     usage,
                     finish_reason,
+                    reported_completion_tokens,
                     annotations: (!annotations.is_empty()).then_some(annotations),
+                    model: serving_model,
                 });
             }
         }
@@ -515,53 +537,28 @@ impl LlmClient for OpenRouterClient {
         }
         let body = self.build_body(req, media);
 
-        let mut attempt: u32 = 0;
-        // Once any attempt has streamed text to the caller, retrying would
-        // re-deliver already-shown content into the same channel (duplicated
-        // UI text + double billing), so retries stop at that point.
         let mut streamed_any = false;
-        loop {
-            match self
-                .try_complete_once(&url, &body, media, &events, &mut streamed_any, attempt)
-                .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    if e.is_retryable() && attempt < self.max_retries && !streamed_any {
-                        attempt += 1;
-                        // Bounded backoff: 1s, 3s. Never longer.
-                        tokio::time::sleep(Duration::from_secs(1 + 2 * attempt as u64)).await;
-                        tracing::warn!(retry = attempt, "retrying provider request");
-                        diag::event(
-                            tracing::Level::WARN,
-                            diag::PROVIDER_RETRY,
-                            &[
-                                ("attempt", diag::Field::Num(u64::from(attempt))),
-                                ("reason", diag::Field::Static(e.category())),
-                            ],
-                        );
-                        continue;
-                    }
-                    if streamed_any && e.is_retryable() {
-                        tracing::warn!(
-                            "provider failed mid-stream after partial delivery; not retrying \
-                             to avoid duplicating streamed output"
-                        );
-                        diag::event(
-                            tracing::Level::WARN,
-                            diag::PROVIDER_MIDSTREAM_ABORT,
-                            &[("reason", diag::Field::Static(e.category()))],
-                        );
-                    }
-                    return Err(e);
-                }
+        let result = self
+            .try_complete_once(&url, &body, media, &events, &mut streamed_any, 0)
+            .await;
+        if let Err(e) = &result {
+            if streamed_any {
+                diag::event(
+                    tracing::Level::WARN,
+                    diag::PROVIDER_MIDSTREAM_ABORT,
+                    &[("reason", diag::Field::Static(e.category()))],
+                );
             }
         }
+        result
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         self.key_or_fail()?;
-        let url = format!("{}/models", self.base_url);
+        // Documented server-side ranking: tokens processed in the last week.
+        // Response position becomes `weekly_rank` (usage popularity, never
+        // quality); the id sort below keeps the wire order deterministic.
+        let url = format!("{}/models?sort=top-weekly", self.base_url);
         let resp = self
             .http
             .get(&url)
@@ -617,7 +614,7 @@ impl LlmClient for OpenRouterClient {
             .cloned()
             .unwrap_or_default();
         let mut models = Vec::new();
-        for m in arr {
+        for (position, m) in arr.into_iter().enumerate() {
             let id = m
                 .get("id")
                 .and_then(|x| x.as_str())
@@ -640,6 +637,14 @@ impl LlmClient for OpenRouterClient {
                     })
                     .unwrap_or_default()
             };
+            // Optional fee details stay None when unreported: unknown fees are
+            // never normalized to zero (Auto ranking treats prompt/completion
+            // as mandatory and these as known-applicable extras).
+            let fee = |field: &str| -> Option<String> {
+                m.pointer(&format!("/pricing/{field}"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            };
             models.push(ModelInfo {
                 id,
                 name: m
@@ -649,16 +654,28 @@ impl LlmClient for OpenRouterClient {
                     .to_string(),
                 context_length: m.get("context_length").and_then(|x| x.as_u64()),
                 supports_tools,
-                pricing_prompt: m
-                    .pointer("/pricing/prompt")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                pricing_completion: m
-                    .pointer("/pricing/completion")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
+                pricing_prompt: fee("prompt"),
+                pricing_completion: fee("completion"),
+                created: m.get("created").and_then(|x| x.as_i64()),
+                pricing_request: fee("request"),
+                pricing_image: fee("image"),
                 input_modalities: modalities("input_modalities"),
                 output_modalities: modalities("output_modalities"),
+                // Provider-specific advertised output limit; routers may not
+                // report one — absence stays absence (never an invented cap).
+                max_completion_tokens: m
+                    .pointer("/top_provider/max_completion_tokens")
+                    .and_then(|x| x.as_u64()),
+                // 1-based position in the requested top-weekly ordering
+                // (weekly token usage). Unscored models are placed last by
+                // the provider; their position is still a list position.
+                weekly_rank: Some((position + 1).min(u32::MAX as usize) as u32),
+                expires_on: m
+                    .get("expiration_date")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                ..Default::default()
             });
         }
         models.sort_by(|a, b| a.id.cmp(&b.id));

@@ -11,13 +11,14 @@ pub mod settings;
 
 pub use chat::{
     AttachmentKind, AttachmentRef, AttachmentStatus, ChatMessage, ContentPart, FileContent,
-    ImageUrlContent, ModelInfo, Role, ToolCall, Usage, VideoUrlContent,
+    ImageUrlContent, ModelInfo, Role, ToolCall, Usage, VideoUrlContent, VORTEX_AUTO_MODEL,
 };
 pub use dto::{
     ApprovalInfo, ApprovalStatus, AttachmentInfo, AttachmentOrigin, BrowserEventKind,
     BrowserOperation, BrowserReport, BrowserSourceLocation, Capabilities, ChatRequestDto,
-    CheckpointInfo, ConversationSummary, MediaKind, MediaModelInfo, PreviewInfo, RunInfo,
-    StoredMessage, ToolCallRecord, VideoJobInfo, VideoJobStatus,
+    CheckpointInfo, ConversationRunUsage, ConversationSummary, ConversationUsage, MediaKind,
+    MediaModelInfo, ModelsResponse, PreviewInfo, RecommendedBounds, RunInfo, StoredMessage,
+    ToolCallRecord, VideoJobInfo, VideoJobStatus,
 };
 pub use events::{PlanStep, RunEvent, RunStatus, StepStatus};
 pub use settings::{

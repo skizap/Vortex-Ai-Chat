@@ -146,6 +146,9 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
             if let Ok(seq) = ev.last_event_id().parse::<u64>() {
                 note_seq(&run_id_msg, seq);
             }
+            if ctx_msg.run_id.get_untracked().as_deref() != Some(run_id_msg.as_str()) {
+                return;
+            }
             let Some(text) = ev.data().as_string() else {
                 return;
             };
@@ -183,6 +186,9 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
     let run_id_err = run_id.clone();
     let source_err = source.clone();
     let on_error = Closure::<dyn FnMut()>::new(move || {
+        if ctx_err.run_id.get_untracked().as_deref() != Some(run_id_err.as_str()) {
+            return;
+        }
         let nonterminal = ctx_err
             .run_status
             .get_untracked()
@@ -211,7 +217,9 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
                             .get_untracked()
                             .map(|s| !s.is_terminal())
                             .unwrap_or(false);
-                        if still_live {
+                        if still_live
+                            && ctx.run_id.get_untracked().as_deref() == Some(run_id.as_str())
+                        {
                             match subscribe_run(ctx, run_id.clone()) {
                                 Ok(sub) => set_new_subscription(sub),
                                 Err(e) => {
@@ -289,11 +297,21 @@ pub fn subscribe_run(ctx: AppCtx, run_id: String) -> Result<RunSubscription, Str
 
 /// Pull the authoritative run snapshot and reconcile the panels with it.
 async fn resync_from_server(ctx: &AppCtx, run_id: &str) {
-    match crate::api::run_state(run_id).await {
+    let result = crate::api::run_state(run_id).await;
+    if ctx.run_id.get_untracked().as_deref() != Some(run_id) {
+        return;
+    }
+    crate::session_usage::reload(*ctx);
+    match result {
         Ok(snap) => {
             if let Some(run) = snap.run {
+                ctx.error_banner.set(run.error);
                 ctx.run_status.set(Some(run.status));
                 ctx.plan.set(run.plan);
+                if run.status.is_terminal() {
+                    reload_finished_messages(*ctx, run.id.clone());
+                }
+                ctx.run_model.set(Some((run.id, run.model)));
             }
             let calls: Vec<crate::state::ToolCallDisplay> = snap
                 .tool_calls
@@ -379,6 +397,8 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                         usage: None,
                     });
                 });
+            } else if ctx.run_id.get_untracked().as_deref() == Some(run_id.as_str()) {
+                ctx.run_model.set(Some((run_id, model)));
             }
         }
         E::ToolCallStarted {
@@ -491,6 +511,7 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
             });
         }
         E::UsageUpdate { run_id, usage, .. } => {
+            crate::session_usage::record(*ctx, run_id.clone(), Some(usage), false);
             ctx.agents.update(|a| {
                 for agent in a.iter_mut() {
                     if agent.run_id == run_id {
@@ -508,6 +529,7 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
             error,
             ..
         } => {
+            crate::session_usage::reload(*ctx);
             // Same boundary as StatusChanged: a sub-agent finishing must not
             // terminate the subscribed run's UI (clear its streaming bubble,
             // refetch messages, flip the global status).
@@ -528,27 +550,27 @@ fn handle_event(ctx: &AppCtx, event: vortex_types::RunEvent) {
                 ctx.error_banner.set(None);
             }
             if status.is_terminal() {
-                let ctx2 = *ctx;
-                let current = ctx.current.get_untracked();
-                if let Some(conv) = current {
-                    spawn_local(async move {
-                        let messages = crate::api::messages(&conv).await;
-                        if ctx2.current.get_untracked().as_deref() != Some(conv.as_str())
-                            || ctx2.run_id.get_untracked().as_deref() != Some(run_id.as_str())
-                        {
-                            return;
-                        }
-                        if let Ok(msgs) = messages {
-                            ctx2.messages.set(msgs);
-                        }
-                        ctx2.stream_text.set(String::new());
-                        ctx2.stream_display.set(String::new());
-                    });
-                } else {
-                    ctx.stream_text.set(String::new());
-                    ctx.stream_display.set(String::new());
-                }
+                reload_finished_messages(*ctx, run_id);
             }
         }
     }
+}
+
+fn reload_finished_messages(ctx: AppCtx, run_id: String) {
+    let Some(conv) = ctx.current.get_untracked() else {
+        return;
+    };
+    spawn_local(async move {
+        let messages = crate::api::messages(&conv).await;
+        if ctx.current.get_untracked().as_deref() != Some(conv.as_str())
+            || ctx.run_id.get_untracked().as_deref() != Some(run_id.as_str())
+        {
+            return;
+        }
+        if let Ok(msgs) = messages {
+            ctx.messages.set(msgs);
+            ctx.stream_text.set(String::new());
+            ctx.stream_display.set(String::new());
+        }
+    });
 }

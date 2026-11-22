@@ -159,7 +159,13 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub finish_reason: String,
+    /// Completion tokens explicitly reported for this call, not an estimate.
+    pub reported_completion_tokens: Option<u64>,
     pub annotations: Option<Vec<Value>>,
+    /// Provider-reported model that actually answered (the `model` field of
+    /// the completion chunks). `None` when the provider never reported one;
+    /// it may legitimately differ from the requested model (router aliases).
+    pub model: Option<String>,
 }
 
 impl std::fmt::Debug for CompletionResponse {

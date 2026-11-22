@@ -14,7 +14,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use vortex_agents::Hub;
-use vortex_types::{Mode, Role, RunEvent, RunInfo, RunStatus};
+use vortex_types::{Role, RunEvent, RunInfo, RunStatus};
 
 /// Replay cursor for an SSE (re-)subscription: the `Last-Event-ID` header
 /// (sent automatically by the browser's EventSource on reconnect) and the
@@ -251,12 +251,15 @@ pub async fn retry_run(
         return err_json(StatusCode::BAD_REQUEST, "no user message to retry");
     };
     let retry_content = messages[last_user_idx].content.clone();
-    let mode = match state.db.get_conversation(conv_id.clone()).await {
-        Ok(Some(c)) => c.mode,
-        Ok(None) => Mode::default(),
+    let conversation = match state.db.get_conversation(conv_id.clone()).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "conversation not found"),
         Err(_) => {
             crate::diagnostics::db_failure("get_conversation", Some(&conv_id));
-            Mode::default()
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not load conversation",
+            );
         }
     };
     let retry_attachments = messages[last_user_idx].attachments.clone();
@@ -265,7 +268,14 @@ pub async fn retry_run(
     messages.truncate(last_user_idx);
     let preflight = match state
         .engine
-        .preflight_chat(&conv_id, &retry_attachments)
+        .preflight_chat_for_send(
+            &conv_id,
+            conversation.mode,
+            conversation.model.as_deref(),
+            &retry_content,
+            &retry_attachments,
+            &messages,
+        )
         .await
     {
         Ok(preflight) => preflight,
@@ -275,7 +285,7 @@ pub async fn retry_run(
         .engine
         .start_preflighted_chat_run(
             &conv_id,
-            mode,
+            conversation.mode,
             messages,
             &retry_content,
             retry_attachments,

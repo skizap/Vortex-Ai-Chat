@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use vortex_llm::llm::{
-    CompletionRequest, CompletionResponse, LlmClient, LlmEvent, PdfEngine, ToolSchema,
-};
+use vortex_llm::llm::{CompletionRequest, LlmClient, LlmEvent, PdfEngine, ToolSchema};
 use vortex_llm::openrouter::OpenRouterClient;
 use vortex_types::{ChatMessage, ContentPart, FileContent, ImageUrlContent, VideoUrlContent};
 
@@ -76,8 +74,9 @@ async fn chat_handler(
 async fn models_handler() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "data": [
-            { "id": "a/model", "name": "A", "context_length": 4096,
-              "supported_parameters": ["tools"], "pricing": { "prompt": "1", "completion": "2" } },
+            { "id": "a/model", "name": "A", "context_length": 4096, "created": 1_750_000_000,
+              "supported_parameters": ["tools"],
+              "pricing": { "prompt": "1", "completion": "2", "request": "0.004", "image": "0.0002" } },
             { "id": "b/model", "name": "B", "supported_parameters": [] }
         ]
     }))
@@ -134,6 +133,27 @@ async fn streams_text_and_parses_models() {
     assert!(requests[0].get("plugins").is_none());
 }
 
+/// Catalog parsing exposes the provider creation date and optional fee
+/// details with explicit units (USD strings, as reported); unreported fields
+/// stay unknown and are never normalized to zero.
+#[tokio::test]
+async fn parses_model_created_and_fee_details() {
+    let (base, _) = spawn_server(Vec::new()).await;
+    let client = OpenRouterClient::new(&base, Some("test-key".into())).unwrap();
+    let models = client.models().await.unwrap();
+    assert_eq!(models[0].created, Some(1_750_000_000));
+    assert_eq!(models[0].pricing_prompt.as_deref(), Some("1"));
+    assert_eq!(models[0].pricing_completion.as_deref(), Some("2"));
+    assert_eq!(models[0].pricing_request.as_deref(), Some("0.004"));
+    assert_eq!(models[0].pricing_image.as_deref(), Some("0.0002"));
+    // b/model reports nothing optional: every field stays unknown.
+    assert_eq!(models[1].created, None);
+    assert!(models[1].pricing_prompt.is_none());
+    assert!(models[1].pricing_completion.is_none());
+    assert!(models[1].pricing_request.is_none());
+    assert!(models[1].pricing_image.is_none());
+}
+
 #[tokio::test]
 async fn accumulates_tool_calls_across_deltas() {
     let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"que\"}}]}}]}\n\n\
@@ -166,7 +186,7 @@ async fn maps_auth_error_without_retry() {
 }
 
 #[tokio::test]
-async fn retries_rate_limit_then_succeeds() {
+async fn rate_limit_is_not_retried_automatically() {
     let ok_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
     let (base, state) = spawn_server(vec![
         MockResponse::Error(429, "slow down".into()),
@@ -175,9 +195,9 @@ async fn retries_rate_limit_then_succeeds() {
     .await;
     let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
     let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
-    let resp: CompletionResponse = client.complete(&req(), tx).await.unwrap();
-    assert_eq!(resp.content, "done");
-    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 2);
+    let err = client.complete(&req(), tx).await.unwrap_err();
+    assert!(matches!(err, vortex_llm::LlmError::RateLimited));
+    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -232,6 +252,22 @@ async fn model_not_found_maps_to_clear_error() {
 /// C3 regression: a retryable failure *after* deltas were delivered must not
 /// retry (which used to re-stream the whole answer into the same channel).
 #[tokio::test]
+async fn inline_provider_error_is_not_a_normal_finish() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\":{\"code\":502},\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (base, state) = spawn_server(vec![MockResponse::Sse(sse.into())]).await;
+    let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(8);
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert_eq!(resp.content, "partial");
+    assert_eq!(resp.finish_reason, "error");
+    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn no_retry_after_partial_stream_delivery() {
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
     let (base, state) = spawn_server(vec![
@@ -283,9 +319,8 @@ async fn bad_request_is_not_retried() {
     assert_eq!(state.chat_calls.load(Ordering::SeqCst), 1);
 }
 
-/// 5xx provider errors remain retryable.
 #[tokio::test]
-async fn server_error_is_retried() {
+async fn server_error_is_not_retried_automatically() {
     let ok_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
     let (base, state) = spawn_server(vec![
         MockResponse::Error(503, "unavailable".into()),
@@ -294,9 +329,9 @@ async fn server_error_is_retried() {
     .await;
     let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
     let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
-    let resp = client.complete(&req(), tx).await.unwrap();
-    assert_eq!(resp.content, "ok");
-    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 2);
+    let err = client.complete(&req(), tx).await.unwrap_err();
+    assert!(matches!(err, vortex_llm::LlmError::Provider(503, _)));
+    assert_eq!(state.chat_calls.load(Ordering::SeqCst), 1);
 }
 
 /// C24 regression: a spec-compliant provider may split one JSON payload across
@@ -493,4 +528,83 @@ async fn video_on_auto_router_keeps_tool_wire_fields_and_omits_the_pdf_parser() 
             "role":"tool", "tool_call_id":"fixture-call", "content":"fixture result"
         })
     );
+}
+
+/// Plan step 5: the provider-reported model from completion chunks is
+/// captured on the response and may legitimately differ from the requested
+/// model (router aliases resolve server-side).
+#[tokio::test]
+async fn captures_provider_reported_serving_model() {
+    let sse = "data: {\"model\":\"provider/actually-served\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+               data: {\"model\":\"provider/actually-served\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n\
+               data: [DONE]\n\n";
+    let (base, _) = spawn_server(vec![MockResponse::Sse(sse.into())]).await;
+    let client = OpenRouterClient::new(&base, Some("test-key".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
+    // The request asks for "test/model" (see `req()`); the provider reports
+    // a different serving model and the response must carry the reported one.
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert_eq!(resp.model.as_deref(), Some("provider/actually-served"));
+    assert_eq!(resp.content, "Hi");
+    assert_eq!(resp.reported_completion_tokens, Some(3));
+}
+
+/// A stream that never reports a model stays honestly `None` — the serving
+/// model is never inferred from the request. Empty strings are ignored, the
+/// first non-empty report wins (a late chunk must not rewrite provenance),
+/// and oversized model strings are capped.
+#[tokio::test]
+async fn serving_model_is_never_inferred_first_wins_and_capped() {
+    // Never reported → None.
+    let sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n\
+               data: [DONE]\n\n";
+    let (base, _) = spawn_server(vec![MockResponse::Sse(sse.into())]).await;
+    let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert!(
+        resp.model.is_none(),
+        "missing provider model must stay None, got {:?}",
+        resp.model
+    );
+
+    // Empty then real then a hostile late rewrite → first non-empty wins.
+    let sse = "data: {\"model\":\"\",\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+               data: {\"model\":\"first/real\",\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+               data: {\"model\":\"late/rewrite\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+               data: [DONE]\n\n";
+    let (base, _) = spawn_server(vec![MockResponse::Sse(sse.into())]).await;
+    let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert_eq!(resp.content, "ab");
+    assert_eq!(resp.model.as_deref(), Some("first/real"));
+
+    // Oversized provider model string is capped, not persisted unbounded.
+    let long = "m".repeat(600);
+    let sse = format!(
+        "data: {{\"model\":\"{long}\",\"choices\":[{{\"delta\":{{\"content\":\"c\"}},\"finish_reason\":\"stop\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    );
+    let (base, _) = spawn_server(vec![MockResponse::Sse(sse)]).await;
+    let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert_eq!(resp.model.as_ref().map(|m| m.chars().count()), Some(256));
+}
+
+/// The serving model survives streams that end without a `[DONE]` marker
+/// (the flushed-tail path returns the same accumulated response).
+#[tokio::test]
+async fn serving_model_survives_stream_end_without_done() {
+    let sse = "data: {\"model\":\"provider/tail-served\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}],\"usage\":{\"prompt_tokens\":7}}\n\n";
+    let (base, _) = spawn_server(vec![MockResponse::Sse(sse.into())]).await;
+    let client = OpenRouterClient::new(&base, Some("k".into())).unwrap();
+    let (tx, _rx) = mpsc::channel::<LlmEvent>(64);
+    let resp = client.complete(&req(), tx).await.unwrap();
+    assert_eq!(resp.content, "partial");
+    assert_eq!(resp.model.as_deref(), Some("provider/tail-served"));
+    assert!(resp.finish_reason.is_empty());
+    assert_eq!(resp.reported_completion_tokens, None);
 }

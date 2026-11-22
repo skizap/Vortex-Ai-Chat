@@ -14,6 +14,7 @@ pub mod preview;
 pub mod preview_server;
 pub mod prompts;
 pub mod registry;
+pub mod routing;
 pub mod safe_http;
 pub mod scheduler;
 pub mod schema;

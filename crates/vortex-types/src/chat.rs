@@ -213,8 +213,14 @@ impl std::ops::Add for Usage {
     }
 }
 
-/// A model from the provider catalog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Preference constant for server-side Auto routing. Not a provider id: it is
+/// resolved to a concrete catalog model once per turn, before a run starts.
+/// Distinct from the provider's own `openrouter/auto` router alias, which is
+/// passed through unchanged like any pinned model.
+pub const VORTEX_AUTO_MODEL: &str = "vortex/auto";
+
+/// A model from the provider catalog. Display data only — never instructions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -224,16 +230,60 @@ pub struct ModelInfo {
     /// `Some(false)` means the catalog says the model does not support tool calling.
     #[serde(default)]
     pub supports_tools: Option<bool>,
+    /// USD per token (provider string form; unknown when None, never zero).
     #[serde(default)]
     pub pricing_prompt: Option<String>,
     #[serde(default)]
     pub pricing_completion: Option<String>,
+    /// Provider creation date (Unix seconds) when the catalog reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+    /// USD per request, when the provider charges a known request fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_request: Option<String>,
+    /// USD per image input, when the provider reports a per-image fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_image: Option<String>,
     /// Provider-declared input modalities (e.g. `text`, `image`, `video`).
     /// Empty when unknown; a nonempty list names the supported modalities.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_modalities: Vec<String>,
+    /// Advertised maximum completion tokens (`top_provider.max_completion_tokens`).
+    /// Provider-specific and not a guaranteed limit; `None` when unreported
+    /// (routers such as `openrouter/auto` have no known response limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u64>,
+    /// 1-based position in the provider's weekly token-usage ranking
+    /// (`sort=top-weekly`). Usage popularity, never quality. `None` when the
+    /// ranking is unavailable — clients must then omit popularity claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_rank: Option<u32>,
+    /// `Some(true)` only from the reviewed exact-ID open-weights mapping.
+    /// A Hugging Face id, brand name or free price alone never sets this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_weights: Option<bool>,
+    /// Publisher of the weights, from the reviewed mapping only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// License name from the reviewed mapping (e.g. `Apache-2.0`, `MIT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// Link to the license text or model card carrying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_url: Option<String>,
+    /// Link to the publisher's weights page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights_url: Option<String>,
+    /// Custom license terms beyond the standard license text, when flagged by
+    /// the reviewed mapping. Such models stay out of the recommended shortlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<String>,
+    /// Provider-reported date (YYYY-MM-DD) after which the model may be
+    /// removed; `None` when no expiration is reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_on: Option<String>,
 }
 
 #[cfg(test)]
@@ -325,24 +375,104 @@ mod tests {
         let m: ModelInfo = serde_json::from_str(json).unwrap();
         assert!(m.input_modalities.is_empty());
         assert!(m.output_modalities.is_empty());
+        assert!(m.created.is_none());
+        assert!(m.pricing_request.is_none());
+        assert!(m.pricing_image.is_none());
+        assert!(m.max_completion_tokens.is_none());
+        assert!(m.weekly_rank.is_none());
+        assert!(m.open_weights.is_none());
+        assert!(m.license.is_none());
+        assert!(m.restriction.is_none());
+        assert!(m.expires_on.is_none());
         let out = serde_json::to_string(&m).unwrap();
         assert!(!out.contains("input_modalities"));
+        assert!(!out.contains("created"));
+        assert!(!out.contains("pricing_request"));
+        assert!(!out.contains("max_completion_tokens"));
+        assert!(!out.contains("weekly_rank"));
+        assert!(!out.contains("open_weights"));
+        assert!(!out.contains("license"));
+        assert!(!out.contains("restriction"));
+        assert!(!out.contains("expires_on"));
     }
 
     #[test]
     fn model_info_modalities_roundtrip() {
         let m = ModelInfo {
             id: "x".into(),
-            name: String::new(),
-            context_length: None,
-            supports_tools: None,
-            pricing_prompt: None,
-            pricing_completion: None,
             input_modalities: vec!["text".into(), "image".into()],
             output_modalities: vec!["text".into()],
+            ..Default::default()
         };
         let back: ModelInfo = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.input_modalities, vec!["text", "image"]);
         assert_eq!(back.output_modalities, vec!["text"]);
+    }
+
+    #[test]
+    fn model_info_created_and_fee_details_roundtrip() {
+        let m = ModelInfo {
+            id: "google/gemini-x".into(),
+            name: "Gemini X".into(),
+            context_length: Some(1_000_000),
+            supports_tools: Some(true),
+            pricing_prompt: Some("0.0000004".into()),
+            pricing_completion: Some("0.0000012".into()),
+            created: Some(1_750_000_000),
+            pricing_request: Some("0.004".into()),
+            pricing_image: Some("0.0002".into()),
+            input_modalities: vec!["text".into(), "image".into(), "video".into()],
+            output_modalities: vec!["text".into()],
+            ..Default::default()
+        };
+        let back: ModelInfo = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.created, Some(1_750_000_000));
+        assert_eq!(back.pricing_request.as_deref(), Some("0.004"));
+        assert_eq!(back.pricing_image.as_deref(), Some("0.0002"));
+    }
+
+    /// Catalog provenance fields (rank, output limit, verified license data,
+    /// retirement date) survive the wire and stay absent when unknown.
+    #[test]
+    fn model_info_catalog_provenance_roundtrip() {
+        let m = ModelInfo {
+            id: "qwen/qwen3-32b".into(),
+            name: "Qwen3 32B".into(),
+            max_completion_tokens: Some(16_384),
+            weekly_rank: Some(7),
+            open_weights: Some(true),
+            publisher: Some("Alibaba Cloud Qwen Team".into()),
+            license: Some("Apache-2.0".into()),
+            license_url: Some("https://www.apache.org/licenses/LICENSE-2.0".into()),
+            weights_url: Some("https://huggingface.co/Qwen/Qwen3-32B".into()),
+            restriction: None,
+            expires_on: Some("2027-01-31".into()),
+            ..Default::default()
+        };
+        let back: ModelInfo = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.max_completion_tokens, Some(16_384));
+        assert_eq!(back.weekly_rank, Some(7));
+        assert_eq!(back.open_weights, Some(true));
+        assert_eq!(back.license.as_deref(), Some("Apache-2.0"));
+        assert!(back.restriction.is_none());
+        assert_eq!(back.expires_on.as_deref(), Some("2027-01-31"));
+
+        // Unmapped model: license provenance keys are omitted entirely, so a
+        // Hugging Face id or a free price can never masquerade as verified.
+        let plain = ModelInfo {
+            id: "vendor/unknown-lineage".into(),
+            weekly_rank: Some(3),
+            ..Default::default()
+        };
+        let out = serde_json::to_string(&plain).unwrap();
+        assert!(!out.contains("open_weights"));
+        assert!(!out.contains("license"));
+        assert!(out.contains("weekly_rank"));
+    }
+
+    #[test]
+    fn vortex_auto_constant_is_distinct_from_provider_alias() {
+        assert_eq!(VORTEX_AUTO_MODEL, "vortex/auto");
+        assert_ne!(VORTEX_AUTO_MODEL, "openrouter/auto");
     }
 }

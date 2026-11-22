@@ -123,6 +123,37 @@ pub enum RunError {
     Failed(String),
 }
 
+/// Classify an attachment into what hydration would materialize, so Auto
+/// estimates and eligibility share the media rules. `media_type` is optional:
+/// history refs classify by kind alone (conservative), current refs use the
+/// exact kind/MIME pair hydration uses.
+fn shape_for_kind(
+    kind: vortex_types::AttachmentKind,
+    media_type: Option<&str>,
+) -> crate::routing::AttachmentShape {
+    use crate::media_context::VisualInput;
+    use crate::routing::AttachmentShape;
+    use vortex_types::AttachmentKind;
+    if let Some(mime) = media_type {
+        return match VisualInput::for_meta(kind, mime) {
+            Some((VisualInput::Image, _)) => AttachmentShape::Image,
+            Some((VisualInput::Video, _)) => AttachmentShape::Video,
+            None => match kind {
+                AttachmentKind::Pdf => AttachmentShape::Pdf,
+                AttachmentKind::Text => AttachmentShape::Text,
+                // Unsupported image/video MIME: hydration sends a placeholder.
+                _ => AttachmentShape::Skipped,
+            },
+        };
+    }
+    match kind {
+        AttachmentKind::Image => AttachmentShape::Image,
+        AttachmentKind::Video => AttachmentShape::Video,
+        AttachmentKind::Pdf => AttachmentShape::Pdf,
+        AttachmentKind::Text => AttachmentShape::Text,
+    }
+}
+
 pub struct RunSpec {
     pub run_id: String,
     pub root_run_id: String,
@@ -140,10 +171,28 @@ pub struct RunSpec {
     pub needs_slot: bool,
 }
 
-/// Settings and model input support captured before accepting a turn.
+/// Settings and model input support captured before accepting a turn, plus
+/// the turn's resolved model. Resolution happens exactly once here (before
+/// the run is accepted); the resolved id then flows unchanged through engine
+/// iterations, delegates, and transport retries.
 pub struct ChatPreflight {
     settings: Settings,
     support: Option<MediaSupport>,
+    /// Concrete provider model id for this turn: the pinned preference passed
+    /// through, or the Auto-routed pick.
+    resolved_model: String,
+}
+
+/// Model catalog plus honest freshness metadata for `GET /api/models`.
+pub struct ModelsStatus {
+    /// `None` only on a cold start where no provider fetch ever succeeded.
+    pub models: Option<Arc<Vec<vortex_types::ModelInfo>>>,
+    /// Unix seconds of the last successful provider fetch.
+    pub fetched_at: Option<u64>,
+    /// True when the last refresh failed and last-known-good data is served.
+    pub stale: bool,
+    /// Presentable refresh failure reason, when stale/unavailable.
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -197,6 +246,21 @@ impl Engine {
         self.catalog.get(self.llm.as_ref()).await
     }
 
+    /// Catalog + freshness for `GET /api/models`: on refresh failure the
+    /// last-known-good catalog is reported as `stale` instead of vanishing.
+    pub async fn models_status(&self) -> ModelsStatus {
+        let snapshot = self.catalog.snapshot(self.llm.as_ref()).await;
+        ModelsStatus {
+            models: snapshot.models,
+            fetched_at: snapshot.fetched_at,
+            stale: snapshot.stale,
+            error: snapshot.error.map(|e| e.to_string()),
+        }
+    }
+
+    /// Legacy preflight (direct-engine callers and tests): the configured
+    /// model passes through verbatim — no Auto resolution, exactly the
+    /// historical behavior.
     pub async fn preflight_chat(
         &self,
         conversation_id: &str,
@@ -217,7 +281,196 @@ impl Engine {
             }
             None => None,
         };
-        Ok(ChatPreflight { settings, support })
+        let resolved_model = settings.model.clone();
+        Ok(ChatPreflight {
+            settings,
+            support,
+            resolved_model,
+        })
+    }
+
+    /// Preflight for the HTTP send/retry path: resolves the conversation's
+    /// model preference once per turn *before* the run is accepted. A pinned
+    /// id (including the provider's own `openrouter/auto` alias) passes
+    /// through unchanged; [`vortex_types::VORTEX_AUTO_MODEL`] is resolved
+    /// against a fresh catalog, or the turn is rejected with actionable
+    /// guidance — never a silent fallback to another (possibly paid) model.
+    /// Media preflight for the resolved model keeps its existing semantics
+    /// (unknown capabilities warn via the provider; known incompatibilities
+    /// are rejected before anything is persisted).
+    pub async fn preflight_chat_for_send(
+        &self,
+        conversation_id: &str,
+        mode: Mode,
+        model_pref: Option<&str>,
+        user_text: &str,
+        attachments: &[vortex_types::AttachmentRef],
+        history: &[vortex_types::StoredMessage],
+    ) -> Result<ChatPreflight, String> {
+        let settings = self.current_settings().await;
+        let effective = match model_pref.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(preference) => preference.to_string(),
+            None => settings.model.clone(),
+        };
+        let resolved_model = if effective == vortex_types::VORTEX_AUTO_MODEL {
+            self.resolve_auto_model(mode, &settings, user_text, attachments, history)
+                .await?
+        } else {
+            effective
+        };
+        let support = match &self.attachments {
+            Some(store) => media_context::preflight(
+                store,
+                &self.catalog,
+                self.llm.as_ref(),
+                &resolved_model,
+                conversation_id,
+                attachments,
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+            None => None,
+        };
+        Ok(ChatPreflight {
+            settings,
+            support,
+            resolved_model,
+        })
+    }
+
+    /// Vortex Auto resolution: requires a fresh catalog (a failed refresh or
+    /// stale last-known-good data is refused rather than priced from),
+    /// gathers the turn's requirements, and picks deterministically. Errors
+    /// are user-actionable: refresh the catalog or pin an explicit model;
+    /// the draft and attachments are untouched because this runs before any
+    /// persistence.
+    async fn resolve_auto_model(
+        &self,
+        mode: Mode,
+        settings: &Settings,
+        user_text: &str,
+        attachments: &[vortex_types::AttachmentRef],
+        history: &[vortex_types::StoredMessage],
+    ) -> Result<String, String> {
+        let snapshot = self.catalog.snapshot(self.llm.as_ref()).await;
+        if snapshot.models.is_none() || snapshot.stale {
+            let reason = snapshot
+                .error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no catalog available".to_string());
+            return Err(format!(
+                "Vortex Auto could not use a fresh model catalog ({reason}). Refresh the model \
+                 list, or choose an explicit model for this conversation. Your draft and \
+                 attachments were kept; nothing was sent."
+            ));
+        }
+        let models = snapshot.models.expect("checked above");
+        let requirements = self
+            .auto_requirements(mode, settings, user_text, attachments, history)
+            .await;
+        crate::routing::resolve_auto(&models, &requirements).ok_or_else(|| {
+            format!(
+                "Vortex Auto found no model among {} catalog entries that verifiably supports \
+                 this turn (input types, tool calling, context window) with published pricing. \
+                 Choose an explicit model for this conversation, or adjust the request. Missing \
+                 prices are never assumed free; nothing was sent.",
+                models.len()
+            )
+        })
+    }
+
+    /// Gather what the turn actually sends: system prompt + tool schemas for
+    /// the mode, the user text, applicable history (same 40-turn window and
+    /// recent-attachment rules as hydration), and every current attachment.
+    async fn auto_requirements(
+        &self,
+        mode: Mode,
+        settings: &Settings,
+        user_text: &str,
+        attachments: &[vortex_types::AttachmentRef],
+        history: &[vortex_types::StoredMessage],
+    ) -> crate::routing::AutoRequirements {
+        use crate::routing::{attachment_tokens, estimate_text_tokens, AttachmentShape};
+
+        let allowed = allowed_for_mode(mode, settings, self.browser.is_available());
+        let tools = self.registry.schemas(&allowed);
+        let system = crate::prompts::coordinator_system_prompt(mode, settings);
+        let mut est: u64 = estimate_text_tokens(system.len() as u64)
+            .saturating_add(estimate_text_tokens(user_text.len() as u64))
+            .saturating_add(
+                tools
+                    .iter()
+                    .map(|t| estimate_text_tokens(vortex_llm::llm::json_size(t) as u64))
+                    .sum(),
+            );
+
+        // Applicable history: the same bounded window the run loop rebuilds,
+        // with attachment estimates limited to the recent turns hydration
+        // would actually materialize.
+        let window = &history[history.len().saturating_sub(40)..];
+        let mut recent_user_turns = 0usize;
+        let mut needs_image = false;
+        let mut needs_video = false;
+        let mut image_count = 0u32;
+        for message in window.iter().rev() {
+            if !matches!(
+                message.role,
+                vortex_types::Role::User | vortex_types::Role::Assistant
+            ) {
+                continue;
+            }
+            est = est.saturating_add(estimate_text_tokens(message.content.len() as u64));
+            if message.role == vortex_types::Role::User && !message.attachments.is_empty() {
+                recent_user_turns += 1;
+                if recent_user_turns <= media_context::HISTORY_ATTACHMENT_TURNS {
+                    for reference in &message.attachments {
+                        let shape = shape_for_kind(reference.kind, Some(&reference.media_type));
+                        match shape {
+                            AttachmentShape::Image => {
+                                needs_image = true;
+                                image_count = image_count.saturating_add(1);
+                            }
+                            AttachmentShape::Video => needs_video = true,
+                            _ => {}
+                        }
+                        est = est.saturating_add(attachment_tokens(shape, None));
+                    }
+                }
+            }
+        }
+
+        // Current attachments drive modality requirements and per-image fees;
+        // sizes come from the store when available for sharper estimates.
+        for reference in attachments {
+            let size = match &self.attachments {
+                Some(store) => store
+                    .get_meta(&reference.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|m| m.size_bytes),
+                None => None,
+            };
+            let shape = shape_for_kind(reference.kind, Some(reference.media_type.as_str()));
+            match shape {
+                AttachmentShape::Image => {
+                    needs_image = true;
+                    image_count = image_count.saturating_add(1);
+                }
+                AttachmentShape::Video => needs_video = true,
+                _ => {}
+            }
+            est = est.saturating_add(attachment_tokens(shape, size));
+        }
+
+        crate::routing::AutoRequirements {
+            needs_image,
+            needs_video,
+            needs_tools: !tools.is_empty(),
+            image_count,
+            est_input_tokens: est,
+            output_allowance: u64::from(settings.max_tokens),
+        }
     }
 
     pub async fn update_settings(&self, settings: Settings) {
@@ -238,6 +491,7 @@ impl Engine {
             root_run_id: spec.root_run_id.clone(),
             depth: spec.depth,
             settings: spec.settings.clone(),
+            model: spec.model.clone(),
             allowed: spec.allowed.clone(),
             events: tx,
             cancel: spec.cancel.clone(),
@@ -365,7 +619,7 @@ impl Engine {
                     .meta
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (Some(m.usage), Some(m.plan.clone()))
+                (m.usage, Some(m.plan.clone()))
             }
             None => (None, None),
         };
@@ -387,7 +641,33 @@ impl Engine {
         }
     }
 
+    /// Persist (once per run) that a provider call in this run never reported
+    /// usage: the run's totals stay permanently partial even when other calls
+    /// do report usage.
+    async fn record_usage_gap(&self, run_id: &str, recorded: &mut bool) {
+        if *recorded {
+            return;
+        }
+        *recorded = true;
+        if self
+            .db
+            .mark_run_usage_incomplete(run_id.to_string())
+            .await
+            .is_err()
+        {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::DB_PERSIST_FAILED,
+                &[
+                    ("op", diag::Field::Static("run_usage_incomplete")),
+                    ("run_id", diag::Field::Uuid(run_id)),
+                ],
+            );
+        }
+    }
+
     async fn finish(&self, run_id: &str, status: RunStatus, error: Option<String>) {
+        self.persist_status(run_id, status, error.clone()).await;
         self.hub.set_status(run_id, status);
         self.hub.publish(
             run_id,
@@ -414,7 +694,6 @@ impl Engine {
                 &[("run_id", diag::Field::Uuid(run_id))],
             );
         }
-        self.persist_status(run_id, status, None).await;
     }
 
     /// Start a new main (coordinator) run and return its id immediately.
@@ -427,9 +706,14 @@ impl Engine {
         user_message: &str,
         user_attachments: Vec<vortex_types::AttachmentRef>,
     ) -> String {
+        let settings = self.current_settings().await;
+        // Legacy direct-engine path: the configured model is used verbatim
+        // (no Auto resolution); HTTP sends go through `preflight_chat_for_send`.
+        let resolved_model = settings.model.clone();
         let preflight = ChatPreflight {
-            settings: self.current_settings().await,
+            settings,
             support: None,
+            resolved_model,
         };
         let mut user = ChatMessage::user(user_message);
         user.attachments = user_attachments;
@@ -478,7 +762,11 @@ impl Engine {
         user: ChatMessage,
         preflight: ChatPreflight,
     ) -> String {
-        let ChatPreflight { settings, support } = preflight;
+        let ChatPreflight {
+            settings,
+            support,
+            resolved_model,
+        } = preflight;
         let run_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
         let allowed = allowed_for_mode(mode, &settings, self.browser.is_available());
@@ -509,7 +797,9 @@ impl Engine {
             depth: 0,
             allowed,
             messages,
-            model: settings.model.clone(),
+            // The once-per-turn resolved model id (pinned pass-through or the
+            // Auto pick); it flows unchanged through every engine iteration.
+            model: resolved_model,
             settings,
             cancel,
             is_root: true,
@@ -604,6 +894,9 @@ impl Engine {
         let settings = spec.settings.clone();
         let mut messages = spec.messages.clone();
         let mut total_usage = Usage::default();
+        // Set once when a completion reported no usage: that gap makes the
+        // run's totals permanently partial, so it is persisted exactly once.
+        let mut usage_gap_recorded = false;
         let tools_schema = self.registry.schemas(&spec.allowed);
         let mut media = MediaContext {
             store: ctx.attachments.as_deref(),
@@ -644,6 +937,7 @@ impl Engine {
                 pdf_engine: Some(pdfs.parser()),
                 assistant_annotations: Default::default(),
             };
+            let requested_output_limit = req.max_tokens;
             let sent_pdfs = tokio::select! {
                 biased;
                 _ = spec.cancel.cancelled() => return Err(RunError::Cancelled),
@@ -698,6 +992,14 @@ impl Engine {
                                 fields.push(("status", diag::Field::Num(u64::from(code))));
                             }
                             diag::event(tracing::Level::ERROR, diag::RUN_PROVIDER_FAILED, &fields);
+                            // The failed completion was in flight and never
+                            // reported usage; any tokens it consumed stay
+                            // unaccounted. A missing key fails before any
+                            // request is sent, so it is not a usage gap.
+                            if !matches!(e, vortex_llm::LlmError::NotConfigured) {
+                                self.record_usage_gap(&run_id, &mut usage_gap_recorded)
+                                    .await;
+                            }
                         }
                         inner.map_err(|e| RunError::Failed(e.to_string()))
                     }
@@ -715,6 +1017,10 @@ impl Engine {
                                 ("cancelled", diag::Field::Flag(e.is_cancelled())),
                             ],
                         );
+                        // The provider task died mid-completion: in flight,
+                        // usage never reported.
+                        self.record_usage_gap(&run_id, &mut usage_gap_recorded)
+                            .await;
                         return Err(RunError::Failed(format!("provider task failed: {e}")));
                     }
                 },
@@ -724,6 +1030,9 @@ impl Engine {
                     // (and billing) the stream after cancellation.
                     call.abort();
                     fwd.abort();
+                    // The aborted completion was in flight; any tokens it had
+                    // already consumed were never reported.
+                    self.record_usage_gap(&run_id, &mut usage_gap_recorded).await;
                     return Err(RunError::Cancelled);
                 }
                 _ = tokio::time::sleep_until(deadline) => {
@@ -734,6 +1043,9 @@ impl Engine {
                         diag::RUN_DEADLINE_EXCEEDED,
                         &[("run_id", diag::Field::Uuid(run_id.as_str()))],
                     );
+                    // Same as cancellation: the deadline hit an in-flight
+                    // completion whose usage was never reported.
+                    self.record_usage_gap(&run_id, &mut usage_gap_recorded).await;
                     return Err(RunError::Failed("run time budget exceeded".into()));
                 }
             };
@@ -751,7 +1063,7 @@ impl Engine {
                     h.meta
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .usage = total_usage;
+                        .usage = Some(total_usage);
                 }
                 self.hub.publish(
                     &run_id,
@@ -780,6 +1092,11 @@ impl Engine {
                         ],
                     );
                 }
+            } else {
+                // A completion that never reported usage: the run's totals
+                // are partial from here on, even if later calls report usage.
+                self.record_usage_gap(&run_id, &mut usage_gap_recorded)
+                    .await;
             }
 
             // Normalize provider tool-call ids once, before anything consumes
@@ -794,6 +1111,19 @@ impl Engine {
                     tc.id = uuid::Uuid::new_v4().to_string();
                 }
             }
+            // A length-limited stream may contain incomplete tool arguments.
+            // Keep any visible text, but never execute calls from that response.
+            use vortex_types::dto::{ReplyFinish, ReplySummary};
+            let finish = match resp.finish_reason.trim() {
+                "stop" => ReplyFinish::Stop,
+                "length" => ReplyFinish::Length,
+                "content_filter" => ReplyFinish::ContentFilter,
+                "error" => ReplyFinish::Error,
+                "" => ReplyFinish::NotReported,
+                _ => ReplyFinish::Other,
+            };
+            let output_limited = finish == ReplyFinish::Length;
+            let provider_error = finish == ReplyFinish::Error;
 
             messages.push(ChatMessage {
                 role: vortex_types::Role::Assistant,
@@ -805,12 +1135,31 @@ impl Engine {
                 parts: None,
             });
 
-            if tool_calls.is_empty() {
+            if tool_calls.is_empty()
+                || output_limited
+                || provider_error
+                || finish == ReplyFinish::ContentFilter
+            {
                 if spec.is_root {
                     if let Some(conv) = &spec.conversation_id {
+                        // Persist model provenance with the reply: the run
+                        // that produced it, the requested model, and the
+                        // provider-reported serving model (None when the
+                        // provider never reported one — never inferred).
                         let persisted = self
                             .db
-                            .add_message(conv.clone(), ChatMessage::assistant(resp.content.clone()))
+                            .add_message_with_reply(
+                                conv.clone(),
+                                ChatMessage::assistant(resp.content.clone()),
+                                Some(run_id.clone()),
+                                Some(spec.model.clone()),
+                                resp.model.clone(),
+                                Some(ReplySummary {
+                                    finish,
+                                    requested_output_tokens: requested_output_limit,
+                                    completion_tokens: resp.reported_completion_tokens,
+                                }),
+                            )
                             .await;
                         if let Ok(assistant_id) = persisted {
                             let save = pdfs.persist(&media, assistant_id, annotations);
@@ -844,6 +1193,16 @@ impl Engine {
                             );
                         }
                     }
+                }
+                if output_limited {
+                    return Err(RunError::Failed(format!(
+                        "The model stopped at its output limit (Vortex requested up to {requested_output_limit} output tokens). Any returned text was saved. Continue in a new message, raise Settings > Max output tokens, or choose a model with a higher output limit."
+                    )));
+                }
+                if provider_error {
+                    return Err(RunError::Failed(
+                        "The provider reported a generation error.".into(),
+                    ));
                 }
                 return Ok(resp.content);
             }
@@ -1087,7 +1446,10 @@ impl Engine {
             depth: parent.depth + 1,
             allowed,
             messages,
-            model: settings.model.clone(),
+            // Delegates inherit the parent run's resolved model verbatim —
+            // never `settings.model` — so one Auto resolution covers the
+            // whole run tree.
+            model: parent.model.clone(),
             settings,
             cancel,
             is_root: false,

@@ -19,8 +19,8 @@ use vortex_types::{
 };
 
 const MEDIA_BUDGET: usize = 32 * 1024 * 1024;
-const TEXT_LIMIT: usize = 200_000;
-const HISTORY_ATTACHMENT_TURNS: usize = 4;
+pub(crate) const TEXT_LIMIT: usize = 200_000;
+pub(crate) const HISTORY_ATTACHMENT_TURNS: usize = 4;
 const CATALOG_TIMEOUT_SECS: u64 = 5;
 const CATALOG_SUCCESS_TTL: Duration = Duration::from_secs(300);
 const CATALOG_FAILURE_TTL: Duration = Duration::from_secs(15);
@@ -35,15 +35,44 @@ pub(crate) struct MediaSupport {
 
 type CatalogResult = Result<Arc<Vec<ModelInfo>>, LlmError>;
 
+/// One catalog lookup plus honest freshness metadata. `stale` means the last
+/// provider refresh failed and `models`/`fetched_at` describe the
+/// last-known-good catalog; `models: None` is a cold start with no data.
+pub(crate) struct CatalogSnapshot {
+    pub(crate) models: Option<Arc<Vec<ModelInfo>>>,
+    /// Unix seconds of the last successful provider fetch.
+    pub(crate) fetched_at: Option<u64>,
+    pub(crate) stale: bool,
+    pub(crate) error: Option<LlmError>,
+}
+
 #[derive(Default)]
-pub(crate) struct ModelCatalog(Mutex<Option<(Instant, CatalogResult)>>);
+struct CatalogCache {
+    /// TTL'd entry (success or failure) collapsing concurrent refreshes.
+    entry: Option<(Instant, CatalogResult)>,
+    /// Last-known-good catalog, kept across refresh failures so the UI can
+    /// show stale data instead of an empty state.
+    last_good: Option<Arc<Vec<ModelInfo>>>,
+    /// Wall-clock Unix seconds of the `last_good` fetch.
+    last_good_at: Option<u64>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Default)]
+pub(crate) struct ModelCatalog(Mutex<CatalogCache>);
 
 impl ModelCatalog {
     pub(crate) async fn get(&self, llm: &dyn LlmClient) -> CatalogResult {
         // One in-flight refresh. Both success and failure are cached briefly
         // enough to collapse concurrent refreshes during a provider outage.
-        let mut entry = self.0.lock().await;
-        if let Some((until, result)) = entry.as_ref() {
+        let mut cache = self.0.lock().await;
+        if let Some((until, result)) = cache.entry.as_ref() {
             if *until > Instant::now() {
                 return result.clone();
             }
@@ -57,8 +86,41 @@ impl ModelCatalog {
         } else {
             CATALOG_FAILURE_TTL
         };
-        *entry = Some((Instant::now() + ttl, result.clone()));
+        if let Ok(models) = &result {
+            cache.last_good = Some(models.clone());
+            cache.last_good_at = Some(unix_now());
+        }
+        cache.entry = Some((Instant::now() + ttl, result.clone()));
         result
+    }
+
+    /// [`ModelCatalog::get`] plus freshness metadata: a failed refresh with a
+    /// last-known-good catalog degrades to `stale` data instead of an error.
+    pub(crate) async fn snapshot(&self, llm: &dyn LlmClient) -> CatalogSnapshot {
+        let result = self.get(llm).await;
+        let cache = self.0.lock().await;
+        match result {
+            Ok(models) => CatalogSnapshot {
+                models: Some(models),
+                fetched_at: cache.last_good_at,
+                stale: false,
+                error: None,
+            },
+            Err(error) => match &cache.last_good {
+                Some(models) => CatalogSnapshot {
+                    models: Some(models.clone()),
+                    fetched_at: cache.last_good_at,
+                    stale: true,
+                    error: Some(error),
+                },
+                None => CatalogSnapshot {
+                    models: None,
+                    fetched_at: None,
+                    stale: false,
+                    error: Some(error),
+                },
+            },
+        }
     }
 
     async fn media_support(&self, llm: &dyn LlmClient, model: &str) -> MediaSupport {
@@ -97,15 +159,18 @@ fn pdf_wire_name(meta: &AttachmentInfo) -> String {
 }
 
 #[derive(Clone, Copy)]
-enum VisualInput {
+pub(crate) enum VisualInput {
     Image,
     Video,
 }
 
 impl VisualInput {
-    fn for_attachment(meta: &AttachmentInfo) -> Option<(Self, &str)> {
-        let mime = meta.media_type.as_str();
-        match (meta.kind, mime) {
+    /// The visual wire input for an attachment kind/MIME pair, plus the MIME
+    /// to put on the wire. Shared with Auto routing so eligibility checks and
+    /// hydration always agree on what counts as image/video input.
+    pub(crate) fn for_meta(kind: AttachmentKind, media_type: &str) -> Option<(Self, &str)> {
+        let mime = media_type;
+        match (kind, mime) {
             (AttachmentKind::Image, "image/png" | "image/jpeg" | "image/webp" | "image/gif") => {
                 Some((Self::Image, mime))
             }
@@ -174,7 +239,7 @@ impl Payload {
             text.push_str("[END UNTRUSTED FILE]");
             return Ok(Self::Text(ContentPart::Text { text }));
         }
-        let part = match VisualInput::for_attachment(meta) {
+        let part = match VisualInput::for_meta(meta.kind, &meta.media_type) {
             Some((VisualInput::Image, mime)) => ContentPart::ImageUrl {
                 image_url: ImageUrlContent {
                     url: format!("data:{mime};base64,"),
@@ -257,7 +322,7 @@ pub(crate) async fn preflight(
     let mut size: usize = 0;
     for reference in refs {
         if let Some(meta) = owned_meta(store, conversation, reference).await {
-            if let Some((input, _)) = VisualInput::for_attachment(&meta) {
+            if let Some((input, _)) = VisualInput::for_meta(meta.kind, &meta.media_type) {
                 if !media.allows(input).await {
                     return Err(input.switch_model_hint());
                 }
@@ -370,7 +435,7 @@ impl MediaContext<'_> {
         let Some(meta) = owned_meta(store, conversation, reference).await else {
             return Ok(Err("file unavailable"));
         };
-        if let Some((input, _)) = VisualInput::for_attachment(&meta) {
+        if let Some((input, _)) = VisualInput::for_meta(meta.kind, &meta.media_type) {
             if !self.allows(input).await {
                 return if current {
                     Err(input.switch_model_hint())

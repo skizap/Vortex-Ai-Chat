@@ -42,7 +42,9 @@ impl LlmClient for Capture {
             tool_calls: vec![],
             usage: None,
             finish_reason: "stop".into(),
+            reported_completion_tokens: None,
             annotations,
+            model: None,
         })
     }
 

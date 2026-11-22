@@ -165,9 +165,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model: "openrouter/auto".into(),
+            // Fresh installs default to Vortex Auto (server-side routing).
+            // Upgraded installs keep their saved blob verbatim, so an explicit
+            // past choice — including the distinct `openrouter/auto` provider
+            // alias — is preserved.
+            model: crate::chat::VORTEX_AUTO_MODEL.into(),
             temperature: 0.7,
-            max_tokens: 4096,
+            max_tokens: 16_384,
             theme: Theme::Dark,
             default_mode: Mode::Chat,
             workspace: None,
@@ -184,6 +188,17 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_model_is_vortex_auto_and_explicit_choices_survive() {
+        assert_eq!(Settings::default().model, crate::chat::VORTEX_AUTO_MODEL);
+        // Upgrade path: a stored blob with an explicit model keeps it verbatim;
+        // the provider alias is never rewritten to Vortex Auto.
+        let s: Settings = serde_json::from_str(r#"{"model":"openrouter/auto"}"#).unwrap();
+        assert_eq!(s.model, "openrouter/auto");
+        let s: Settings = serde_json::from_str(r#"{"model":"anthropic/claude-sonnet-4"}"#).unwrap();
+        assert_eq!(s.model, "anthropic/claude-sonnet-4");
+    }
 
     #[test]
     fn old_settings_payload_defaults_media() {

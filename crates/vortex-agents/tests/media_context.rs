@@ -103,7 +103,9 @@ impl LlmClient for CaptureLlm {
                 total_tokens: 2,
             }),
             finish_reason: "stop".into(),
+            reported_completion_tokens: None,
             annotations: None,
+            model: None,
         })
     }
 
@@ -128,8 +130,12 @@ fn model_info(id: &str, inputs: &[&str]) -> ModelInfo {
         supports_tools: None,
         pricing_prompt: None,
         pricing_completion: None,
+        created: None,
+        pricing_request: None,
+        pricing_image: None,
         input_modalities: inputs.iter().map(|s| (*s).to_string()).collect(),
         output_modalities: vec!["text".into()],
+        ..ModelInfo::default()
     }
 }
 

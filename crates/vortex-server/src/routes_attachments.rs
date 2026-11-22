@@ -1132,12 +1132,26 @@ mod route_tests {
             _events: tokio::sync::mpsc::Sender<LlmEvent>,
         ) -> Result<CompletionResponse, vortex_llm::LlmError> {
             self.captured.lock().await.push(req.clone());
+            if req
+                .messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == vortex_types::Role::User)
+                .is_some_and(|msg| msg.content == "Reject this context fixture")
+            {
+                return Err(vortex_llm::LlmError::Provider(
+                    400,
+                    "context window exceeded".into(),
+                ));
+            }
             Ok(CompletionResponse {
                 content: "ok".into(),
                 tool_calls: Vec::new(),
                 usage: None,
                 finish_reason: "stop".into(),
+                reported_completion_tokens: None,
                 annotations: None,
+                model: None,
             })
         }
 
@@ -1179,8 +1193,12 @@ mod route_tests {
             supports_tools: Some(true),
             pricing_prompt: None,
             pricing_completion: None,
+            created: None,
+            pricing_request: None,
+            pricing_image: None,
             input_modalities: inputs.iter().map(|s| s.to_string()).collect(),
             output_modalities: vec!["text".into()],
+            ..ModelInfo::default()
         }
     }
 
@@ -1227,6 +1245,159 @@ mod route_tests {
         let (status, body) = post_chat(base, conv, dto).await;
         assert_eq!(status, 200, "chat start failed: {body}");
         body["run_id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn chat_beyond_history_window_preserves_replies_and_accepts_continuation() {
+        let (client, handles) = capture_llm(Vec::new(), false);
+        let (base, state, _dir) = test_app_with_llm(client, Some("test/model"), None).await;
+        let conv = new_conversation(&state).await;
+        for i in 0..42 {
+            let content = if i == 41 {
+                "Continue from where you left off.".into()
+            } else {
+                format!("Turn marker {i}")
+            };
+            let id = start_run(
+                &base,
+                &conv,
+                &ChatRequestDto {
+                    content,
+                    mode: Some(Mode::Chat),
+                    attachment_ids: Vec::new(),
+                },
+            )
+            .await;
+            wait_for_run_completed(&state, &id).await;
+        }
+        let stored = reqwest::get(format!("{base}/api/conversations/{conv}/messages"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Vec<vortex_types::StoredMessage>>()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 84);
+        assert_eq!(stored[0].content, "Turn marker 0");
+        let summary = stored.last().unwrap().reply_summary.as_ref().unwrap();
+        assert_eq!(summary.finish, vortex_types::dto::ReplyFinish::Stop);
+        assert_eq!(summary.completion_tokens, None);
+        let requests = handles.captured.lock().await;
+        let last = requests.last().unwrap();
+        assert!(!last
+            .messages
+            .iter()
+            .any(|msg| msg.content == "Turn marker 0"));
+        assert!(last
+            .messages
+            .iter()
+            .any(|msg| msg.content == "Continue from where you left off."));
+    }
+
+    #[tokio::test]
+    async fn provider_context_rejection_is_not_an_output_limit_reply() {
+        let (client, _) = capture_llm(Vec::new(), false);
+        let (base, state, _dir) = test_app_with_llm(client, Some("test/model"), None).await;
+        let conv = new_conversation(&state).await;
+        let turn = |content: &str| ChatRequestDto {
+            content: content.into(),
+            mode: Some(Mode::Chat),
+            attachment_ids: Vec::new(),
+        };
+        let id = start_run(&base, &conv, &turn("Reject this context fixture")).await;
+        let run = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(run) = state.db.get_run(id.clone()).await.unwrap() {
+                    if run.status.is_terminal() {
+                        break run;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(run.error.unwrap().contains("context window exceeded"));
+        assert_eq!(state.db.get_messages(conv.clone()).await.unwrap().len(), 1);
+        let next = start_run(&base, &conv, &turn("Try a shorter request")).await;
+        wait_for_run_completed(&state, &next).await;
+    }
+
+    #[tokio::test]
+    async fn saving_model_default_preserves_existing_chat_preference() {
+        let (llm, _) = capture_llm(Vec::new(), false);
+        let (base, _, _dir) = test_app_with_llm(llm, Some("test/original"), None).await;
+        let client = reqwest::Client::new();
+        let create = || async {
+            client
+                .post(format!("{base}/api/conversations"))
+                .json(&serde_json::json!({"mode": "chat", "title": "Pin test"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<vortex_types::ConversationSummary>()
+                .await
+                .unwrap()
+        };
+        let before = create().await;
+        let mut settings = client
+            .get(format!("{base}/api/settings"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<vortex_types::Settings>()
+            .await
+            .unwrap();
+        settings.model = "test/new-default".into();
+        client
+            .put(format!("{base}/api/settings"))
+            .json(&settings)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let after = create().await;
+        let chat_model = |id: &str| format!("{base}/api/conversations/{id}/model");
+        assert_eq!(after.model.as_deref(), Some("test/new-default"));
+        let get_model = |url| async {
+            client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            get_model(chat_model(&before.id)).await["model"],
+            "test/original"
+        );
+        client
+            .patch(chat_model(&before.id))
+            .json(&serde_json::json!({"model": "test/override"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(
+            get_model(chat_model(&before.id)).await["model"],
+            "test/override"
+        );
+        assert_eq!(
+            get_model(chat_model(&after.id)).await["model"],
+            "test/new-default"
+        );
     }
 
     async fn post_retry(base: &str, run_id: &str) -> (StatusCode, serde_json::Value) {
@@ -1313,7 +1484,7 @@ mod route_tests {
             vec![model_info("openrouter/auto", &["text", "image", "video"])],
             false,
         );
-        let (base, state, _dir) = test_app_with_llm(llm, None, None).await;
+        let (base, state, _dir) = test_app_with_llm(llm, Some("openrouter/auto"), None).await;
         let conv = new_conversation(&state).await;
         let mut ids = Vec::new();
         for (name, mime, _, bytes) in VIDEO_HEADERS {

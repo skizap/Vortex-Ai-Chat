@@ -2,26 +2,69 @@
 
 use crate::db::{now, Db};
 use crate::error::Result;
-use vortex_types::{AttachmentRef, ChatMessage, Role, Settings, StoredMessage, ToolCall};
+use vortex_types::{
+    dto::ReplySummary, AttachmentRef, ChatMessage, Role, Settings, StoredMessage, ToolCall,
+};
 
 impl Db {
     // ---- messages ---------------------------------------------------------
 
     pub async fn add_message(&self, conversation_id: String, msg: ChatMessage) -> Result<i64> {
+        self.add_message_with_provenance(conversation_id, msg, None, None, None)
+            .await
+    }
+
+    /// Persist a message with optional model provenance: the run that
+    /// produced it, the model id sent to the provider, and the
+    /// provider-reported model that actually answered. Used for assistant
+    /// replies; all three stay NULL for messages without provenance.
+    pub async fn add_message_with_provenance(
+        &self,
+        conversation_id: String,
+        msg: ChatMessage,
+        run_id: Option<String>,
+        requested_model: Option<String>,
+        serving_model: Option<String>,
+    ) -> Result<i64> {
+        self.add_message_with_reply(
+            conversation_id,
+            msg,
+            run_id,
+            requested_model,
+            serving_model,
+            None,
+        )
+        .await
+    }
+
+    /// Write the reply diagnostics atomically with the text and its provenance.
+    pub async fn add_message_with_reply(
+        &self,
+        conversation_id: String,
+        msg: ChatMessage,
+        run_id: Option<String>,
+        requested_model: Option<String>,
+        serving_model: Option<String>,
+        reply_summary: Option<ReplySummary>,
+    ) -> Result<i64> {
         self.with_conn(move |c| {
             let tool_calls = serde_json::to_string(&msg.tool_calls).unwrap_or_else(|_| "[]".into());
             let attachments =
                 serde_json::to_string(&msg.attachments).unwrap_or_else(|_| "[]".into());
             c.execute(
-                "INSERT INTO messages (conversation_id, role, content, tool_calls, attachments, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO messages (conversation_id, role, content, tool_calls, attachments, created_at, run_id, requested_model, serving_model, reply_summary)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     conversation_id,
                     msg.role.as_str(),
                     msg.content,
                     tool_calls,
                     attachments,
-                    now()
+                    now(),
+                    run_id,
+                    requested_model,
+                    serving_model,
+                    reply_summary.map(|summary| serde_json::json!(summary).to_string()),
                 ],
             )?;
             Ok(c.last_insert_rowid())
@@ -32,7 +75,8 @@ impl Db {
     pub async fn get_messages(&self, conversation_id: String) -> Result<Vec<StoredMessage>> {
         self.with_conn(move |c| {
             let mut st = c.prepare(
-                "SELECT id, role, content, tool_calls, attachments, created_at
+                "SELECT id, role, content, tool_calls, attachments, created_at,
+                        run_id, requested_model, serving_model, reply_summary
                      FROM messages WHERE conversation_id = ?1 ORDER BY id",
             )?;
             let rows = st
@@ -49,6 +93,12 @@ impl Db {
                         attachments: serde_json::from_str::<Vec<AttachmentRef>>(&att)
                             .unwrap_or_default(),
                         created_at: r.get(5)?,
+                        run_id: r.get(6)?,
+                        requested_model: r.get(7)?,
+                        serving_model: r.get(8)?,
+                        reply_summary: r
+                            .get::<_, Option<String>>(9)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -197,5 +247,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(backup, "{not valid json", "corrupt blob is preserved");
+    }
+
+    #[tokio::test]
+    async fn message_provenance_roundtrip_and_legacy_nulls() {
+        let (db, _dir) = test_db();
+        let c = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+        // Plain path (user messages): no provenance.
+        db.add_message(c.id.clone(), ChatMessage::user("q"))
+            .await
+            .unwrap();
+        // Full provenance: run id, requested model, provider-reported model.
+        db.add_message_with_provenance(
+            c.id.clone(),
+            ChatMessage::assistant("a"),
+            Some("00000000-0000-4000-8000-0000000000a1".into()),
+            Some("requested/model".into()),
+            Some("provider/served".into()),
+        )
+        .await
+        .unwrap();
+        // Provider never reported a serving model: stays NULL, not inferred.
+        db.add_message_with_provenance(
+            c.id.clone(),
+            ChatMessage::assistant("b"),
+            Some("00000000-0000-4000-8000-0000000000a1".into()),
+            Some("requested/model".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let msgs = db.get_messages(c.id.clone()).await.unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[0].run_id.is_none());
+        assert!(msgs[0].requested_model.is_none());
+        assert!(msgs[0].serving_model.is_none());
+        assert_eq!(
+            msgs[1].run_id.as_deref(),
+            Some("00000000-0000-4000-8000-0000000000a1")
+        );
+        assert_eq!(msgs[1].requested_model.as_deref(), Some("requested/model"));
+        assert_eq!(msgs[1].serving_model.as_deref(), Some("provider/served"));
+        assert_eq!(msgs[2].requested_model.as_deref(), Some("requested/model"));
+        assert!(
+            msgs[2].serving_model.is_none(),
+            "unreported serving model stays null"
+        );
     }
 }

@@ -6,6 +6,7 @@ use crate::state::{AppCtx, UploadChip, UploadState};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use vortex_types::chat::MAX_ATTACHMENT_UPLOAD_BYTES;
+use vortex_types::dto::ReplyFinish;
 use vortex_types::{
     AttachmentInfo, AttachmentKind, AttachmentRef, AttachmentStatus, ChatRequestDto, Role,
     RunStatus, StoredMessage,
@@ -14,12 +15,26 @@ use vortex_types::{
 #[component]
 pub fn ChatView() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
-    let input = RwSignal::new(String::new());
+    let input = move || {
+        ctx.current
+            .get()
+            .and_then(|id| ctx.chat_drafts.with(|drafts| drafts.get(&id).cloned()))
+            .unwrap_or_default()
+    };
+    let blocked = move || {
+        ctx.chat_sending.get() || ctx.model_saving.get() || turn_active(ctx.run_status.get())
+    };
     let file_input: NodeRef<leptos::html::Input> = NodeRef::new();
 
     // Shared submit path for the Send button and Enter key.
     let submit = move || {
-        let text = input.get_untracked();
+        if untrack(blocked) {
+            return;
+        }
+        let Some(id) = ctx.current.get_untracked() else {
+            return;
+        };
+        let text = untrack(input);
         let chips = ctx.pending_attachments.get_untracked();
         if chips
             .iter()
@@ -44,11 +59,26 @@ pub fn ChatView() -> impl IntoView {
         if text.trim().is_empty() && ready.is_empty() {
             return;
         }
-        input.set(String::new());
-        ctx.pending_attachments.set(Vec::new());
+        ctx.chat_sending.set(true);
         let mode = ctx.mode.get_untracked();
         spawn_local(async move {
-            crate::chat::send_message(ctx, text, mode, ready).await;
+            let accepted = send_message(ctx, &id, text.clone(), mode, ready).await;
+            if accepted {
+                ctx.chat_drafts.update(|drafts| {
+                    if drafts.get(&id) == Some(&text) {
+                        drafts.remove(&id);
+                    }
+                });
+                ctx.update_attachment_draft(&id, |pending| {
+                    pending.retain(|chip| {
+                        !chips.iter().any(|sent| {
+                            sent.local_id == chip.local_id
+                                && matches!(sent.state, UploadState::Ready(_))
+                        })
+                    });
+                });
+            }
+            ctx.chat_sending.set(false);
         });
     };
 
@@ -71,6 +101,11 @@ pub fn ChatView() -> impl IntoView {
                     </For>
                     <Show when=move || !ctx.stream_display.get().is_empty()>
                         <div class="msg assistant streaming">
+                            <span class="message-model">{move || {
+                                let run = ctx.run_id.get();
+                                ctx.run_model.get().filter(|(id, _)| Some(id) == run.as_ref())
+                                    .map(|(_, model)| format!("Requested: {model}"))
+                            }}</span>
                             <div class="msg-body markdown"
                                 inner_html=move || crate::markdown::render_markdown(&ctx.stream_display.get())>
                             </div>
@@ -97,6 +132,8 @@ pub fn ChatView() -> impl IntoView {
                     }
                 >
                     <RunControls />
+                    <crate::model_picker::ModelPicker />
+                    <crate::session_usage::UsageBadge />
                     <Show when=move || !ctx.pending_attachments.get().is_empty()>
                         <div class="composer-chips">
                             <For
@@ -128,21 +165,32 @@ pub fn ChatView() -> impl IntoView {
                         <textarea
                             rows="2"
                             placeholder="Message Vortex… (Enter to send, Shift+Enter for a new line)"
-                            prop:value=move || input.get()
-                            on:input=move |ev| input.set(event_target_value(&ev))
+                            prop:value=input
+                            on:input=move |ev| {
+                                if let Some(id) = ctx.current.get_untracked() {
+                                    ctx.chat_drafts.update(|drafts| { drafts.insert(id, event_target_value(&ev)); });
+                                }
+                            }
                             on:keydown=move |ev| {
-                                if ev.key() == "Enter" && !ev.shift_key() {
+                                if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() {
                                     ev.prevent_default();
                                     submit_key();
                                 }
                             }
                         ></textarea>
-                        <button class="btn primary" on:click=move |_| submit()>"Send"</button>
+                        <button class="btn primary" disabled=blocked on:click=move |_| submit()>"Send"</button>
                     </div>
                 </div>
             </Show>
         </div>
     }
+}
+
+fn turn_active(status: Option<RunStatus>) -> bool {
+    matches!(
+        status,
+        Some(RunStatus::Running | RunStatus::Queued | RunStatus::WaitingApproval)
+    )
 }
 
 thread_local! {
@@ -209,14 +257,11 @@ fn start_uploads(ctx: AppCtx, files: web_sys::FileList) {
     ctx.pending_attachments.set(chips);
     spawn_local(async move {
         for (id, file) in accepted {
-            if !ctx
-                .pending_attachments
-                .with_untracked(|chips| chips.iter().any(|c| c.local_id == id))
-            {
+            if !ctx.has_attachment_chip(&conv, id) {
                 continue;
             }
             let result = api::upload_attachment(&conv, &file).await;
-            ctx.pending_attachments.update(|chips| {
+            ctx.update_attachment_draft(&conv, |chips| {
                 if let Some(c) = chips.iter_mut().find(|c| c.local_id == id) {
                     c.state = match result {
                         Ok(info) => {
@@ -287,16 +332,19 @@ fn next_optimistic_id() -> i64 {
 }
 
 /// Send a message: optimistic user bubble + POST + SSE subscription.
-pub async fn send_message(
+async fn send_message(
     ctx: AppCtx,
+    conv_id: &str,
     text: String,
     mode: vortex_types::Mode,
     attachments: Vec<AttachmentRef>,
-) {
-    let Some(conv_id) = ctx.current.get_untracked() else {
-        return;
-    };
+) -> bool {
+    if ctx.current.get_untracked().as_deref() != Some(conv_id) {
+        return false;
+    }
     let attachment_ids: Vec<String> = attachments.iter().map(|a| a.id.clone()).collect();
+    ctx.run_id.set(None);
+    crate::sse::close_subscription();
     // Optimistic user bubble.
     let optimistic_id = next_optimistic_id();
     ctx.messages.update(|m| {
@@ -307,6 +355,10 @@ pub async fn send_message(
             tool_calls: Vec::new(),
             attachments: attachments.clone(),
             created_at: String::new(),
+            run_id: None,
+            requested_model: None,
+            serving_model: None,
+            reply_summary: None,
         })
     });
     ctx.stream_text.set(String::new());
@@ -321,17 +373,21 @@ pub async fn send_message(
         mode: Some(mode),
         attachment_ids,
     };
-    let result = api::send_chat(&conv_id, &dto).await;
-    if ctx.current.get_untracked().as_deref() != Some(conv_id.as_str()) {
-        return;
+    let result = api::send_chat(conv_id, &dto).await;
+    if ctx.current.get_untracked().as_deref() != Some(conv_id) {
+        return result.is_ok();
     }
     match result {
-        Ok(r) => start_stream(ctx, r.run_id),
+        Ok(r) => {
+            start_stream(ctx, r.run_id);
+            true
+        }
         Err(e) => {
             ctx.run_status.set(None);
             // Roll back only *this* send's bubble.
             ctx.messages.update(|m| m.retain(|x| x.id != optimistic_id));
             ctx.error_banner.set(Some(e));
+            false
         }
     }
 }
@@ -355,8 +411,53 @@ pub fn start_stream(ctx: AppCtx, run_id: String) {
 #[component]
 fn RunControls() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
+    let can_continue = move || {
+        !turn_active(ctx.run_status.get())
+            && ctx.messages.with(|messages| {
+                messages.last().is_some_and(|message| {
+                    message.role == Role::Assistant
+                        && !message.content.is_empty()
+                        && message.reply_summary.as_ref().is_none_or(|summary| {
+                            matches!(
+                                summary.finish,
+                                ReplyFinish::Stop | ReplyFinish::Length | ReplyFinish::NotReported
+                            )
+                        })
+                })
+            })
+    };
+    let last_hit_limit = move || {
+        ctx.messages.with(|messages| {
+            messages
+                .last()
+                .and_then(|message| message.reply_summary.as_ref())
+                .is_some_and(|summary| summary.finish == ReplyFinish::Length)
+        })
+    };
     view! {
         <>
+            <Show when=can_continue>
+                <button class="btn" title="Send a new turn asking the model to continue"
+                    disabled=move || ctx.model_saving.get() || ctx.chat_sending.get()
+                    on:click=move |_| {
+                        if !untrack(can_continue) || ctx.chat_sending.get_untracked() || ctx.model_saving.get_untracked() {
+                            return;
+                        }
+                        let Some(id) = ctx.current.get_untracked() else { return; };
+                        let mode = ctx.mode.get_untracked();
+                        ctx.chat_sending.set(true);
+                        spawn_local(async move {
+                            send_message(ctx, &id, "Continue from where you left off without repeating the previous content.".into(), mode, Vec::new()).await;
+                            ctx.chat_sending.set(false);
+                        });
+                    }>"Continue"</button>
+            </Show>
+            {move || match ctx.run_status.get() {
+                Some(RunStatus::Failed) if !last_hit_limit() => Some("Run failed"),
+                Some(RunStatus::Cancelled) => Some("Run cancelled"),
+                Some(RunStatus::Interrupted) => Some("Run interrupted"),
+                _ => None,
+            }.map(|status| view! { <span role="status">{status}</span> })}
             <Show when=move || {
                 matches!(ctx.run_status.get(),
                     Some(RunStatus::Running) | Some(RunStatus::Queued) | Some(RunStatus::WaitingApproval))
@@ -374,13 +475,20 @@ fn RunControls() -> impl IntoView {
                         });
                     }>"■ Stop"</button>
             </Show>
-            <Show when=move || matches!(ctx.run_status.get(), Some(RunStatus::Failed))>
+            <Show when=move || matches!(ctx.run_status.get(), Some(RunStatus::Failed)) && !last_hit_limit() && ctx.run_id.get().is_some()>
                 <button class="btn"
+                    disabled=move || ctx.model_saving.get() || ctx.chat_sending.get()
                     on:click=move |_| {
-                        let ctx = ctx;
                         spawn_local(async move {
                             if let Some(run) = ctx.run_id.get_untracked() {
-                                match api::retry_run(&run).await {
+                                let conversation = ctx.current.get_untracked();
+                                ctx.chat_sending.set(true);
+                                let result = api::retry_run(&run).await;
+                                ctx.chat_sending.set(false);
+                                if ctx.current.get_untracked() != conversation || ctx.run_id.get_untracked().as_ref() != Some(&run) {
+                                    return;
+                                }
+                                match result {
                                     Ok(r) => {
                                         ctx.error_banner.set(None);
                                         ctx.set_toast("Retrying…");
@@ -400,17 +508,49 @@ fn RunControls() -> impl IntoView {
 fn MessageBubble(msg: StoredMessage) -> impl IntoView {
     let markdown = crate::markdown::render_markdown(&msg.content);
     let raw = msg.content.clone();
+    let raw_is_empty = raw.is_empty();
     let is_user = msg.role == Role::User;
     let attachments = msg.attachments.clone();
+    let model = if is_user {
+        None
+    } else {
+        Some(match (msg.serving_model, msg.requested_model) {
+            (Some(serving), Some(requested)) if serving != requested => {
+                format!("{serving} (requested: {requested})")
+            }
+            (Some(serving), _) => serving,
+            (None, Some(requested)) => {
+                format!("Requested: {requested}; serving model not reported")
+            }
+            (None, None) => "Model not recorded".into(),
+        })
+    };
     view! {
         <div class=if is_user { "msg user" } else { "msg assistant" }>
             <div class="msg-head">
                 <span class="who">{if is_user { "You" } else { "Vortex" }}</span>
+                {model.map(|label| view! { <span class="message-model">{label}</span> })}
                 <button class="icon-btn copy"
                     title="Copy message"
                     on:click=move |_| copy_text(&raw)>"⧉"</button>
             </div>
             <div class="msg-body markdown" inner_html=markdown></div>
+            {(!is_user).then(|| match msg.reply_summary {
+                Some(summary) => {
+                    let finish = match summary.finish {
+                        ReplyFinish::Stop => "Normal stop (task may be incomplete)",
+                        ReplyFinish::Length if raw_is_empty => "Output limit reached; no text returned",
+                        ReplyFinish::Length => "Output limit reached; partial reply",
+                        ReplyFinish::ContentFilter => "Stopped by provider content filter",
+                        ReplyFinish::Error => "Provider reported a generation error",
+                        ReplyFinish::NotReported => "Stop reason not reported",
+                        ReplyFinish::Other => "Other provider stop reason",
+                    };
+                    let usage = summary.completion_tokens.map(|count| count.to_string()).unwrap_or_else(|| "not reported".into());
+                    format!("{finish} · Requested output allowance: {} tokens · Reported completion tokens: {usage}", summary.requested_output_tokens)
+                }
+                None => "Stop reason, output allowance and completion usage not recorded".into(),
+            }).map(|label| view! { <small class="message-model">{label}</small> })}
             {(!attachments.is_empty()).then(|| view! {
                 <div class="attachments">
                     {attachments.iter().map(|a| view! { <AttachmentView att=a.clone() /> }).collect::<Vec<_>>()}

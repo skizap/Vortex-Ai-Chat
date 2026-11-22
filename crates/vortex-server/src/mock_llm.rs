@@ -80,7 +80,10 @@ impl LlmClient for DemoMockLlm {
                 }],
                 usage,
                 finish_reason: "tool_calls".to_string(),
+                reported_completion_tokens: usage.map(|u| u.completion_tokens),
                 annotations: None,
+                // Deterministic serving model for the offline harness.
+                model: Some("mock/model".to_string()),
             });
         }
 
@@ -110,24 +113,214 @@ impl LlmClient for DemoMockLlm {
             tool_calls: Vec::new(),
             usage,
             finish_reason: "stop".to_string(),
+            reported_completion_tokens: usage.map(|u| u.completion_tokens),
             annotations: None,
+            // Deterministic serving model for the offline harness.
+            model: Some("mock/model".to_string()),
         })
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(vec![ModelInfo {
-            id: "mock/model".to_string(),
-            name: "Mock Model (offline)".to_string(),
-            context_length: Some(8192),
-            supports_tools: Some(true),
-            pricing_prompt: None,
-            pricing_completion: None,
-            input_modalities: vec!["text".into(), "image".into()],
-            output_modalities: vec!["text".into()],
-        }])
+        // Deterministic offline demo catalog (id-sorted, no network). It
+        // exercises the recommended-shortlist filters end to end:
+        // - mapped rows with real-ish in-bounds prices → recommended
+        // - mapped row above the output bound (thinking-2507 at $3.5/M) → out
+        // - mapped restricted-license row (qwen-2.5-72b) → flagged, out
+        // - mapped row with unknown price (qwen3.5-9b) → out (never zero)
+        // - unmapped free row (mock/model) → out (no verified license) but
+        //   still the cheapest Auto pick
+        // - router row (openrouter/auto) → out, and no invented output limit
+        // Weekly ranks stay None on purpose: the offline harness has no
+        // ranking source, so ranking_source reports unavailable and clients
+        // omit popularity claims (recommended is id-ordered).
+        let text = vec!["text".to_string()];
+        let text_image = vec!["text".to_string(), "image".to_string()];
+        Ok(vec![
+            ModelInfo {
+                id: "deepseek/deepseek-chat-v3.1".to_string(),
+                name: "DeepSeek: DeepSeek V3.1 (offline demo)".to_string(),
+                context_length: Some(163_840),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.00000025".into()),
+                pricing_completion: Some("0.00000095".into()),
+                created: Some(1_753_000_000),
+                max_completion_tokens: Some(147_456),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "mistralai/mistral-nemo".to_string(),
+                name: "Mistral: Mistral Nemo (offline demo)".to_string(),
+                context_length: Some(131_072),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.000000029".into()),
+                pricing_completion: Some("0.00000003".into()),
+                created: Some(1_721_000_000),
+                max_completion_tokens: Some(16_384),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "mistralai/mistral-small-3.2-24b-instruct".to_string(),
+                name: "Mistral: Mistral Small 3.2 24B (offline demo)".to_string(),
+                context_length: Some(256_000),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.000000075".into()),
+                pricing_completion: Some("0.0000002".into()),
+                created: Some(1_750_000_000),
+                max_completion_tokens: Some(16_384),
+                input_modalities: text_image.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "mock/model".to_string(),
+                name: "Mock Model (offline)".to_string(),
+                context_length: Some(128_000),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0".into()),
+                pricing_completion: Some("0".into()),
+                created: Some(1_700_000_000),
+                input_modalities: text_image.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "openrouter/auto".to_string(),
+                name: "OpenRouter: Auto (offline demo)".to_string(),
+                context_length: None,
+                supports_tools: None,
+                pricing_prompt: Some("0".into()),
+                pricing_completion: Some("0".into()),
+                created: Some(1_700_000_000),
+                input_modalities: text_image.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "qwen/qwen-2.5-72b-instruct".to_string(),
+                name: "Qwen2.5 72B Instruct (offline demo)".to_string(),
+                context_length: Some(32_768),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.00000036".into()),
+                pricing_completion: Some("0.0000004".into()),
+                created: Some(1_726_000_000),
+                max_completion_tokens: Some(16_384),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "qwen/qwen3-235b-a22b-thinking-2507".to_string(),
+                name: "Qwen: Qwen3 235B A22B Thinking 2507 (offline demo)".to_string(),
+                context_length: Some(128_000),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.00000045".into()),
+                pricing_completion: Some("0.0000035".into()),
+                created: Some(1_753_000_000),
+                max_completion_tokens: Some(16_384),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "qwen/qwen3-32b".to_string(),
+                name: "Qwen: Qwen3 32B (offline demo)".to_string(),
+                context_length: Some(131_072),
+                supports_tools: Some(true),
+                pricing_prompt: Some("0.00000008".into()),
+                pricing_completion: Some("0.00000028".into()),
+                created: Some(1_745_000_000),
+                max_completion_tokens: Some(16_384),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "qwen/qwen3.5-9b".to_string(),
+                name: "Qwen: Qwen3.5 9B (offline demo, price unknown)".to_string(),
+                context_length: Some(262_144),
+                supports_tools: Some(true),
+                pricing_prompt: None,
+                pricing_completion: None,
+                created: Some(1_760_000_000),
+                max_completion_tokens: Some(81_920),
+                input_modalities: text.clone(),
+                output_modalities: text.clone(),
+                ..Default::default()
+            },
+        ])
     }
 
     fn describe(&self) -> &'static str {
         "mock"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The offline demo catalog must exercise the recommended-shortlist
+    /// filters under `VORTEX_LLM=mock`: verified in-bounds rows are listed,
+    /// every exclusion category is present, and ranking stays honestly
+    /// unavailable (no popularity claims without a ranking source).
+    #[tokio::test]
+    async fn demo_catalog_exercises_recommended_filters() {
+        let llm = DemoMockLlm::new("echo");
+        let models = llm.models().await.unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.is_sorted(),
+            "demo catalog stays id-sorted/deterministic"
+        );
+
+        // No weekly ranks offline → ranking unavailable.
+        assert!(models.iter().all(|m| m.weekly_rank.is_none()));
+        assert_eq!(vortex_llm::catalog::ranking_source(&models), None);
+
+        let enriched = vortex_llm::catalog::enrich(&models);
+        let recommended = vortex_llm::catalog::recommended(
+            &enriched,
+            vortex_types::RecommendedBounds::default(),
+            vortex_llm::catalog::DEFAULT_RECOMMENDED_LIMIT,
+        );
+        // Verified + in-bounds rows, id-ordered (ranking unavailable).
+        assert_eq!(
+            recommended,
+            vec![
+                "deepseek/deepseek-chat-v3.1",
+                "mistralai/mistral-nemo",
+                "mistralai/mistral-small-3.2-24b-instruct",
+                "qwen/qwen3-32b",
+            ]
+        );
+        // Exclusion categories present in the catalog but not recommended:
+        // over output bound, restricted license, unknown price, unmapped free
+        // row, router alias.
+        let find = |id: &str| enriched.iter().find(|m| m.id == id).unwrap();
+        assert!(!recommended.contains(&"qwen/qwen3-235b-a22b-thinking-2507".to_string()));
+        assert!(find("qwen/qwen-2.5-72b-instruct").restriction.is_some());
+        assert!(find("qwen/qwen3.5-9b").pricing_prompt.is_none());
+        assert!(find("mock/model").open_weights.is_none());
+        assert!(vortex_llm::catalog::is_router_or_batch("openrouter/auto"));
+        // A router never gets an invented output limit.
+        assert!(find("openrouter/auto").max_completion_tokens.is_none());
+        // Auto still resolves to the free unmapped mock row (cheapest, id
+        // tie-break): the demo rows must not hijack offline Auto routing.
+        let req = vortex_agents::routing::AutoRequirements {
+            needs_image: false,
+            needs_video: false,
+            needs_tools: false,
+            image_count: 0,
+            est_input_tokens: 100,
+            output_allowance: 100,
+        };
+        assert_eq!(
+            vortex_agents::routing::resolve_auto(&enriched, &req).as_deref(),
+            Some("mock/model")
+        );
     }
 }

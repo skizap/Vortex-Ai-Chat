@@ -11,6 +11,7 @@ mod routes_ckpts;
 mod routes_conv;
 mod routes_misc;
 mod routes_runs;
+mod routes_usage;
 mod state;
 mod static_files;
 
@@ -226,6 +227,14 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
             get(routes_conv::get_messages),
         )
         .route("/api/conversations/{id}/chat", post(routes_conv::post_chat))
+        .route(
+            "/api/conversations/{id}/model",
+            get(routes_conv::get_model).patch(routes_conv::set_model),
+        )
+        .route(
+            "/api/conversations/{id}/usage",
+            get(routes_usage::conversation_usage),
+        )
         .route(
             "/api/conversations/{id}/attachments",
             get(routes_attachments::list_attachments).post(
