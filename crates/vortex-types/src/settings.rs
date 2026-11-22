@@ -66,6 +66,9 @@ pub struct ToolSettings {
     pub previews: bool,
     /// Allow the coordinator to spawn sub-agents.
     pub delegation: bool,
+    /// Allow media-generation tools (`generate_image`, `generate_video`).
+    /// Video stays behind the human approval gate regardless of this toggle.
+    pub media: bool,
 }
 
 impl Default for ToolSettings {
@@ -77,6 +80,29 @@ impl Default for ToolSettings {
             commands: false,
             previews: true,
             delegation: true,
+            media: true,
+        }
+    }
+}
+
+/// Media-generation defaults. Model ids are Settings-overridable; the server
+/// fails honestly when a configured model is absent from the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaSettings {
+    pub image_model: String,
+    pub video_model: String,
+    /// OpenRouter file-parser engine for PDF input:
+    /// `cloudflare-ai` (free), `mistral-ocr` (paid), or `native`.
+    pub pdf_engine: String,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            image_model: "google/gemini-2.5-flash-image".into(),
+            video_model: "google/veo-3.1-lite".into(),
+            pdf_engine: "cloudflare-ai".into(),
         }
     }
 }
@@ -133,14 +159,19 @@ pub struct Settings {
     pub tools: ToolSettings,
     pub profile: PermissionProfile,
     pub agents: AgentSettings,
+    pub media: MediaSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model: "openrouter/auto".into(),
+            // Fresh installs default to Vortex Auto (server-side routing).
+            // Upgraded installs keep their saved blob verbatim, so an explicit
+            // past choice — including the distinct `openrouter/auto` provider
+            // alias — is preserved.
+            model: crate::chat::VORTEX_AUTO_MODEL.into(),
             temperature: 0.7,
-            max_tokens: 4096,
+            max_tokens: 16_384,
             theme: Theme::Dark,
             default_mode: Mode::Chat,
             workspace: None,
@@ -149,6 +180,55 @@ impl Default for Settings {
             tools: ToolSettings::default(),
             profile: PermissionProfile::Standard,
             agents: AgentSettings::default(),
+            media: MediaSettings::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_is_vortex_auto_and_explicit_choices_survive() {
+        assert_eq!(Settings::default().model, crate::chat::VORTEX_AUTO_MODEL);
+        // Upgrade path: a stored blob with an explicit model keeps it verbatim;
+        // the provider alias is never rewritten to Vortex Auto.
+        let s: Settings = serde_json::from_str(r#"{"model":"openrouter/auto"}"#).unwrap();
+        assert_eq!(s.model, "openrouter/auto");
+        let s: Settings = serde_json::from_str(r#"{"model":"anthropic/claude-sonnet-4"}"#).unwrap();
+        assert_eq!(s.model, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn old_settings_payload_defaults_media() {
+        // A pre-media settings blob must decode with media defaults.
+        let json = r#"{"model":"openrouter/auto","temperature":0.7,"max_tokens":4096,
+            "theme":"dark","default_mode":"chat","workspace":null,"command_allowlist":[],
+            "search":{"provider":"searxng","base_url":"","max_results":6},
+            "tools":{"files":true,"search":true,"browser":true,"commands":false,
+                     "previews":true,"delegation":true},
+            "profile":"standard",
+            "agents":{"max_concurrent":6,"recursive":false,"max_iterations":16,
+                      "run_timeout_secs":600,"max_total_tokens":200000,
+                      "approval_timeout_secs":300}}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(s.tools.media, "media toggle defaults on");
+        assert_eq!(s.media.image_model, "google/gemini-2.5-flash-image");
+        assert_eq!(s.media.video_model, "google/veo-3.1-lite");
+        assert_eq!(s.media.pdf_engine, "cloudflare-ai");
+    }
+
+    #[test]
+    fn media_settings_roundtrip() {
+        let mut s = Settings::default();
+        s.tools.media = false;
+        s.media.image_model = "openai/gpt-image-1".into();
+        s.media.pdf_engine = "mistral-ocr".into();
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.tools.media);
+        assert_eq!(back.media.image_model, "openai/gpt-image-1");
+        assert_eq!(back.media.pdf_engine, "mistral-ocr");
+        assert_eq!(back.media.video_model, "google/veo-3.1-lite");
     }
 }

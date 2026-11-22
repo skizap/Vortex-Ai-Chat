@@ -18,6 +18,9 @@ pub struct MockTurn {
     /// When set, `complete` fails with `LlmError::Network(msg)` for this turn
     /// instead of streaming content (used to exercise retry/error paths).
     pub fail_with: Option<String>,
+    /// Provider-reported serving model for this turn (`CompletionResponse
+    /// .model`). `None` emulates a provider that never reports one.
+    pub serving_model: Option<String>,
 }
 
 impl MockTurn {
@@ -26,6 +29,7 @@ impl MockTurn {
             content: content.into(),
             tool_calls: Vec::new(),
             fail_with: None,
+            serving_model: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl MockTurn {
                 arguments: arguments.into(),
             }],
             fail_with: None,
+            serving_model: None,
         }
     }
 
@@ -51,6 +56,7 @@ impl MockTurn {
             content: String::new(),
             tool_calls: Vec::new(),
             fail_with: Some(msg.into()),
+            serving_model: None,
         }
     }
 }
@@ -101,6 +107,9 @@ impl LlmClient for MockLlm {
                     tool_calls: Vec::new(),
                     usage: None,
                     finish_reason: "stop".into(),
+                    reported_completion_tokens: None,
+                    annotations: None,
+                    model: Some("mock/model".into()),
                 });
             }
             guard.remove(0)
@@ -108,6 +117,7 @@ impl LlmClient for MockLlm {
         // Stream content word-by-word to emulate token streaming.
         let content = turn.content;
         let tool_calls = turn.tool_calls;
+        let serving_model = turn.serving_model;
         if let Some(msg) = turn.fail_with {
             return Err(LlmError::Network(msg));
         }
@@ -135,6 +145,9 @@ impl LlmClient for MockLlm {
                 completion_tokens,
                 total_tokens: 10 + completion_tokens,
             }),
+            annotations: None,
+            model: serving_model,
+            reported_completion_tokens: Some(completion_tokens),
             finish_reason: if has_tool_calls {
                 "tool_calls".into()
             } else {
@@ -144,13 +157,24 @@ impl LlmClient for MockLlm {
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        // Deterministic offline catalog: exactly one entry, affirmatively
+        // compatible (text+image in, text out, tools), with explicit zero
+        // pricing so Vortex Auto resolves to it in the offline harness.
+        // No weekly_rank: the offline harness honestly reports ranking as
+        // unavailable, so clients omit popularity claims.
         Ok(vec![ModelInfo {
             id: "mock/model".into(),
             name: "Mock Model".into(),
-            context_length: Some(8192),
+            context_length: Some(128_000),
             supports_tools: Some(true),
-            pricing_prompt: None,
-            pricing_completion: None,
+            pricing_prompt: Some("0".into()),
+            pricing_completion: Some("0".into()),
+            created: Some(1_700_000_000),
+            pricing_request: Some("0".into()),
+            pricing_image: Some("0".into()),
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
+            ..Default::default()
         }])
     }
 

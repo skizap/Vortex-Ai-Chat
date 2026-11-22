@@ -1,6 +1,6 @@
 //! Errors surfaced by LLM providers.
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LlmError {
     #[error("OPENROUTER_API_KEY is not configured. Add it to your environment or config.toml (see README.md 'Setup').")]
     NotConfigured,

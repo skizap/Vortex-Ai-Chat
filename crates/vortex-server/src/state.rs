@@ -3,17 +3,16 @@
 use crate::guard::GuardSettings;
 use std::sync::Arc;
 use vortex_agents::{Engine, Hub, PreviewRegistry};
-use vortex_core::{AppConfig, Db};
-use vortex_llm::LlmClient;
+use vortex_core::{AppConfig, AttachmentStore, Db};
 use vortex_types::Capabilities;
 
 pub struct AppState {
     pub db: Db,
     pub engine: Arc<Engine>,
     pub hub: Arc<Hub>,
-    pub llm: Arc<dyn LlmClient>,
     pub config: AppConfig,
     pub previews: Arc<PreviewRegistry>,
+    pub attachments: Arc<AttachmentStore>,
     pub is_mock_llm: bool,
     pub version: &'static str,
     /// Inputs for the Host/Origin/LAN guard (split out for testability).

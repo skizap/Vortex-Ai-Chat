@@ -6,6 +6,8 @@ pub mod api;
 pub mod chat;
 pub mod diagnostics;
 pub mod markdown;
+mod model_picker;
+mod session_usage;
 pub mod settings_ui;
 pub mod sidebar;
 pub mod sse;
@@ -81,6 +83,11 @@ pub fn App() -> impl IntoView {
         },
         std::time::Duration::from_millis(125),
     );
+
+    Effect::new(move || {
+        ctx.current.track();
+        session_usage::reload(ctx);
+    });
 
     view! {
         <div class="app">

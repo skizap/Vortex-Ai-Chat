@@ -43,6 +43,7 @@ fn serve_path(path: &str) -> Response {
                     (header::CONTENT_TYPE, ctype),
                     (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
                     (header::CACHE_CONTROL, "no-cache"),
+                    (header::REFERRER_POLICY, "no-referrer"),
                 ],
                 file.data,
             )

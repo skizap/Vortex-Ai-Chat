@@ -243,6 +243,7 @@ fn engine_with_registry(
         None,
         vortex_agents::safe_http::SafeHttp::new(false),
         Settings::default(),
+        None,
     );
     let _ = engine_slot.set(engine.clone());
     (engine, hub)
@@ -390,6 +391,7 @@ async fn coordinator_panic_preserves_stuck_run_state() {
             Mode::Chat,
             Vec::new(),
             "hi",
+            Vec::new(),
         )
         .await;
 
@@ -589,6 +591,7 @@ async fn provider_and_run_failures_emit_fixed_categories_only() {
         None,
         vortex_agents::safe_http::SafeHttp::new(false),
         Settings::default(),
+        None,
     );
     let _ = engine_slot.set(engine.clone());
 
@@ -671,6 +674,7 @@ async fn provider_task_panic_is_recorded_without_payload() {
         None,
         vortex_agents::safe_http::SafeHttp::new(false),
         Settings::default(),
+        None,
     );
     let _ = engine_slot.set(engine.clone());
 
@@ -757,6 +761,7 @@ async fn ignored_db_persistence_failures_are_surfaced() {
         None,
         vortex_agents::safe_http::SafeHttp::new(false),
         Settings::default(),
+        None,
     );
     let _ = engine_slot.set(engine.clone());
 
@@ -765,7 +770,13 @@ async fn ignored_db_persistence_failures_are_surfaced() {
     let conversation_id = uuid::Uuid::new_v4().to_string();
     let _sub = tracing::subscriber::set_default(capture.clone());
     let run_id = engine
-        .start_chat_run(&conversation_id, Mode::Chat, Vec::new(), "hello")
+        .start_chat_run(
+            &conversation_id,
+            Mode::Chat,
+            Vec::new(),
+            "hello",
+            Vec::new(),
+        )
         .await;
 
     // The run executes in the background; wait for the failure boundary to

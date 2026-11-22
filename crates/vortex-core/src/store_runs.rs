@@ -2,7 +2,7 @@
 
 use crate::db::{now, Db};
 use crate::error::Result;
-use vortex_types::{PlanStep, RunInfo, RunStatus, Usage};
+use vortex_types::{ConversationRunUsage, PlanStep, RunInfo, RunStatus, Usage};
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunInfo> {
     let usage_json: Option<String> = row.get(8)?;
@@ -129,6 +129,70 @@ impl Db {
             let mut st = c.prepare(&sql)?;
             let rows = st
                 .query_map(rusqlite::params![conversation, parent], row_to_run)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Record that a completion inside this run reported no usage: the run's
+    /// totals stay permanently partial even if other calls report usage.
+    /// Idempotent; returns whether the flag transitioned.
+    pub async fn mark_run_usage_incomplete(&self, run_id: String) -> Result<bool> {
+        self.with_conn(move |c| {
+            let n = c.execute(
+                "UPDATE runs SET usage_incomplete = 1
+                 WHERE id = ?1 AND usage_incomplete = 0",
+                rusqlite::params![run_id],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// Latest cumulative provider-reported usage per distinct run in the
+    /// conversation's whole run tree (coordinator runs, retries, and every
+    /// delegated sub-agent run, which have `conversation_id` NULL and join
+    /// via `parent_run_id`). Each run contributes its most recent total
+    /// exactly once — cumulative SSE events are never summed here.
+    ///
+    /// `incomplete` is true when a completion in the run never reported
+    /// usage (persisted flag) or the run is terminal without any reported
+    /// usage; an active run that has not called the provider yet is not
+    /// permanently incomplete.
+    pub async fn conversation_usage(
+        &self,
+        conversation_id: String,
+    ) -> Result<Vec<ConversationRunUsage>> {
+        self.with_conn(move |c| {
+            let mut st = c.prepare(
+                "WITH RECURSIVE tree(id, usage_json, usage_incomplete, status, created_at) AS (
+                     SELECT id, usage_json, usage_incomplete, status, created_at
+                     FROM runs WHERE conversation_id = ?1
+                     UNION ALL
+                     SELECT r.id, r.usage_json, r.usage_incomplete, r.status, r.created_at
+                     FROM runs r JOIN tree t ON r.parent_run_id = t.id
+                 ) SELECT id, usage_json, usage_incomplete, status
+                   FROM tree ORDER BY created_at, id",
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![conversation_id], |r| {
+                    let usage_json: Option<String> = r.get(1)?;
+                    let flagged: i64 = r.get(2)?;
+                    let status: String = r.get(3)?;
+                    let usage = usage_json.and_then(|j| serde_json::from_str::<Usage>(&j).ok());
+                    let terminal =
+                        serde_json::from_value::<RunStatus>(serde_json::Value::String(status))
+                            .map(|s| s.is_terminal())
+                            // Unknown status strings are treated as terminal: a run
+                            // in a state we cannot parse is not "still active".
+                            .unwrap_or(true);
+                    Ok(ConversationRunUsage {
+                        run_id: r.get(0)?,
+                        usage,
+                        incomplete: flagged != 0 || (usage.is_none() && terminal),
+                    })
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })

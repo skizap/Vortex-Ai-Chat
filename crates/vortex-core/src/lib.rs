@@ -7,12 +7,15 @@ pub mod error;
 pub mod paths;
 pub mod store;
 pub mod store_appr;
+pub mod store_attachments;
 pub mod store_calls;
 pub mod store_ckpts;
 pub mod store_msgs;
 pub mod store_runs;
+pub mod title;
 
 pub use config::AppConfig;
 pub use db::Db;
 pub use error::{CoreError, Result};
 pub use paths::Paths;
+pub use store_attachments::{AttachmentRecord, AttachmentStore, VideoJobRecord};

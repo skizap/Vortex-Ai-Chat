@@ -2,8 +2,9 @@
 
 use crate::diagnostics;
 use serde::de::DeserializeOwned;
+use vortex_types::dto::ModelsResponse;
 use vortex_types::{
-    ApprovalInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
+    ApprovalInfo, AttachmentInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
     ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
 };
 
@@ -16,8 +17,17 @@ fn request_id_of(resp: &gloo_net::http::Response) -> Option<String> {
 }
 
 pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    get_json_optional(path, false)
+        .await?
+        .ok_or_else(|| "resource not found".into())
+}
+
+async fn get_json_optional<T: DeserializeOwned>(
+    path: &str,
+    allow_404: bool,
+) -> Result<Option<T>, String> {
     let run_id = diagnostics::extract_run_id(path);
-    let resp = gloo_net::http::Request::get(&format!("{BASE}{path}"))
+    let resp = authorize(gloo_net::http::Request::get(&format!("{BASE}{path}")))
         .send()
         .await
         .map_err(|e| {
@@ -30,6 +40,9 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
             e.to_string()
         })?;
     let status = resp.status();
+    if allow_404 && status == 404 {
+        return Ok(None);
+    }
     let text = resp.text().await.map_err(|e| {
         diagnostics::report_api_failure(
             BrowserOperation::ApiTransport,
@@ -50,7 +63,7 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
         );
         return Err(parse_error(&text));
     }
-    serde_json::from_str(&text).map_err(|e| {
+    serde_json::from_str(&text).map(Some).map_err(|e| {
         diagnostics::report_api_failure(
             BrowserOperation::ApiDecode,
             Some(status),
@@ -75,7 +88,7 @@ pub async fn send_json<T: DeserializeOwned>(
         _ => return Err(format!("unsupported method {method}")),
     };
     let run_id = diagnostics::extract_run_id(path);
-    let resp = req
+    let resp = authorize(req)
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .map_err(|e| e.to_string())?
@@ -144,14 +157,44 @@ pub async fn save_settings(s: &Settings) -> Result<Settings, String> {
     send_json("PUT", "/settings", &body).await
 }
 
+/// Client-editable recommended-shortlist query for `GET /api/models`. All
+/// parameters are optional; the server applies documented defaults, clamps
+/// values and echoes the effective ones in the response. Session-only: the
+/// UI never persists these.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CatalogQuery {
+    pub max_input_usd_per_mtok: Option<f64>,
+    pub max_output_usd_per_mtok: Option<f64>,
+    pub recommended_limit: Option<u32>,
+}
+
+impl CatalogQuery {
+    fn to_query_string(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = self.max_input_usd_per_mtok {
+            parts.push(format!("max_input_usd_per_mtok={v}"));
+        }
+        if let Some(v) = self.max_output_usd_per_mtok {
+            parts.push(format!("max_output_usd_per_mtok={v}"));
+        }
+        if let Some(v) = self.recommended_limit {
+            parts.push(format!("recommended_limit={v}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        }
+    }
+}
+
 pub async fn models() -> Result<Vec<ModelInfo>, String> {
-    let resp = get_json::<ModelsResp>("/models").await?;
+    let resp = model_catalog(CatalogQuery::default()).await?;
     Ok(resp.models)
 }
 
-#[derive(serde::Deserialize)]
-struct ModelsResp {
-    models: Vec<ModelInfo>,
+pub(crate) async fn model_catalog(q: CatalogQuery) -> Result<ModelsResponse, String> {
+    get_json(&format!("/models{}", q.to_query_string())).await
 }
 
 pub async fn conversations(q: &str) -> Result<Vec<ConversationSummary>, String> {
@@ -170,11 +213,18 @@ pub async fn create_conversation(
     send_json("POST", "/conversations", &body).await
 }
 
-pub async fn rename_conversation(id: &str, title: &str) -> Result<(), String> {
+/// Rename a conversation. Resolves with the canonical (trimmed, normalized)
+/// title as stored by the server — callers must use that value, never the
+/// raw draft, so the row and the DB can never disagree.
+pub async fn rename_conversation(id: &str, title: &str) -> Result<String, String> {
     let body = serde_json::json!({ "title": title }).to_string();
-    send_json::<serde_json::Value>("PATCH", &format!("/conversations/{id}"), &body)
-        .await
-        .map(|_| ())
+    let resp = send_json::<RenameResp>("PATCH", &format!("/conversations/{id}"), &body).await?;
+    Ok(resp.title)
+}
+
+#[derive(serde::Deserialize)]
+struct RenameResp {
+    title: String,
 }
 
 pub async fn delete_conversation(id: &str) -> Result<(), String> {
@@ -195,6 +245,100 @@ pub async fn send_chat(id: &str, dto: &ChatRequestDto) -> Result<RunId, String> 
 #[derive(serde::Deserialize)]
 pub struct RunId {
     pub run_id: String,
+    /// Present when the server auto-titled this conversation on its first
+    /// accepted turn (placeholder origin only; manual titles never change).
+    /// The chat UI may apply it to the sidebar row; the sidebar additionally
+    /// refreshes the summary list on run start, so this is a fast path only.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+// ---- attachments ----------------------------------------------------------
+
+/// Upload one file as multipart/form-data. The browser sets the Content-Type
+/// (with boundary) automatically — it must NOT be set manually here.
+pub async fn upload_attachment(
+    conv_id: &str,
+    file: &web_sys::File,
+) -> Result<AttachmentInfo, String> {
+    let form = web_sys::FormData::new().map_err(|e| format!("form: {e:?}"))?;
+    form.append_with_blob_and_filename("file", file, &file.name())
+        .map_err(|e| format!("form append: {e:?}"))?;
+    let url = format!("{BASE}/conversations/{conv_id}/attachments");
+    let resp = authorize(gloo_net::http::Request::post(&url))
+        .body(form)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| {
+            diagnostics::report_api_failure(BrowserOperation::ApiTransport, None, None, None);
+            e.to_string()
+        })?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        diagnostics::report_api_failure(
+            BrowserOperation::ApiStatus,
+            Some(status),
+            request_id_of(&resp).as_deref(),
+            None,
+        );
+        return Err(parse_error(&text));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("invalid response: {e}"))
+}
+
+pub async fn attachment_meta(id: &str) -> Result<Option<AttachmentInfo>, String> {
+    get_json_optional(&format!("/attachments/{id}/meta"), true).await
+}
+
+pub async fn attachment_list(conv_id: &str) -> Result<Vec<AttachmentInfo>, String> {
+    get_json(&format!("/conversations/{conv_id}/attachments")).await
+}
+
+pub async fn attachment_delete(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("DELETE", &format!("/attachments/{id}"), "")
+        .await
+        .map(|_| ())
+}
+
+/// The LAN access token from the page URL (`?token=...`), if present. Media
+/// URLs must carry it because `<img>`/`<video>` cannot set auth headers.
+fn page_lan_token() -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return None;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let search = web_sys::window()?.location().search().ok()?;
+        web_sys::UrlSearchParams::new_with_str(&search)
+            .ok()?
+            .get("token")
+            .filter(|token| !token.is_empty())
+    }
+}
+
+pub(crate) fn authorize(req: gloo_net::http::RequestBuilder) -> gloo_net::http::RequestBuilder {
+    match page_lan_token() {
+        Some(t) => req.header("Authorization", &format!("Bearer {t}")),
+        None => req,
+    }
+}
+
+/// Append the LAN token to a relative API URL when the page carries one.
+pub(crate) fn with_lan_token(url: &str) -> String {
+    match page_lan_token() {
+        Some(t) => format!(
+            "{url}{}token={}",
+            if url.contains('?') { '&' } else { '?' },
+            urlencode(&t)
+        ),
+        None => url.to_string(),
+    }
+}
+
+/// Serve URL for an attachment (token-aware).
+pub fn attachment_url(id: &str) -> String {
+    with_lan_token(&format!("/api/attachments/{id}"))
 }
 
 pub async fn stop_run(id: &str) -> Result<(), String> {

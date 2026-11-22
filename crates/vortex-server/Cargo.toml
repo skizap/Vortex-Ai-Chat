@@ -32,7 +32,9 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
 percent-encoding = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "ico", "png", "tiff"] }
 
 [dev-dependencies]
+base64 = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }

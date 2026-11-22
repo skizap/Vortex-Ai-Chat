@@ -17,6 +17,9 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
         workspace: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+        // Appended last in every conversation SELECT: per-conversation model
+        // preference (NULL = inherit the Settings default at send time).
+        model: row.get(6)?,
     })
 }
 
@@ -43,6 +46,17 @@ impl Db {
         mode: Mode,
         workspace: Option<String>,
     ) -> Result<ConversationSummary> {
+        self.create_conversation_with_model(title, mode, workspace, None)
+            .await
+    }
+
+    pub async fn create_conversation_with_model(
+        &self,
+        title: impl Into<String> + Send + 'static,
+        mode: Mode,
+        workspace: Option<String>,
+        model: Option<String>,
+    ) -> Result<ConversationSummary> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.into();
         let ts = now();
@@ -53,12 +67,17 @@ impl Db {
             workspace: workspace.clone(),
             created_at: ts.clone(),
             updated_at: ts.clone(),
+            model: model.clone(),
         };
         self.with_conn(move |c| {
+            // A conversation created with the default placeholder title can
+            // still be auto-named later; any other title was chosen by the
+            // user and is treated as manual from the start.
             c.execute(
-                "INSERT INTO conversations (id, title, mode, workspace, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                rusqlite::params![id, title, mode.as_str(), workspace, ts],
+                "INSERT INTO conversations (id, title, mode, workspace, created_at, updated_at, title_origin, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5,
+                          CASE WHEN ?2 = ?6 THEN 'placeholder' ELSE 'manual' END, ?7)",
+                rusqlite::params![id, title, mode.as_str(), workspace, ts, crate::title::PLACEHOLDER_TITLE, model],
             )?;
             Ok(())
         })
@@ -69,7 +88,7 @@ impl Db {
     pub async fn get_conversation(&self, id: String) -> Result<Option<ConversationSummary>> {
         self.with_conn(move |c| {
             let mut st = c.prepare(
-                "SELECT id, title, mode, workspace, created_at, updated_at
+                "SELECT id, title, mode, workspace, created_at, updated_at, model
                      FROM conversations WHERE id = ?1",
             )?;
             let row = st
@@ -84,7 +103,7 @@ impl Db {
     pub async fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
         self.with_conn(|c| {
             let mut st = c.prepare(
-                "SELECT id, title, mode, workspace, created_at, updated_at
+                "SELECT id, title, mode, workspace, created_at, updated_at, model
                      FROM conversations ORDER BY updated_at DESC",
             )?;
             let rows = st
@@ -98,7 +117,7 @@ impl Db {
     pub async fn search_conversations(&self, q: String) -> Result<Vec<ConversationSummary>> {
         self.with_conn(move |c| {
             let mut st = c.prepare(
-                r#"SELECT DISTINCT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at
+                r#"SELECT DISTINCT c.id, c.title, c.mode, c.workspace, c.created_at, c.updated_at, c.model
                      FROM conversations c
                      LEFT JOIN messages m ON m.conversation_id = c.id
                      WHERE c.title LIKE ?1 ESCAPE '\' OR m.content LIKE ?1 ESCAPE '\'
@@ -115,20 +134,56 @@ impl Db {
 
     pub async fn rename_conversation(&self, id: String, title: String) -> Result<bool> {
         self.with_conn(move |c| {
+            // Manual renames always win: mark the origin so automatic naming
+            // can never overwrite it later, even if the user typed the exact
+            // placeholder title.
             Ok(c.execute(
-                "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE conversations SET title = ?2, updated_at = ?3, title_origin = 'manual'
+                  WHERE id = ?1",
                 rusqlite::params![id, title, now()],
             )? > 0)
         })
         .await
     }
 
+    /// Conditional automatic title write: succeeds only while the
+    /// conversation is still at its placeholder origin, so a manual rename
+    /// (past or concurrent) is never clobbered. Returns whether it wrote.
+    pub async fn auto_title_conversation(&self, id: String, title: String) -> Result<bool> {
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "UPDATE conversations SET title = ?2, updated_at = ?3, title_origin = 'automatic'
+                  WHERE id = ?1 AND title_origin = 'placeholder'",
+                rusqlite::params![id, title, now()],
+            )? > 0)
+        })
+        .await
+    }
+
+    /// Current title origin (`placeholder` / `automatic` / `manual`), if the
+    /// conversation exists. Internal to the server; not part of the summary
+    /// DTO.
+    pub async fn title_origin(&self, id: String) -> Result<Option<String>> {
+        self.with_conn(move |c| {
+            let mut st = c.prepare("SELECT title_origin FROM conversations WHERE id = ?1")?;
+            let row = st
+                .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))?
+                .next()
+                .transpose()?;
+            Ok(row)
+        })
+        .await
+    }
+
     /// Delete a conversation and everything that belongs to it, atomically:
     /// messages, the run tree (including sub-agent runs), their tool calls
-    /// and approvals, and checkpoints. Previously this was three unlinked
-    /// DELETEs that orphaned `tool_calls`/`approvals`/`checkpoints` rows
-    /// forever and could leave a partial deletion on failure.
+    /// and approvals, checkpoints, attachments, video jobs and file
+    /// annotations. Previously this was three unlinked DELETEs that orphaned
+    /// `tool_calls`/`approvals`/`checkpoints` rows forever and could leave a
+    /// partial deletion on failure. Attachment files are removed after the
+    /// transaction commits (best-effort, traced).
     pub async fn delete_conversation(&self, id: String) -> Result<bool> {
+        let attachments_root = self.attachments_root.get().cloned();
         self.with_conn(move |c| {
             let tx = c.unchecked_transaction()?;
             // Collect the whole run tree (runs of this conversation plus all
@@ -166,6 +221,19 @@ impl Db {
                 rusqlite::params![id],
             )?;
             tx.execute(
+                "DELETE FROM file_annotations WHERE attachment_id IN
+                     (SELECT id FROM attachments WHERE conversation_id = ?1)",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM video_jobs WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM attachments WHERE conversation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
                 "DELETE FROM messages WHERE conversation_id = ?1",
                 rusqlite::params![id],
             )?;
@@ -177,6 +245,24 @@ impl Db {
                 rusqlite::params![id],
             )? > 0;
             tx.commit()?;
+            // Best-effort file cleanup after the rows are gone. The directory
+            // name is the conversation UUID (validated), never user input.
+            if deleted {
+                if let Some(root) = attachments_root {
+                    if uuid::Uuid::parse_str(&id).is_ok() {
+                        let dir = root.join(&id);
+                        if dir.exists() {
+                            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                                tracing::warn!(
+                                    conversation_id = %id,
+                                    error = %e,
+                                    "could not remove attachment files for deleted conversation"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Ok(deleted)
         })
         .await
@@ -189,6 +275,19 @@ impl Db {
                 rusqlite::params![id, now()],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Set (or with `None`, clear back to "inherit the Settings default") the
+    /// per-conversation model preference. Affects future sends only and never
+    /// bumps `updated_at`: changing the model must not reorder the sidebar.
+    pub async fn set_conversation_model(&self, id: String, model: Option<String>) -> Result<bool> {
+        self.with_conn(move |c| {
+            Ok(c.execute(
+                "UPDATE conversations SET model = ?2 WHERE id = ?1",
+                rusqlite::params![id, model],
+            )? > 0)
         })
         .await
     }
@@ -352,5 +451,144 @@ mod tests {
             .unwrap();
         let all = db.list_approvals(false).await.unwrap();
         assert_eq!(all[0].status, ApprovalStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn create_classifies_title_origin() {
+        let (db, _dir) = test_db();
+        let placeholder = db
+            .create_conversation("New chat", Mode::Chat, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.title_origin(placeholder.id).await.unwrap().as_deref(),
+            Some("placeholder")
+        );
+        let named = db
+            .create_conversation("Roadmap", Mode::Chat, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.title_origin(named.id).await.unwrap().as_deref(),
+            Some("manual")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_title_only_writes_placeholder_origin() {
+        let (db, _dir) = test_db();
+        let c = db
+            .create_conversation("New chat", Mode::Chat, None)
+            .await
+            .unwrap();
+        // First automatic write succeeds.
+        assert!(db
+            .auto_title_conversation(c.id.clone(), "Fix login bug".into())
+            .await
+            .unwrap());
+        let got = db.get_conversation(c.id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.title, "Fix login bug");
+        assert_eq!(
+            db.title_origin(c.id.clone()).await.unwrap().as_deref(),
+            Some("automatic")
+        );
+        // A second automatic write must not replace the first.
+        assert!(!db
+            .auto_title_conversation(c.id.clone(), "Something else".into())
+            .await
+            .unwrap());
+        let got = db.get_conversation(c.id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.title, "Fix login bug");
+    }
+
+    #[tokio::test]
+    async fn manual_rename_wins_over_auto_title_even_for_placeholder_text() {
+        let (db, _dir) = test_db();
+        let c = db
+            .create_conversation("Draft", Mode::Chat, None)
+            .await
+            .unwrap();
+        // User renames it to the exact placeholder text: still manual.
+        assert!(db
+            .rename_conversation(c.id.clone(), "New chat".into())
+            .await
+            .unwrap());
+        assert_eq!(
+            db.title_origin(c.id.clone()).await.unwrap().as_deref(),
+            Some("manual")
+        );
+        assert!(!db
+            .auto_title_conversation(c.id.clone(), "Derived".into())
+            .await
+            .unwrap());
+        let got = db.get_conversation(c.id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.title, "New chat", "manual title is never clobbered");
+    }
+
+    #[tokio::test]
+    async fn auto_title_unknown_conversation_is_false() {
+        let (db, _dir) = test_db();
+        assert!(!db
+            .auto_title_conversation("missing".into(), "x".into())
+            .await
+            .unwrap());
+        assert_eq!(db.title_origin("missing".into()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn conversation_model_preference_roundtrip_and_clear() {
+        let (db, _dir) = test_db();
+        let c = db.create_conversation("t", Mode::Chat, None).await.unwrap();
+        assert_eq!(c.model, None, "new conversations inherit until seeded");
+
+        // Pin a model: visible in every summary read path, ordering untouched.
+        assert!(db
+            .set_conversation_model(c.id.clone(), Some("anthropic/claude-sonnet-4".into()))
+            .await
+            .unwrap());
+        let got = db.get_conversation(c.id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(
+            got.updated_at, c.updated_at,
+            "changing the model must not bump updated_at"
+        );
+        let listed = db.list_conversations().await.unwrap();
+        assert_eq!(
+            listed[0].model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        let found = db.search_conversations("t".into()).await.unwrap();
+        assert_eq!(found[0].model.as_deref(), Some("anthropic/claude-sonnet-4"));
+
+        // The Auto constant is stored verbatim.
+        assert!(db
+            .set_conversation_model(c.id.clone(), Some("vortex/auto".into()))
+            .await
+            .unwrap());
+        assert_eq!(
+            db.get_conversation(c.id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("vortex/auto")
+        );
+
+        // Clearing returns to inherit-default.
+        assert!(db.set_conversation_model(c.id.clone(), None).await.unwrap());
+        assert!(db
+            .get_conversation(c.id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .model
+            .is_none());
+
+        // Unknown conversation reports "not found" rather than failing.
+        assert!(!db
+            .set_conversation_model("missing".into(), Some("x".into()))
+            .await
+            .unwrap());
     }
 }
