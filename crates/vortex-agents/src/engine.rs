@@ -7,7 +7,7 @@
 
 use crate::approvals::ApprovalManager;
 use crate::browser::BrowserManager;
-use crate::errors::ToolError;
+use crate::errors::{Risk, ToolError};
 use crate::file_state::FileState;
 use crate::hub::Hub;
 use crate::media_context::{self, MediaContext, MediaSupport, ModelCatalog, PdfReplay};
@@ -26,7 +26,8 @@ use vortex_core::{AttachmentStore, Db};
 use vortex_llm::llm::PdfEngine;
 use vortex_llm::{CompletionRequest, LlmClient, LlmEvent};
 use vortex_types::{
-    ChatMessage, Mode, RunEvent, RunInfo, RunStatus, Settings, ToolCallRecord, Usage,
+    ApprovalPolicy, ChatMessage, Mode, PlanStep, RunEvent, RunInfo, RunOrigin, RunStatus, Settings,
+    ToolCallRecord, Usage,
 };
 
 pub struct Engine {
@@ -38,19 +39,37 @@ pub struct Engine {
     pub db: Db,
     pub browser: Arc<BrowserManager>,
     pub previews: Arc<PreviewRegistry>,
-    pub search: Option<Arc<dyn SearchProvider>>,
     pub http: SafeHttp,
     pub file_state: Arc<FileState>,
     attachments: Option<Arc<AttachmentStore>>,
     catalog: ModelCatalog,
-    settings: tokio::sync::RwLock<Settings>,
+    /// Saved settings and the live search provider behind ONE lock, so no
+    /// reader (probe, run admission) can observe a mixed snapshot while a
+    /// settings save swaps the provider. The server rebuilds the provider
+    /// when search settings are saved, so a changed/removed URL applies to
+    /// subsequent runs without a restart; admitted runs carry their own
+    /// snapshot in `RunSpec` and are unaffected by later saves.
+    runtime: tokio::sync::RwLock<RuntimeState>,
     /// Engine self-reference for the delegate tool (set once after Arc::new).
     pub self_ref: Arc<OnceLock<Arc<Engine>>>,
 }
 
+/// Settings + live search provider, always read/written atomically together.
+struct RuntimeState {
+    settings: Settings,
+    search: Option<Arc<dyn SearchProvider>>,
+}
+
 /// Which tools a mode exposes, after applying the user's toggles and the
 /// runtime capability detection. The registry still validates everything.
-pub fn allowed_for_mode(mode: Mode, settings: &Settings, browser_ok: bool) -> HashSet<String> {
+/// `origin` strips routine/job-authoring tools from job-origin runs (and
+/// their delegates), so injected instructions cannot self-propagate.
+pub fn allowed_for_mode(
+    mode: Mode,
+    settings: &Settings,
+    browser_ok: bool,
+    origin: &RunOrigin,
+) -> HashSet<String> {
     let mut set = HashSet::new();
     set.insert("update_plan".to_string());
     set.insert("request_approval".to_string());
@@ -111,6 +130,53 @@ pub fn allowed_for_mode(mode: Mode, settings: &Settings, browser_ok: bool) -> Ha
                 add(&mut set, "delegate_subtask");
             }
         }
+        Mode::Agent => {
+            // Union of the research/coding/browser toolsets, subject to the
+            // same toggles and capability detection.
+            if settings.tools.search {
+                add(&mut set, "web_search");
+                add(&mut set, "fetch_url");
+            }
+            if settings.tools.files {
+                for t in [
+                    "list_files",
+                    "read_file",
+                    "write_file",
+                    "edit_file",
+                    "search_files",
+                    "delete_path",
+                ] {
+                    add(&mut set, t);
+                }
+            }
+            if settings.tools.commands {
+                add(&mut set, "run_command");
+            }
+            if settings.tools.previews {
+                add(&mut set, "start_preview");
+                add(&mut set, "stop_preview");
+            }
+            if settings.tools.browser && browser_ok {
+                for t in [
+                    "browser_navigate",
+                    "browser_read",
+                    "browser_click",
+                    "browser_type",
+                ] {
+                    add(&mut set, t);
+                }
+            }
+            if delegation {
+                add(&mut set, "delegate_subtask");
+            }
+            // Authoring tools are interactive-only: job-origin runs (and
+            // their delegates) can never draft or schedule new work.
+            if !origin.is_job() {
+                add(&mut set, "save_routine");
+                add(&mut set, "list_routines");
+                add(&mut set, "propose_schedule");
+            }
+        }
     }
     set
 }
@@ -166,9 +232,89 @@ pub struct RunSpec {
     pub messages: Vec<ChatMessage>,
     pub model: String,
     pub settings: Settings,
+    /// Search-provider snapshot captured when the run was admitted (or, for
+    /// sub-agents, inherited from the parent's context). Later settings saves
+    /// never mutate a pending or active run's provider.
+    pub search: Option<Arc<dyn SearchProvider>>,
     pub cancel: CancellationToken,
     pub is_root: bool,
     pub needs_slot: bool,
+    /// Interactive vs job-origin. Job runs park approvals and never receive
+    /// authoring tools; delegates inherit their root's origin.
+    pub origin: RunOrigin,
+    /// Approval wait behavior for this run (interactive timeout vs park).
+    pub approval_policy: ApprovalPolicy,
+}
+
+/// Admission input for a fresh job occurrence run (supervisor → engine).
+/// Frozen at Phase 2 start; SA3 implements `start_job_run`.
+pub struct JobRunSpec {
+    pub job_id: String,
+    pub occurrence_id: String,
+    pub conversation_id: String,
+    /// Short run task label (job name + tick).
+    pub task: String,
+    /// Routine-version instructions with any steer note already applied.
+    pub instructions: String,
+    pub mode: Mode,
+    /// Pinned model id, or `None`/Vortex Auto for server-side resolution.
+    pub model: Option<String>,
+    /// Resolved job workspace (scratch dir already created by supervisor).
+    pub workspace: Option<String>,
+    pub budgets: vortex_types::JobBudgets,
+}
+
+/// Step-boundary classification of an interrupted run's last tool call
+/// (Decision 2: never auto-re-execute an unconfirmed consequential step).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationSafety {
+    /// No unconfirmed consequential step: continuation may proceed.
+    Safe,
+    /// Possibly half-executed consequential step: human review required.
+    NeedsReview { tool: String, call_id: String },
+}
+
+/// Classify the interrupted run's tool-call history (oldest first, as
+/// returned by `Db::list_tool_calls`). A row whose summary is still
+/// `"running"` is an UNCONFIRMED completion: the engine writes it before
+/// execution and rewrites it afterwards, so a crash in between leaves the
+/// step possibly half-executed. Any unconfirmed consequential step — or an
+/// unconfirmed call to a tool the registry no longer knows — blocks
+/// automatic continuation (first such row wins). Confirmed rows never flag.
+pub fn classify_last_step(registry: &ToolRegistry, calls: &[ToolCallRecord]) -> ContinuationSafety {
+    for call in calls {
+        if call.summary != "running" {
+            continue;
+        }
+        let unconfirmed_risk = match registry.get(&call.tool) {
+            Some(tool) => tool.risk() == Risk::Consequential,
+            // Unknown tool: its risk cannot be verified, so treat it as
+            // consequential rather than assume it was harmless.
+            None => true,
+        };
+        if unconfirmed_risk {
+            return ContinuationSafety::NeedsReview {
+                tool: call.tool.clone(),
+                call_id: call.id.clone(),
+            };
+        }
+    }
+    ContinuationSafety::Safe
+}
+
+/// Seed for a step-boundary continuation of an interrupted job occurrence.
+/// The supervisor builds it from persisted transcript + plan + checkpoints;
+/// `review_flags` list possibly-half-executed consequential steps that must
+/// never be auto-re-executed (they are surfaced for human review instead).
+pub struct ContinuationSeed {
+    pub job_id: String,
+    pub occurrence_id: String,
+    pub prior_run_id: String,
+    pub conversation_id: String,
+    pub task: String,
+    pub messages: Vec<ChatMessage>,
+    pub plan: Vec<PlanStep>,
+    pub review_flags: Vec<String>,
 }
 
 /// Settings and model input support captured before accepting a turn, plus
@@ -181,6 +327,9 @@ pub struct ChatPreflight {
     /// Concrete provider model id for this turn: the pinned preference passed
     /// through, or the Auto-routed pick.
     resolved_model: String,
+    /// Search-provider snapshot taken atomically with `settings`, so the run
+    /// can never pair new settings with a stale provider (or vice versa).
+    search: Option<Arc<dyn SearchProvider>>,
 }
 
 /// Model catalog plus honest freshness metadata for `GET /api/models`.
@@ -228,18 +377,24 @@ impl Engine {
             db,
             browser,
             previews,
-            search,
             http,
             file_state: Arc::new(FileState::new()),
             attachments,
             catalog: ModelCatalog::default(),
-            settings: tokio::sync::RwLock::new(settings),
+            runtime: tokio::sync::RwLock::new(RuntimeState { settings, search }),
             self_ref: Arc::new(OnceLock::new()),
         })
     }
 
     pub async fn current_settings(&self) -> Settings {
-        self.settings.read().await.clone()
+        self.runtime.read().await.settings.clone()
+    }
+
+    /// Atomic (settings, search provider) snapshot — the pair always belongs
+    /// together, so probes and run admission never observe a mixed state.
+    pub async fn settings_and_search(&self) -> (Settings, Option<Arc<dyn SearchProvider>>) {
+        let state = self.runtime.read().await;
+        (state.settings.clone(), state.search.clone())
     }
 
     pub async fn models(&self) -> Result<Arc<Vec<vortex_types::ModelInfo>>, vortex_llm::LlmError> {
@@ -266,7 +421,7 @@ impl Engine {
         conversation_id: &str,
         attachments: &[vortex_types::AttachmentRef],
     ) -> Result<ChatPreflight, &'static str> {
-        let settings = self.current_settings().await;
+        let (settings, search) = self.settings_and_search().await;
         let support = match &self.attachments {
             Some(store) => {
                 media_context::preflight(
@@ -286,6 +441,7 @@ impl Engine {
             settings,
             support,
             resolved_model,
+            search,
         })
     }
 
@@ -307,7 +463,8 @@ impl Engine {
         attachments: &[vortex_types::AttachmentRef],
         history: &[vortex_types::StoredMessage],
     ) -> Result<ChatPreflight, String> {
-        let settings = self.current_settings().await;
+        // Settings and provider are one atomic snapshot for the whole turn.
+        let (settings, search) = self.settings_and_search().await;
         let effective = match model_pref.map(str::trim).filter(|p| !p.is_empty()) {
             Some(preference) => preference.to_string(),
             None => settings.model.clone(),
@@ -335,6 +492,7 @@ impl Engine {
             settings,
             support,
             resolved_model,
+            search,
         })
     }
 
@@ -392,7 +550,12 @@ impl Engine {
     ) -> crate::routing::AutoRequirements {
         use crate::routing::{attachment_tokens, estimate_text_tokens, AttachmentShape};
 
-        let allowed = allowed_for_mode(mode, settings, self.browser.is_available());
+        let allowed = allowed_for_mode(
+            mode,
+            settings,
+            self.browser.is_available(),
+            &RunOrigin::Interactive,
+        );
         let tools = self.registry.schemas(&allowed);
         let system = crate::prompts::coordinator_system_prompt(mode, settings);
         let mut est: u64 = estimate_text_tokens(system.len() as u64)
@@ -475,7 +638,34 @@ impl Engine {
 
     pub async fn update_settings(&self, settings: Settings) {
         self.scheduler.set_limit(settings.agents.max_concurrent);
-        self.settings.write().await.clone_from(&settings);
+        self.runtime.write().await.settings.clone_from(&settings);
+    }
+
+    /// Atomically apply newly saved settings together with the search
+    /// provider rebuilt from them (server settings-save path). One lock hold:
+    /// readers see either the old pair or the new pair, never a mix.
+    pub async fn apply_saved_settings(
+        &self,
+        settings: Settings,
+        search: Option<Arc<dyn SearchProvider>>,
+    ) {
+        self.scheduler.set_limit(settings.agents.max_concurrent);
+        let mut state = self.runtime.write().await;
+        state.settings = settings;
+        state.search = search;
+    }
+
+    /// The provider runs would use right now (also what the Settings search
+    /// probe exercises). `None` when search is unconfigured.
+    pub async fn search_provider(&self) -> Option<Arc<dyn SearchProvider>> {
+        self.runtime.read().await.search.clone()
+    }
+
+    /// Swap the live provider without touching settings (atomic under the
+    /// same single lock). Admitted runs hold their own snapshot and are
+    /// unaffected.
+    pub async fn set_search_provider(&self, provider: Option<Arc<dyn SearchProvider>>) {
+        self.runtime.write().await.search = provider;
     }
 
     fn build_context(&self, spec: &RunSpec) -> (ToolContext, mpsc::Receiver<RunEvent>) {
@@ -502,11 +692,266 @@ impl Engine {
             conversation_id: spec.conversation_id.clone(),
             file_state: self.file_state.clone(),
             http: self.http.clone(),
-            search: self.search.clone(),
+            search: spec.search.clone(),
             browser: Some(self.browser.clone()),
             previews: self.previews.clone(),
+            origin: spec.origin.clone(),
+            approval_policy: spec.approval_policy,
         };
         (ctx, rx)
+    }
+
+    /// Admit a fresh job occurrence run: origin Job, ParkUntilDecided
+    /// approvals, job budgets applied to the settings snapshot, authoring
+    /// tools stripped. Registers the hub handle + persists the run row, then
+    /// spawns execution. Returns the run id and a handle the supervisor
+    /// awaits for the outcome (the task hub-removes the run when done).
+    pub async fn start_job_run(
+        self: &Arc<Self>,
+        spec: JobRunSpec,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<String, RunError>>), RunError> {
+        let (settings, search) = self.settings_and_search().await;
+        let settings = Self::job_settings(settings, spec.budgets, spec.workspace.clone());
+        let origin = RunOrigin::Job {
+            job_id: spec.job_id.clone(),
+            occurrence_id: spec.occurrence_id.clone(),
+        };
+        // A pinned model passes through verbatim; None/Vortex Auto resolves
+        // exactly once here, before the run is accepted (same rule as chat
+        // sends — never a silent fallback to another model).
+        let model = match spec.model.as_deref() {
+            None | Some(vortex_types::VORTEX_AUTO_MODEL) => self
+                .resolve_auto_model(spec.mode, &settings, &spec.instructions, &[], &[])
+                .await
+                .map_err(RunError::Failed)?,
+            Some(pinned) => pinned.to_string(),
+        };
+        let allowed = allowed_for_mode(spec.mode, &settings, self.browser.is_available(), &origin);
+        let mut messages = vec![ChatMessage::system(crate::prompts::job_system_prompt(
+            &settings,
+        ))];
+        // The job conversation's recent history: same user/assistant mapping
+        // and bounded 40-message window as the chat path.
+        let history = self
+            .db
+            .get_messages(spec.conversation_id.clone())
+            .await
+            .unwrap_or_default();
+        let mapped: Vec<ChatMessage> = history
+            .into_iter()
+            .filter_map(|m| {
+                let mut message = match m.role {
+                    vortex_types::Role::User => ChatMessage::user(m.content),
+                    vortex_types::Role::Assistant => ChatMessage::assistant(m.content),
+                    _ => return None,
+                };
+                message.attachments = m.attachments;
+                Some(message)
+            })
+            .collect();
+        let skip = mapped.len().saturating_sub(40);
+        messages.extend(mapped.into_iter().skip(skip));
+        messages.push(ChatMessage::user(spec.instructions.clone()));
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_spec = RunSpec {
+            run_id: run_id.clone(),
+            root_run_id: run_id.clone(),
+            conversation_id: Some(spec.conversation_id.clone()),
+            parent_run_id: None,
+            agent: "coordinator".into(),
+            task: spec.task.clone(),
+            depth: 0,
+            allowed,
+            messages,
+            model,
+            settings,
+            search,
+            cancel: CancellationToken::new(),
+            is_root: true,
+            // Job roots never consume a sub-agent slot; the supervisor's
+            // dedicated job gate bounds job concurrency instead.
+            needs_slot: false,
+            origin,
+            approval_policy: ApprovalPolicy::ParkUntilDecided,
+        };
+        Ok(self.spawn_job_root(run_spec).await)
+    }
+
+    /// Spawn a continuation run for an interrupted job occurrence, seeded
+    /// from the persisted transcript + plan. Never re-executes a
+    /// consequential tool_call whose completion is unconfirmed: those steps
+    /// arrive as `review_flags` and are surfaced for human review instead.
+    /// Derives the model from the prior run row and budgets/workspace from
+    /// the job row. Returns the run id plus a handle the supervisor awaits
+    /// for the outcome (the task hub-removes the run when done).
+    pub async fn spawn_continuation(
+        self: &Arc<Self>,
+        seed: ContinuationSeed,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<String, RunError>>), RunError> {
+        let job = self
+            .db
+            .get_job(seed.job_id.clone())
+            .await
+            .map_err(|e| RunError::Failed(format!("loading job for continuation: {e}")))?
+            .ok_or_else(|| {
+                RunError::Failed(format!(
+                    "job '{}' no longer exists; the occurrence cannot be continued",
+                    seed.job_id
+                ))
+            })?;
+        let version = self
+            .db
+            .get_routine_version(job.routine_id.clone(), job.routine_version)
+            .await
+            .map_err(|e| RunError::Failed(format!("loading pinned routine version: {e}")))?
+            .ok_or_else(|| {
+                RunError::Failed(format!(
+                    "routine '{}' version {} no longer exists; the job's pinned instructions \
+                     are gone",
+                    job.routine_id, job.routine_version
+                ))
+            })?;
+        // Budgets and workspace come from the durable job row, never from
+        // the interrupted run. No explicit workspace → the per-job scratch
+        // dir (created best-effort, same location the supervisor uses).
+        let workspace = match job.workspace.clone() {
+            Some(w) => Some(w),
+            None => {
+                let scratch = crate::job_scratch_dir(&job.id);
+                let _ = std::fs::create_dir_all(&scratch);
+                Some(scratch.to_string_lossy().to_string())
+            }
+        };
+        let (settings, search) = self.settings_and_search().await;
+        let settings = Self::job_settings(settings, job.budgets, workspace);
+        // The continuation inherits the prior run's resolved model verbatim;
+        // only a missing prior row falls back to the configured default.
+        let model = match self.db.get_run(seed.prior_run_id.clone()).await {
+            Ok(Some(prior)) => prior.model,
+            _ => settings.model.clone(),
+        };
+        let origin = RunOrigin::Job {
+            job_id: seed.job_id.clone(),
+            occurrence_id: seed.occurrence_id.clone(),
+        };
+        let allowed = allowed_for_mode(
+            version.mode,
+            &settings,
+            self.browser.is_available(),
+            &origin,
+        );
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_spec = RunSpec {
+            run_id: run_id.clone(),
+            root_run_id: run_id.clone(),
+            conversation_id: Some(seed.conversation_id.clone()),
+            parent_run_id: None,
+            agent: "coordinator".into(),
+            task: seed.task.clone(),
+            depth: 0,
+            allowed,
+            // Seeded transcript VERBATIM: system + prior work + the
+            // supervisor's continuation instruction (plan/review flags are
+            // human-review signals inside it, never executable steps). This
+            // admits a fresh run loop — nothing is re-executed here.
+            messages: seed.messages,
+            model,
+            settings,
+            search,
+            cancel: CancellationToken::new(),
+            is_root: true,
+            needs_slot: false,
+            origin,
+            approval_policy: ApprovalPolicy::ParkUntilDecided,
+        };
+        Ok(self.spawn_job_root(run_spec).await)
+    }
+
+    /// Apply per-job budgets to an admitted settings snapshot (turn cap,
+    /// token cap, wall-clock floor) and pin the job workspace.
+    fn job_settings(
+        base: Settings,
+        budgets: vortex_types::JobBudgets,
+        workspace: Option<String>,
+    ) -> Settings {
+        let mut settings = base;
+        settings.agents.max_iterations = budgets.max_turns.max(1);
+        settings.agents.max_total_tokens = budgets.max_tokens;
+        settings.agents.run_timeout_secs = budgets.run_timeout_secs.max(30);
+        settings.workspace = workspace;
+        settings
+    }
+
+    /// Register + persist + spawn a job-root run (shared admission tail of
+    /// `start_job_run` and `spawn_continuation`). Mirrors the chat path:
+    /// hub handle, Running row, catch_unwind boundary, hub.remove on success
+    /// (skipped on panic, preserving stuck-run recovery behavior).
+    async fn spawn_job_root(
+        self: &Arc<Self>,
+        spec: RunSpec,
+    ) -> (String, tokio::task::JoinHandle<Result<String, RunError>>) {
+        let run_id = spec.run_id.clone();
+        self.hub.register(
+            &run_id,
+            None,
+            spec.conversation_id.clone(),
+            &spec.agent,
+            &spec.task,
+            &spec.model,
+            spec.depth,
+            spec.cancel.clone(),
+        );
+        let persisted = self
+            .db
+            .upsert_run(&RunInfo {
+                id: run_id.clone(),
+                parent_run_id: None,
+                conversation_id: spec.conversation_id.clone(),
+                agent: spec.agent.clone(),
+                task: spec.task.clone(),
+                model: spec.model.clone(),
+                status: RunStatus::Running,
+                error: None,
+                usage: None,
+                plan: Vec::new(),
+                depth: spec.depth,
+                created_at: vortex_core::db::now(),
+                updated_at: vortex_core::db::now(),
+            })
+            .await;
+        if persisted.is_err() {
+            diag::event(
+                tracing::Level::ERROR,
+                diag::DB_PERSIST_FAILED,
+                &[
+                    ("op", diag::Field::Static("run_upsert")),
+                    ("run_id", diag::Field::Uuid(run_id.as_str())),
+                ],
+            );
+        }
+        let engine = self.clone();
+        let handle = tokio::spawn(async move {
+            let rid = spec.run_id.clone();
+            let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                engine.execute_run(spec),
+            ))
+            .await;
+            match outcome {
+                Ok(result) => {
+                    engine.hub.remove(&rid);
+                    result
+                }
+                Err(payload) => {
+                    diag::event(
+                        tracing::Level::ERROR,
+                        diag::COORDINATOR_TASK_PANIC,
+                        &[("run_id", diag::Field::Uuid(rid.as_str()))],
+                    );
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        });
+        (run_id, handle)
     }
 
     /// Drive one run to completion. Returns the final assistant text.
@@ -706,7 +1151,7 @@ impl Engine {
         user_message: &str,
         user_attachments: Vec<vortex_types::AttachmentRef>,
     ) -> String {
-        let settings = self.current_settings().await;
+        let (settings, search) = self.settings_and_search().await;
         // Legacy direct-engine path: the configured model is used verbatim
         // (no Auto resolution); HTTP sends go through `preflight_chat_for_send`.
         let resolved_model = settings.model.clone();
@@ -714,6 +1159,7 @@ impl Engine {
             settings,
             support: None,
             resolved_model,
+            search,
         };
         let mut user = ChatMessage::user(user_message);
         user.attachments = user_attachments;
@@ -766,10 +1212,17 @@ impl Engine {
             settings,
             support,
             resolved_model,
+            search,
         } = preflight;
         let run_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
-        let allowed = allowed_for_mode(mode, &settings, self.browser.is_available());
+        let allowed = allowed_for_mode(
+            mode,
+            &settings,
+            self.browser.is_available(),
+            &RunOrigin::Interactive,
+        );
+        let approval_policy = ApprovalPolicy::TimeoutSecs(settings.agents.approval_timeout_secs);
         let system = crate::prompts::coordinator_system_prompt(mode, &settings);
         let mut messages = vec![ChatMessage::system(system)];
         // Keep context bounded: the most recent 40 turns.
@@ -801,9 +1254,14 @@ impl Engine {
             // Auto pick); it flows unchanged through every engine iteration.
             model: resolved_model,
             settings,
+            // Admitted-run snapshot: later settings saves swap the engine's
+            // live provider but never this run's.
+            search,
             cancel,
             is_root: true,
             needs_slot: false,
+            origin: RunOrigin::Interactive,
+            approval_policy,
         };
         self.hub.register(
             &run_id,
@@ -1451,9 +1909,16 @@ impl Engine {
             // whole run tree.
             model: parent.model.clone(),
             settings,
+            // Sub-agents inherit the parent run's provider snapshot, keeping
+            // the whole run tree on one settings/provider pair.
+            search: parent.search.clone(),
             cancel,
             is_root: false,
             needs_slot: true,
+            // Delegates inherit the root's origin and approval policy: a job
+            // tree stays job-origin (no authoring tools, parked approvals).
+            origin: parent.origin.clone(),
+            approval_policy: parent.approval_policy,
         };
         self.hub.register(
             &run_id,
@@ -1562,6 +2027,9 @@ pub fn build_registry(
     reg!(crate::tools_browser::BrowserTypeTool);
     reg!(crate::tools_meta::UpdatePlanTool);
     reg!(crate::tools_meta::RequestApprovalTool);
+    reg!(crate::tools_routines::SaveRoutineTool);
+    reg!(crate::tools_routines::ListRoutinesTool);
+    reg!(crate::tools_routines::ProposeScheduleTool);
     registry.register(std::sync::Arc::new(crate::tools_delegate::DelegateTool {
         engine_slot,
     }));

@@ -101,10 +101,10 @@ pub fn ChatView() -> impl IntoView {
                     </For>
                     <Show when=move || !ctx.stream_display.get().is_empty()>
                         <div class="msg assistant streaming">
-                            <span class="message-model">{move || {
+                            <span class="message-model" title="Requested model; serving model not reported yet">{move || {
                                 let run = ctx.run_id.get();
                                 ctx.run_model.get().filter(|(id, _)| Some(id) == run.as_ref())
-                                    .map(|(_, model)| format!("Requested: {model}"))
+                                    .map(|(_, model)| model)
                             }}</span>
                             <div class="msg-body markdown"
                                 inner_html=move || crate::markdown::render_markdown(&ctx.stream_display.get())>
@@ -131,10 +131,13 @@ pub fn ChatView() -> impl IntoView {
                         }
                     }
                 >
-                    <RunControls />
-                    <crate::model_picker::ModelPicker />
-                    <crate::session_usage::UsageBadge />
-                    <Show when=move || !ctx.pending_attachments.get().is_empty()>
+                    <div class="composer-options">
+                      <div class="composer-meta">
+                        <crate::model_picker::ModelPicker />
+                        <crate::session_usage::UsageBadge />
+                        <RunControls />
+                      </div>
+                      <Show when=move || !ctx.pending_attachments.get().is_empty()>
                         <div class="composer-chips">
                             <For
                                 each=move || ctx.pending_attachments.get()
@@ -145,7 +148,8 @@ pub fn ChatView() -> impl IntoView {
                             </For>
                         </div>
                         <p class="attachment-notice">"Uploads stay local until you send. Sending shares eligible files with the configured model provider."</p>
-                    </Show>
+                      </Show>
+                    </div>
                     <div class="composer-row">
                         <button class="icon-btn attach" aria-label="Attach files" title="Attach images, videos, PDFs, or text files"
                             on:click=move |_| {
@@ -514,43 +518,37 @@ fn MessageBubble(msg: StoredMessage) -> impl IntoView {
     let model = if is_user {
         None
     } else {
-        Some(match (msg.serving_model, msg.requested_model) {
-            (Some(serving), Some(requested)) if serving != requested => {
-                format!("{serving} (requested: {requested})")
-            }
-            (Some(serving), _) => serving,
-            (None, Some(requested)) => {
-                format!("Requested: {requested}; serving model not reported")
-            }
-            (None, None) => "Model not recorded".into(),
-        })
+        match (msg.serving_model, msg.requested_model) {
+            (Some(serving), _) => Some((serving, String::new())),
+            (None, Some(requested)) => Some((
+                requested,
+                "Requested model; serving model not reported".into(),
+            )),
+            (None, None) => None,
+        }
     };
     view! {
         <div class=if is_user { "msg user" } else { "msg assistant" }>
             <div class="msg-head">
                 <span class="who">{if is_user { "You" } else { "Vortex" }}</span>
-                {model.map(|label| view! { <span class="message-model">{label}</span> })}
+                {model.map(|(label, tip)| view! { <span class="message-model" title=tip>{label}</span> })}
                 <button class="icon-btn copy"
                     title="Copy message"
                     on:click=move |_| copy_text(&raw)>"⧉"</button>
             </div>
             <div class="msg-body markdown" inner_html=markdown></div>
-            {(!is_user).then(|| match msg.reply_summary {
-                Some(summary) => {
-                    let finish = match summary.finish {
-                        ReplyFinish::Stop => "Normal stop (task may be incomplete)",
-                        ReplyFinish::Length if raw_is_empty => "Output limit reached; no text returned",
-                        ReplyFinish::Length => "Output limit reached; partial reply",
-                        ReplyFinish::ContentFilter => "Stopped by provider content filter",
-                        ReplyFinish::Error => "Provider reported a generation error",
-                        ReplyFinish::NotReported => "Stop reason not reported",
-                        ReplyFinish::Other => "Other provider stop reason",
-                    };
-                    let usage = summary.completion_tokens.map(|count| count.to_string()).unwrap_or_else(|| "not reported".into());
-                    format!("{finish} · Requested output allowance: {} tokens · Reported completion tokens: {usage}", summary.requested_output_tokens)
-                }
-                None => "Stop reason, output allowance and completion usage not recorded".into(),
-            }).map(|label| view! { <small class="message-model">{label}</small> })}
+            {msg.reply_summary.as_ref().filter(|_| !is_user).and_then(|summary| {
+                let (label, class) = match summary.finish {
+                    ReplyFinish::Length if raw_is_empty => ("Output limit reached — no text returned", "msg-flag warn"),
+                    ReplyFinish::Length => ("Output limit reached — partial reply", "msg-flag warn"),
+                    ReplyFinish::ContentFilter => ("Stopped by content filter", "msg-flag warn"),
+                    ReplyFinish::Error => ("Provider generation error", "msg-flag error"),
+                    _ => return None,
+                };
+                let usage = summary.completion_tokens.map(|count| count.to_string()).unwrap_or_else(|| "not reported".into());
+                let tip = format!("Requested output allowance: {} tokens · Reported completion tokens: {usage}", summary.requested_output_tokens);
+                Some(view! { <span class=class role="status" title=tip>{label}</span> })
+            })}
             {(!attachments.is_empty()).then(|| view! {
                 <div class="attachments">
                     {attachments.iter().map(|a| view! { <AttachmentView att=a.clone() /> }).collect::<Vec<_>>()}

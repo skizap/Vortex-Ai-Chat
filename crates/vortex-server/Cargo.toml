@@ -16,6 +16,7 @@ vortex-llm = { workspace = true }
 vortex-agents = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }

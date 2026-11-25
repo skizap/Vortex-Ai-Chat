@@ -291,7 +291,7 @@ pub(crate) fn ModelBrowser(
                 <Show when=move || {
                     cat.catalog.with(|c| c.as_ref().map(|c| c.recommended.is_empty()).unwrap_or(false))
                 }>
-                    <p class="hint">"No verified open-weights models within the current bounds are available in this catalog. Unknown prices or licenses never appear here; they stay in All models below. Widen the bounds to see more."</p>
+                    <p class="hint">"No verified open-weights models fit the current bounds; widen them or browse All models below."</p>
                 </Show>
                 <p class="hint">{move || cat.catalog.with(|c| c.as_ref().map(bounds_text).unwrap_or_default())}</p>
                 <details class="model-bounds">
@@ -314,7 +314,7 @@ pub(crate) fn ModelBrowser(
                         </label>
                         <button class="btn" disabled=move || cat.loading.get() on:click=apply_bounds>"Apply"</button>
                     </div>
-                    <p class="hint">"Bounds apply to the Recommended shortlist only; All models always shows the full catalog. The server clamps values and echoes what it applied. These edits are not persisted."</p>
+                    <p class="hint">"Bounds filter only the Recommended shortlist; these session-only edits are clamped and echoed by the server."</p>
                 </details>
             </div>
         </Show>
@@ -373,22 +373,34 @@ pub(crate) fn ModelBrowser(
                 .unwrap_or((16_384, 200_000));
             if is_auto(&id) {
                 return view! {
-                    <p>{auto_copy(&id)}</p>
-                    <OutputFacts model=None router=true ceiling budget />
+                    <p class="model-summary">"Model chosen per turn"</p>
+                    <details class="model-details">
+                        <summary>"Model details"</summary>
+                        <p>{auto_copy(&id)}</p>
+                        <OutputFacts model=None router=true ceiling budget />
+                    </details>
                 }.into_any();
             }
             match cat.lookup(&id) {
                 Some(model) => view! {
-                    <Capabilities model=model.clone() />
-                    <OutputFacts model=Some(model) router=false ceiling budget />
+                    <p class="model-summary">{model_summary(&model)}</p>
+                    <details class="model-details">
+                        <summary>"Model details"</summary>
+                        <Capabilities model=model.clone() />
+                        <OutputFacts model=Some(model) router=false ceiling budget />
+                    </details>
                 }.into_any(),
                 None => {
                     if cat.loading.get() && cat.catalog.with(|c| c.is_none()) {
                         return ().into_any();
                     }
                     view! {
-                        <p>"The catalog does not report capabilities, pricing or limits for this model ID. You can still pin it; server-side validation stays authoritative."</p>
-                        <OutputFacts model=None router=false ceiling budget />
+                        <p class="model-summary">"Limits not reported by catalog"</p>
+                        <details class="model-details">
+                            <summary>"Model details"</summary>
+                            <p class="hint">"You can still pin this model; server-side validation stays authoritative."</p>
+                            <OutputFacts model=None router=false ceiling budget />
+                        </details>
                     }.into_any()
                 }
             }
@@ -509,6 +521,11 @@ pub(crate) fn ModelPicker() -> impl IntoView {
             .unwrap_or_else(|| AUTO.into())
     };
     Effect::new(move || {
+        if ctx.mode.get() == vortex_types::Mode::Research {
+            cat.ensure();
+        }
+    });
+    Effect::new(move || {
         let id = ctx.current.get();
         saved.set(None);
         if let Some(id) = id {
@@ -592,6 +609,11 @@ pub(crate) fn ModelPicker() -> impl IntoView {
                 }}
             </div>
         </details>
+        <Show when=move || ctx.mode.get() == vortex_types::Mode::Research>
+            <crate::settings_ui::ResearchStatus unsupported=Signal::derive(move || {
+                cat.lookup(&current_model()).and_then(|model| model.supports_tools) == Some(false)
+            }) />
+        </Show>
         <p class="model-warning" role="status">{move || {
             let id = current_model();
             let needed = ctx.pending_attachments.with(|chips| chips.iter().filter_map(|chip| match &chip.state {
@@ -677,6 +699,49 @@ pub(crate) fn model_label(id: &str) -> &str {
         AUTO => "Vortex Auto (lowest estimated cost)",
         OPENROUTER_AUTO => "OpenRouter Auto (provider decides)",
         id => id,
+    }
+}
+
+/// One-line essentials for the selected model: reported context, text rates
+/// and tool support only. Missing facts are omitted, never guessed; the full
+/// tables stay available in the Model details disclosure.
+fn model_summary(m: &ModelInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = m.context_length.filter(|&c| c > 0) {
+        parts.push(format!("{} context", compact_count(c)));
+    }
+    if let (Some(i), Some(o)) = (
+        price(m.pricing_prompt.as_deref()),
+        price(m.pricing_completion.as_deref()),
+    ) {
+        parts.push(format!(
+            "${} in / ${} out per Mtok",
+            trim_usd(i * 1_000_000.0),
+            trim_usd(o * 1_000_000.0)
+        ));
+    }
+    match m.supports_tools {
+        Some(true) => parts.push("tools: yes".into()),
+        Some(false) => parts.push("tools: no".into()),
+        None => {}
+    }
+    if parts.is_empty() {
+        "Limits not reported by catalog".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Compact count for summary lines: 128000 → "128k", 1000000 → "1M".
+fn compact_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        let s = format!("{:.1}", n as f64 / 1_000_000.0);
+        format!("{}M", s.trim_end_matches('0').trim_end_matches('.'))
+    } else if n >= 1_000 {
+        let s = format!("{:.1}", n as f64 / 1_000.0);
+        format!("{}k", s.trim_end_matches('0').trim_end_matches('.'))
+    } else {
+        n.to_string()
     }
 }
 
@@ -944,6 +1009,38 @@ mod tests {
         assert!(text
             .contains("weekly token usage (openrouter sort=top-weekly) — popularity, not quality"));
         assert!(text.contains("last-known-good"));
+    }
+
+    #[test]
+    fn model_summary_reports_essentials_only() {
+        let m = ModelInfo {
+            id: "qwen/qwen3-32b".into(),
+            name: "Qwen3 32B".into(),
+            context_length: Some(128_000),
+            pricing_prompt: Some("0.0000004".into()),
+            pricing_completion: Some("0.0000016".into()),
+            supports_tools: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_summary(&m),
+            "128k context · $0.4 in / $1.6 out per Mtok · tools: yes"
+        );
+        let sparse = ModelInfo {
+            context_length: Some(0),
+            supports_tools: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(model_summary(&sparse), "tools: no");
+        assert_eq!(
+            model_summary(&ModelInfo::default()),
+            "Limits not reported by catalog"
+        );
+        assert_eq!(compact_count(4_096), "4.1k");
+        assert_eq!(compact_count(128_000), "128k");
+        assert_eq!(compact_count(1_000_000), "1M");
+        assert_eq!(compact_count(1_048_576), "1M");
+        assert_eq!(compact_count(999), "999");
     }
 
     #[test]

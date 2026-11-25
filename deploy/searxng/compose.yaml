@@ -1,0 +1,40 @@
+# Opt-in local SearXNG for Vortex research mode (loopback only).
+#
+#   cp .env.example .env   # then set a random SEARXNG_SECRET
+#   docker compose up -d
+#   curl 'http://127.0.0.1:8888/search?q=test&format=json'
+#
+# See README.md -> "Search setup (research mode)".
+
+name: vortex-searxng
+
+services:
+  searxng:
+    # Pinned official image: tag 2026.11.21-c6ee3e9fd + amd64 manifest digest.
+    image: searxng/searxng:2026.11.21-c6ee3e9fd@sha256:fc1d81d7e9d04d3c8b3e23c7162feddf5c3d6aecd32e67a56eaabcb8d8747f79
+    container_name: vortex-searxng
+    # Run as the image's searxng user (977:977) so the entrypoint cannot
+    # chown the bind-mounted config directory on the host.
+    user: "977:977"
+    restart: unless-stopped
+    environment:
+      # Overrides the server.secret_key placeholder in config/settings.yml.
+      # Lives only in the untracked .env next to this file.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?copy .env.example to .env and set a random SEARXNG_SECRET}
+    ports:
+      # Local publishing only - never expose this instance to the LAN.
+      - "127.0.0.1:8888:8080"
+    volumes:
+      # Read-only: the instance needs no writes here and the repo copy of
+      # settings.yml stays authoritative across restarts.
+      - ./config:/etc/searxng:ro
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/searxng/.venv/bin/python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

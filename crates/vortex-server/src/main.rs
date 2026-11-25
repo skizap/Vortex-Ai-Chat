@@ -9,11 +9,19 @@ mod mock_llm;
 mod routes_attachments;
 mod routes_ckpts;
 mod routes_conv;
+mod routes_jobs;
 mod routes_misc;
 mod routes_runs;
 mod routes_usage;
 mod state;
 mod static_files;
+
+#[cfg(test)]
+mod job_hardening_tests;
+#[cfg(test)]
+mod job_routes_tests;
+#[cfg(test)]
+mod search_probe_tests;
 
 use std::sync::Arc;
 use vortex_core::{AppConfig, Db, Paths};
@@ -58,6 +66,34 @@ async fn main() -> anyhow::Result<()> {
                  consequential actions are never replayed automatically"
             );
         }
+    }
+    // Honest interrupted-occurrence marking (mirrors the runs sweep): live
+    // job occurrences become `interrupted`; the supervisor's catch-up then
+    // decides continuation per policy — never a mid-loop replay.
+    let interrupted_occurrences = db
+        .mark_occurrences_interrupted_on_startup()
+        .await
+        .map_err(|e| diagnostics::stage_fatal("database", e.into()))?;
+    if interrupted_occurrences > 0 {
+        tracing::warn!(
+            "marked {interrupted_occurrences} job occurrence(s) as interrupted from a previous \
+             session; the supervisor will review them for safe continuation — consequential \
+             actions are never replayed automatically"
+        );
+    }
+
+    // Shipped draft routine templates: seeded once, only into an empty
+    // routines table (never overwritten, never activated). A seeding failure
+    // is logged, not fatal — templates are a convenience, not a dependency.
+    match vortex_core::job_seeds::seed_draft_routines(&db).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            "seeded {n} draft routine template(s); activate them in the Jobs tab to use them"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not seed draft routine templates; continuing startup without them"
+        ),
     }
 
     // Settings (DB) drive the engine; config drives boot-level choices.
@@ -114,17 +150,12 @@ async fn main() -> anyhow::Result<()> {
     let previews = Arc::new(vortex_agents::PreviewRegistry::new());
 
     // Search provider: SearXNG when configured, mock when the LLM is mocked.
-    let search: Option<Arc<dyn vortex_agents::search::SearchProvider>> =
-        if config.is_mock_llm() || settings.search.provider == "mock" {
-            Some(Arc::new(vortex_agents::search::MockSearchProvider))
-        } else if settings.search.is_configured() {
-            Some(Arc::new(vortex_agents::search::SearxngProvider::new(
-                &settings.search.base_url,
-            )))
-        } else {
-            tracing::info!("no search provider configured; research tools will say so honestly");
-            None
-        };
+    // Same selection policy as settings saves (state::build_search_provider),
+    // so a URL change applies to subsequent runs without a restart.
+    let search = state::build_search_provider(&settings, config.is_mock_llm());
+    if search.is_none() {
+        tracing::info!("no search provider configured; research tools will say so honestly");
+    }
 
     let approvals = Arc::new(vortex_agents::approvals::ApprovalManager::new(
         db.clone(),
@@ -150,6 +181,20 @@ async fn main() -> anyhow::Result<()> {
     );
     let _ = engine_slot.set(engine.clone());
 
+    // Job supervisor: created and started EXACTLY ONCE. Its run loop performs
+    // the startup catch-up, then ticks every second until cancelled; the job
+    // gate (2 concurrent job roots) is independent of the sub-agent scheduler.
+    let supervisor_cancel = tokio_util::sync::CancellationToken::new();
+    let supervisor = vortex_agents::supervisor::Supervisor::new(
+        db.clone(),
+        engine.clone(),
+        hub.clone(),
+        Arc::new(vortex_agents::clock::SystemClock),
+        2,
+        supervisor_cancel.clone(),
+    );
+    tokio::spawn(supervisor.clone().run());
+
     let is_mock_llm = config.is_mock_llm();
     let config =
         handle_lan_token(config, &paths).map_err(|e| diagnostics::stage_fatal("lan_token", e))?;
@@ -168,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         guard: guard_settings,
         diagnostics: diagnostics::DiagnosticsState::new(diag),
+        supervisor: supervisor.clone(),
     });
 
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
@@ -180,10 +226,17 @@ async fn main() -> anyhow::Result<()> {
     let hub_for_shutdown = hub.clone();
     let previews_for_shutdown = previews.clone();
     let browser_for_shutdown = browser.clone();
+    let supervisor_cancel_for_shutdown = supervisor_cancel.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            tracing::info!("shutting down: cancelling runs, stopping previews, closing browser");
+            tracing::info!(
+                "shutting down: stopping job supervisor, cancelling runs, stopping previews, \
+                 closing browser"
+            );
+            // Stop new job admissions FIRST (the tick loop exits on cancel;
+            // no orphan ticks), then cancel live runs and tear down the rest.
+            supervisor_cancel_for_shutdown.cancel();
             hub_for_shutdown.cancel_all();
             previews_for_shutdown.stop_all();
             browser_for_shutdown.shutdown().await;
@@ -205,6 +258,10 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
             "/api/settings",
             get(routes_misc::get_settings).put(routes_misc::put_settings),
         )
+        // Settings "Test search": guarded POST, no caller-provided URL or
+        // query — the fixed benign probe runs server-side against the saved
+        // provider. No polling; nothing is cached between calls.
+        .route("/api/settings/search/test", post(routes_misc::test_search))
         .route("/api/models", get(routes_misc::list_models))
         .route("/api/approvals", get(routes_misc::list_approvals))
         .route(
@@ -264,6 +321,50 @@ fn build_router(state: Arc<state::AppState>) -> axum::Router {
         .route("/api/runs/{id}/state", get(routes_runs::run_state))
         .route("/api/runs/{id}/stop", post(routes_runs::stop_run))
         .route("/api/runs/{id}/retry", post(routes_runs::retry_run))
+        // Jobs & routines (SA6): all inside the guard layer. Static segments
+        // (events/inbox) take precedence over the {id} capture in axum 0.8.
+        .route(
+            "/api/routines",
+            get(routes_jobs::list_routines).post(routes_jobs::create_routine),
+        )
+        .route("/api/routines/{id}", get(routes_jobs::get_routine))
+        .route(
+            "/api/routines/{id}/activate",
+            post(routes_jobs::activate_routine),
+        )
+        .route(
+            "/api/routines/{id}/archive",
+            post(routes_jobs::archive_routine),
+        )
+        .route(
+            "/api/routines/{id}/versions",
+            post(routes_jobs::add_routine_version),
+        )
+        .route(
+            "/api/jobs",
+            get(routes_jobs::list_jobs).post(routes_jobs::create_job),
+        )
+        .route("/api/jobs/events", get(routes_jobs::job_events))
+        .route("/api/jobs/inbox", get(routes_jobs::job_inbox))
+        .route(
+            "/api/jobs/{id}",
+            get(routes_jobs::get_job)
+                .patch(routes_jobs::patch_job)
+                .delete(routes_jobs::delete_job),
+        )
+        .route("/api/jobs/{id}/activate", post(routes_jobs::activate_job))
+        .route("/api/jobs/{id}/pause", post(routes_jobs::pause_job))
+        .route("/api/jobs/{id}/resume", post(routes_jobs::resume_job))
+        .route("/api/jobs/{id}/run", post(routes_jobs::run_job))
+        .route("/api/jobs/{id}/steer", post(routes_jobs::steer_job))
+        .route(
+            "/api/jobs/{id}/occurrences",
+            get(routes_jobs::list_job_occurrences),
+        )
+        .route(
+            "/api/occurrences/{id}/resolve-review",
+            post(routes_jobs::resolve_review),
+        )
         // The 8 KiB report cap is enforced inside the handler (gate and
         // content-length/stream checks run before any body extraction), so
         // it holds on this router regardless of layering.

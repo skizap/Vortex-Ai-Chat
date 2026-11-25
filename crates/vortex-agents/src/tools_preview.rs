@@ -106,7 +106,12 @@ async fn run_process_preview(
     .unwrap_or_default();
     let approved = ctx
         .approvals
-        .request(&ctx.run_id, "Approve dev-server preview", &payload)
+        .request(
+            &ctx.run_id,
+            "Approve dev-server preview",
+            &payload,
+            ctx.approval_policy,
+        )
         .await?;
     if !approved {
         return Err(ToolError::Denied(

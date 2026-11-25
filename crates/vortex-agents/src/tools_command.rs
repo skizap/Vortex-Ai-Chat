@@ -298,7 +298,12 @@ impl Tool for RunCommandTool {
             .unwrap_or_default();
             let approved = ctx
                 .approvals
-                .request(&ctx.run_id, "Approve command execution", &payload)
+                .request(
+                    &ctx.run_id,
+                    "Approve command execution",
+                    &payload,
+                    ctx.approval_policy,
+                )
                 .await?;
             if !approved {
                 return Err(ToolError::Denied(

@@ -45,10 +45,9 @@ impl SessionUsage {
         run.incomplete |= update.incomplete;
     }
 
-    fn label(&self, id: &str) -> String {
-        if self.conversation != id || (!self.loaded && !self.load_failed && self.runs.is_empty()) {
-            return "Loading session usage...".into();
-        }
+    /// Cumulative totals across runs, with the incomplete marker; `None`
+    /// until at least one run has reported usage.
+    fn totals(&self) -> Option<(Usage, bool)> {
         let mut total = Usage::default();
         let mut has_report = false;
         let mut incomplete = self.load_failed || !self.loaded;
@@ -63,21 +62,50 @@ impl SessionUsage {
             }
             incomplete |= run.incomplete;
         }
-        if !has_report {
-            return if self.load_failed {
-                "Session usage unavailable"
-            } else {
-                "No token usage reported yet"
-            }
-            .into();
+        has_report.then_some((total, incomplete))
+    }
+
+    fn label(&self, id: &str) -> String {
+        if self.conversation != id {
+            return String::new();
         }
-        format!(
-            "Session reported tokens: {} input / {} output / {} total{}",
-            total.prompt_tokens,
-            total.completion_tokens,
-            total.total_tokens,
-            if incomplete { " (incomplete)" } else { "" }
-        )
+        match self.totals() {
+            Some((total, incomplete)) => {
+                let mut label = human_tokens(total.total_tokens);
+                if incomplete {
+                    label.push_str(" (partial)");
+                }
+                label
+            }
+            None => String::new(),
+        }
+    }
+
+    fn tooltip(&self, id: &str) -> String {
+        if self.conversation != id {
+            return String::new();
+        }
+        match self.totals() {
+            Some((total, incomplete)) => format!(
+                "{} input · {} output · {} total{}",
+                total.prompt_tokens,
+                total.completion_tokens,
+                total.total_tokens,
+                if incomplete { " (incomplete)" } else { "" }
+            ),
+            None => String::new(),
+        }
+    }
+}
+
+/// Humanized token count: exact below 1k, one decimal in k/M above.
+fn human_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k tokens", n as f64 / 1_000.0)
+    } else {
+        format!("{n} tokens")
     }
 }
 
@@ -143,7 +171,7 @@ mod tests {
             conversation: "abc".into(),
             ..SessionUsage::default()
         };
-        assert_eq!(s.label("abc"), "No token usage reported yet");
+        assert_eq!(s.label("abc"), "");
         for (id, input, output, incomplete) in [
             ("root", 50, 25, false),
             ("root", 5, 2, false),
@@ -162,12 +190,25 @@ mod tests {
                 },
             );
         }
+        assert_eq!(s.label("abc"), "100 tokens (partial)");
         assert_eq!(
-            s.label("abc"),
-            "Session reported tokens: 70 input / 30 output / 100 total (incomplete)"
+            s.tooltip("abc"),
+            "70 input · 30 output · 100 total (incomplete)"
         );
         s.select("other");
-        assert_eq!(s.label("other"), "Loading session usage...");
+        assert_eq!(s.label("other"), "");
+        assert_eq!(s.tooltip("other"), "");
+    }
+
+    #[test]
+    fn humanized_token_boundaries() {
+        assert_eq!(human_tokens(0), "0 tokens");
+        assert_eq!(human_tokens(812), "812 tokens");
+        assert_eq!(human_tokens(999), "999 tokens");
+        assert_eq!(human_tokens(1_000), "1.0k tokens");
+        assert_eq!(human_tokens(12_400), "12.4k tokens");
+        assert_eq!(human_tokens(1_000_000), "1.0M tokens");
+        assert_eq!(human_tokens(1_234_567), "1.2M tokens");
     }
 }
 
@@ -175,9 +216,23 @@ mod tests {
 pub(crate) fn UsageBadge() -> impl IntoView {
     let ctx = use_context::<AppCtx>().expect("ctx provided");
     view! {
-        <div class="session-usage" aria-label="Conversation token usage">{move || {
+        {move || {
             let id = ctx.current.get().unwrap_or_default();
-            ctx.session_usage.with(|s| s.label(&id))
-        }}</div>
+            ctx.session_usage.with(|s| {
+                let label = s.label(&id);
+                if !label.is_empty() {
+                    let tip = s.tooltip(&id);
+                    return view! {
+                        <div class="session-usage" title=tip aria-label="Conversation token usage">{label}</div>
+                    }.into_any();
+                }
+                if s.conversation == id && s.load_failed {
+                    return view! {
+                        <div class="session-usage dim" aria-label="Conversation token usage">"usage unavailable"</div>
+                    }.into_any();
+                }
+                ().into_any()
+            })
+        }}
     }
 }

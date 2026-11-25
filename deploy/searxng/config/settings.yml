@@ -1,0 +1,18 @@
+# Minimal SearXNG configuration for a private, single-user Vortex instance.
+# Docs: https://docs.searxng.org/admin/settings/
+#
+# No secrets here: the SEARXNG_SECRET environment variable (untracked
+# deploy/searxng/.env, injected via compose.yaml) overrides the placeholder
+# server.secret_key at startup.
+
+use_default_settings: true
+
+server:
+  secret_key: "overridden-by-SEARXNG_SECRET-env"
+  limiter: false
+  public_instance: false
+
+search:
+  # Vortex's web_search tool calls /search?format=json; JSON must be listed
+  # here or SearXNG answers 403.
+  formats: [html, json]

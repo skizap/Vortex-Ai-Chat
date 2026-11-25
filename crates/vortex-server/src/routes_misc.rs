@@ -7,7 +7,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use std::sync::Arc;
-use vortex_types::{AgentSettings, Settings};
+use vortex_types::{
+    AgentSettings, SearchTestErrorKind, SearchTestResult, SearchTestStatus, Settings,
+};
 
 pub async fn health(State(state): State<Arc<AppState>>) -> axum::response::Response {
     Json(state.capabilities().await).into_response()
@@ -63,8 +65,145 @@ pub async fn put_settings(
     if let Err(e) = state.db.save_settings(&settings).await {
         return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    state.engine.update_settings(settings.clone()).await;
+    // Rebuild the search provider from the just-saved settings (same policy
+    // as startup) and apply settings + provider under ONE atomic engine
+    // update, so concurrent readers never pair new settings with a stale
+    // provider. A new or removed URL applies to subsequent runs without a
+    // restart; runs already admitted keep their snapshot.
+    let provider = crate::state::build_search_provider(&settings, state.is_mock_llm);
+    state
+        .engine
+        .apply_saved_settings(settings.clone(), provider)
+        .await;
     Json(settings).into_response()
+}
+
+/// Route-level hard bound for the search probe. The SearXNG client itself is
+/// bounded (5s connect / 15s total); this backstop guarantees the HTTP
+/// response always returns even if a future provider misconfigures timeouts.
+const SEARCH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// POST /api/settings/search/test — verify the saved search provider without
+/// a model call. Guarded like every route; takes no body, no caller-provided
+/// URL and no query: the fixed benign probe (`search::PROBE_QUERY`) goes
+/// through the same server-side provider and JSON parsing as `web_search`.
+/// Always answers 200 with a structured [`SearchTestResult`]; the configured
+/// URL is never echoed (it could carry credentials) and no probe state is
+/// kept server-side, so nothing here turns `/api/health` or any poll into
+/// network I/O. Error details are fixed, sanitized strings — never raw
+/// transport output.
+pub async fn test_search(State(state): State<Arc<AppState>>) -> Json<SearchTestResult> {
+    use vortex_agents::search::{SearchError, PROBE_LIMIT, PROBE_QUERY};
+
+    // One atomic snapshot: the enablement flag and the provider always
+    // belong to the same saved-settings generation.
+    let (settings, provider) = state.engine.settings_and_search().await;
+    let tested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let result = |status: SearchTestStatus,
+                  provider: &str,
+                  result_count: usize,
+                  http_status: Option<u16>,
+                  error_kind: Option<SearchTestErrorKind>,
+                  detail: Option<String>| SearchTestResult {
+        status,
+        mock: provider == "mock",
+        provider: provider.to_string(),
+        result_count,
+        http_status,
+        error_kind,
+        detail,
+        tested_at,
+    };
+
+    if !settings.tools.search {
+        let name = provider.as_ref().map(|p| p.describe()).unwrap_or("");
+        return Json(result(
+            SearchTestStatus::Disabled,
+            name,
+            0,
+            None,
+            None,
+            Some(
+                "Web tools are turned off in Settings → Tools; enable them to use search."
+                    .to_string(),
+            ),
+        ));
+    }
+    let Some(provider) = provider else {
+        return Json(result(
+            SearchTestStatus::NotConfigured,
+            "",
+            0,
+            None,
+            None,
+            Some(crate::state::SEARCH_SETUP_HINT.to_string()),
+        ));
+    };
+    let name = provider.describe();
+    match tokio::time::timeout(
+        SEARCH_PROBE_TIMEOUT,
+        provider.search(PROBE_QUERY, PROBE_LIMIT),
+    )
+    .await
+    {
+        Ok(Ok(results)) if results.is_empty() => Json(result(
+            SearchTestStatus::Empty,
+            name,
+            0,
+            None,
+            None,
+            Some(
+                "Connected successfully, but the provider returned no results for the test \
+                 probe."
+                    .to_string(),
+            ),
+        )),
+        Ok(Ok(results)) => Json(result(
+            SearchTestStatus::Ok,
+            name,
+            results.len(),
+            None,
+            None,
+            None,
+        )),
+        Ok(Err(err)) => {
+            let (kind, http_status) = match &err {
+                SearchError::Connect | SearchError::Timeout | SearchError::Transport => {
+                    (SearchTestErrorKind::Connection, None)
+                }
+                SearchError::HttpStatus(code) => (SearchTestErrorKind::HttpStatus, Some(*code)),
+                SearchError::InvalidJson | SearchError::MissingResults => {
+                    (SearchTestErrorKind::InvalidResponse, None)
+                }
+                SearchError::Provider(_) | SearchError::ResponseTooLarge => {
+                    (SearchTestErrorKind::Provider, None)
+                }
+            };
+            Json(result(
+                SearchTestStatus::Error,
+                name,
+                0,
+                http_status,
+                Some(kind),
+                Some(err.to_string()),
+            ))
+        }
+        Err(_elapsed) => Json(result(
+            SearchTestStatus::Error,
+            name,
+            0,
+            None,
+            Some(SearchTestErrorKind::Connection),
+            Some(
+                "The test request timed out before the provider answered. Check that the \
+                 service is running and responsive."
+                    .to_string(),
+            ),
+        )),
+    }
 }
 
 /// GET /api/models — server-side OpenRouter catalog enriched with the
@@ -257,6 +396,14 @@ mod catalog_route_tests {
         let _ = engine_slot.set(engine.clone());
         let mut config = vortex_core::AppConfig::default();
         config.llm.provider = "mock".into();
+        let supervisor = vortex_agents::supervisor::Supervisor::new(
+            db.clone(),
+            engine.clone(),
+            hub.clone(),
+            Arc::new(vortex_agents::clock::SystemClock),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
         let state = Arc::new(AppState {
             db,
             engine,
@@ -271,6 +418,7 @@ mod catalog_route_tests {
                 lan_token: Arc::from(""),
             },
             diagnostics: crate::diagnostics::DiagnosticsState::new(false),
+            supervisor,
         });
         let app = crate::build_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

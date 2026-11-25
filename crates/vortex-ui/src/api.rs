@@ -5,7 +5,9 @@ use serde::de::DeserializeOwned;
 use vortex_types::dto::ModelsResponse;
 use vortex_types::{
     ApprovalInfo, AttachmentInfo, BrowserOperation, Capabilities, ChatRequestDto, CheckpointInfo,
-    ConversationSummary, ModelInfo, PreviewInfo, RunInfo, Settings, StoredMessage, ToolCallRecord,
+    ConversationSummary, Job, JobBudgets, ModelInfo, Occurrence, OverlapPolicy, ParkedApproval,
+    PreviewInfo, Routine, RoutineVersion, RunInfo, ScheduleSpec, Settings, StoredMessage,
+    ToolCallRecord,
 };
 
 const BASE: &str = "/api";
@@ -155,6 +157,10 @@ pub async fn settings() -> Result<Settings, String> {
 pub async fn save_settings(s: &Settings) -> Result<Settings, String> {
     let body = serde_json::to_string(s).map_err(|e| e.to_string())?;
     send_json("PUT", "/settings", &body).await
+}
+
+pub async fn test_search() -> Result<vortex_types::SearchTestResult, String> {
+    send_json("POST", "/settings/search/test", "").await
 }
 
 /// Client-editable recommended-shortlist query for `GET /api/models`. All
@@ -415,6 +421,219 @@ pub struct RestoreResult {
 
 pub async fn restore_checkpoint(id: i64) -> Result<RestoreResult, String> {
     send_json("POST", &format!("/checkpoints/{id}/restore"), "").await
+}
+
+// ---- routines & jobs -------------------------------------------------------
+
+/// Wizard input for `POST /api/jobs`: the server creates the routine (v1),
+/// the job, and its dedicated conversation atomically. `schedule: None`
+/// creates a manual-only job.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobWizard {
+    pub name: String,
+    pub instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<vortex_types::Mode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub schedule: Option<ScheduleSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budgets: Option<JobBudgets>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<OverlapPolicy>,
+}
+
+/// Partial update for `PATCH /api/jobs/{id}`; omitted fields stay unchanged.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct JobPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<OverlapPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budgets: Option<JobBudgets>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+/// `GET /api/routines/{id}` response.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RoutineDetail {
+    pub routine: Routine,
+    pub versions: Vec<RoutineVersion>,
+}
+
+/// `GET /api/jobs/{id}` response.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct JobDetail {
+    pub job: Job,
+    pub occurrences: Vec<Occurrence>,
+}
+
+/// Human decision for an occurrence flagged `needs_human_review`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAction {
+    Continue,
+    Dismiss,
+}
+
+#[derive(serde::Serialize)]
+struct RoutineCreate<'a> {
+    name: &'a str,
+    instructions: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<vortex_types::Mode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct RoutineVersionCreate<'a> {
+    instructions: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<vortex_types::Mode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+}
+
+pub async fn routines() -> Result<Vec<Routine>, String> {
+    get_json("/routines").await
+}
+
+/// Creates a routine as a human-authored draft (activation is a separate,
+/// human-only endpoint).
+pub async fn create_routine(
+    name: &str,
+    instructions: &str,
+    description: Option<&str>,
+    mode: Option<vortex_types::Mode>,
+    model: Option<&str>,
+) -> Result<Routine, String> {
+    let body = serde_json::to_string(&RoutineCreate {
+        name,
+        instructions,
+        description,
+        mode,
+        model,
+    })
+    .map_err(|e| e.to_string())?;
+    send_json("POST", "/routines", &body).await
+}
+
+pub async fn routine_detail(id: &str) -> Result<RoutineDetail, String> {
+    get_json(&format!("/routines/{id}")).await
+}
+
+/// Draft → active. The server answers 409 when the routine is not a draft;
+/// the error text surfaces through the usual `parse_error` path.
+pub async fn activate_routine(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("POST", &format!("/routines/{id}/activate"), "")
+        .await
+        .map(|_| ())
+}
+
+pub async fn archive_routine(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("POST", &format!("/routines/{id}/archive"), "")
+        .await
+        .map(|_| ())
+}
+
+pub async fn add_routine_version(
+    id: &str,
+    instructions: &str,
+    mode: Option<vortex_types::Mode>,
+    model: Option<&str>,
+) -> Result<RoutineVersion, String> {
+    let body = serde_json::to_string(&RoutineVersionCreate {
+        instructions,
+        mode,
+        model,
+    })
+    .map_err(|e| e.to_string())?;
+    send_json("POST", &format!("/routines/{id}/versions"), &body).await
+}
+
+pub async fn jobs() -> Result<Vec<Job>, String> {
+    get_json("/jobs").await
+}
+
+pub async fn create_job(wizard: &JobWizard) -> Result<Job, String> {
+    let body = serde_json::to_string(wizard).map_err(|e| e.to_string())?;
+    send_json("POST", "/jobs", &body).await
+}
+
+pub async fn job_detail(id: &str) -> Result<JobDetail, String> {
+    get_json(&format!("/jobs/{id}")).await
+}
+
+pub async fn patch_job(id: &str, patch: &JobPatch) -> Result<Job, String> {
+    let body = serde_json::to_string(patch).map_err(|e| e.to_string())?;
+    send_json("PATCH", &format!("/jobs/{id}"), &body).await
+}
+
+pub async fn activate_job(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("POST", &format!("/jobs/{id}/activate"), "")
+        .await
+        .map(|_| ())
+}
+
+pub async fn pause_job(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("POST", &format!("/jobs/{id}/pause"), "")
+        .await
+        .map(|_| ())
+}
+
+pub async fn resume_job(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("POST", &format!("/jobs/{id}/resume"), "")
+        .await
+        .map(|_| ())
+}
+
+/// Start a manual occurrence right now.
+pub async fn run_job(id: &str) -> Result<Occurrence, String> {
+    send_json("POST", &format!("/jobs/{id}/run"), "").await
+}
+
+/// Persist a steering note for the next occurrence/continuation; `None`
+/// clears it (serialized as an explicit `null`).
+pub async fn steer_job(id: &str, note: Option<&str>) -> Result<(), String> {
+    let body = serde_json::json!({ "note": note }).to_string();
+    send_json::<serde_json::Value>("POST", &format!("/jobs/{id}/steer"), &body)
+        .await
+        .map(|_| ())
+}
+
+pub async fn delete_job(id: &str) -> Result<(), String> {
+    send_json::<serde_json::Value>("DELETE", &format!("/jobs/{id}"), "")
+        .await
+        .map(|_| ())
+}
+
+pub async fn job_occurrences(id: &str, limit: u32) -> Result<Vec<Occurrence>, String> {
+    get_json(&format!("/jobs/{id}/occurrences?limit={limit}")).await
+}
+
+/// Parked approvals belonging to job occurrences (the Jobs-tab inbox).
+pub async fn jobs_inbox() -> Result<Vec<ParkedApproval>, String> {
+    get_json("/jobs/inbox").await
+}
+
+pub async fn resolve_review(occurrence_id: &str, action: ReviewAction) -> Result<(), String> {
+    let body = serde_json::json!({ "action": action }).to_string();
+    send_json::<serde_json::Value>(
+        "POST",
+        &format!("/occurrences/{occurrence_id}/resolve-review"),
+        &body,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub fn urlencode(s: &str) -> String {

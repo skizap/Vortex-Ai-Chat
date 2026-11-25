@@ -1,11 +1,11 @@
 //! Settings view: model, generation, tools, permissions, search, agents.
 
 use crate::api;
-use crate::model_picker::{is_auto, model_label, CatalogState, DefaultModelPicker, OutputFacts};
-use crate::state::AppCtx;
+use crate::model_picker::{is_auto, model_label, CatalogState, DefaultModelPicker};
+use crate::state::{search_key, AppCtx, SearchCheck, Tab};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use vortex_types::{PermissionProfile, Settings as S};
+use vortex_types::{PermissionProfile, SearchTestStatus, Settings as S};
 
 #[component]
 pub fn SettingsView() -> impl IntoView {
@@ -27,19 +27,17 @@ fn SettingsForm(s: S) -> impl IntoView {
     // One catalog fetch shared by the default-model picker and the output
     // settings panel; the picker triggers the load on mount.
     let cat = CatalogState::new();
-    let saved_flash = RwSignal::new(false);
-
     let save = move || {
         let s = draft.get_untracked();
-        let ctx = ctx;
-        let flash = saved_flash;
         spawn_local(async move {
             match api::save_settings(&s).await {
                 Ok(saved) => {
-                    ctx.settings.set(Some(saved));
-                    crate::state::apply_theme(s.theme);
-                    flash.set(true);
-                    set_timeout(move || flash.set(false), std::time::Duration::from_secs(2));
+                    crate::state::apply_theme(saved.theme);
+                    ctx.replace_settings(saved);
+                    ctx.set_toast("Settings saved");
+                    if let Ok(caps) = api::health().await {
+                        ctx.capabilities.set(Some(caps));
+                    }
                 }
                 Err(e) => ctx.set_toast(format!("could not save settings: {e}")),
             }
@@ -53,7 +51,7 @@ fn SettingsForm(s: S) -> impl IntoView {
                 <label>"Default model for new chats"</label>
                 <p class="hint">{move || format!("Current default: {}", model_label(&draft.get().model))}</p>
                 <DefaultModelPicker draft cat />
-                <p class="hint">"Save settings applies this default to NEW chats only — open chats keep the model pinned in their composer, and saving here never repins an existing chat."</p>
+                <p class="hint">"Applies to new chats only; open chats keep the model pinned in their composer."</p>
             </div>
             <div class="field-row">
                 <div class="field">
@@ -70,15 +68,15 @@ fn SettingsForm(s: S) -> impl IntoView {
             </div>
         </section>
         <ToolsPanel draft />
-        <AgentsPanel draft />
+        <AdvancedPanel draft />
         <SaveBar save />
     }
 }
 
-/// Step-5 output settings: the requested ceiling stays user-editable, while
-/// the advertised provider maximum, context headroom and per-run budget are
-/// shown as separate read-only facts. A known incompatibility offers an
-/// explicit one-click lower value (draft-only — nothing is saved silently).
+/// The requested output ceiling stays user-editable; full provider facts
+/// live in the model picker's details disclosure. A known incompatibility
+/// offers an explicit one-click lower value (draft-only — nothing is saved
+/// silently).
 #[component]
 fn OutputSettings(draft: RwSignal<S>, cat: CatalogState) -> impl IntoView {
     view! {
@@ -91,7 +89,7 @@ fn OutputSettings(draft: RwSignal<S>, cat: CatalogState) -> impl IntoView {
                         draft.update(|s| s.max_tokens = v);
                     }
                 }/>
-            <p class="hint">"Per model call. A maximum is not a minimum: the model may stop earlier, and reasoning models can consume completion tokens on reasoning before any visible text. 100,000 is an application safety ceiling, not a recommendation — 16,384 suits most long replies."</p>
+            <p class="hint">"Per model call; the model may stop earlier. 16,384 suits most replies."</p>
             {move || {
                 let s = draft.get();
                 let router = is_auto(&s.model);
@@ -102,9 +100,8 @@ fn OutputSettings(draft: RwSignal<S>, cat: CatalogState) -> impl IntoView {
                     .and_then(|m| m.max_completion_tokens)
                     .filter(|&n| n > 0 && (s.max_tokens as u64) > n);
                 view! {
-                    <OutputFacts model router ceiling=s.max_tokens budget=s.agents.max_total_tokens />
                     {unknown.then(|| view! {
-                        <p class="hint">"The catalog does not report limits for this model ID. It can still be saved as the default — an explicit choice — and server-side validation stays authoritative."</p>
+                        <p class="hint">"The catalog has no limits for this model ID; it can still be saved and server-side validation stays authoritative."</p>
                     })}
                     {over.map(|adv| {
                         let adv32 = adv.min(u32::MAX as u64) as u32;
@@ -128,7 +125,6 @@ fn OutputSettings(draft: RwSignal<S>, cat: CatalogState) -> impl IntoView {
 
 #[component]
 fn ToolsPanel(draft: RwSignal<S>) -> impl IntoView {
-    let ctx = use_context::<AppCtx>().expect("ctx provided");
     view! {
         <section class="panel">
             <h3>"Tools & permissions"</h3>
@@ -156,6 +152,11 @@ fn ToolsPanel(draft: RwSignal<S>) -> impl IntoView {
                     move || draft.get().tools.delegation,
                     move |v| draft.update(|s| s.tools.delegation = v))}
             </div>
+            <div class="field-row">
+                {toggle("Media", "image & video generation tools",
+                    move || draft.get().tools.media,
+                    move |v| draft.update(|s| s.tools.media = v))}
+            </div>
             <div class="field">
                 <label for="profile">"Permission profile"</label>
                 <select id="profile"
@@ -177,100 +178,199 @@ fn ToolsPanel(draft: RwSignal<S>) -> impl IntoView {
                     <option value="trusted">"Trusted — allowlisted commands auto-run; consequential actions still need approval"</option>
                 </select>
             </div>
-            <div class="field">
-                <label for="search-url">"Search provider (SearXNG URL)"</label>
-                <input id="search-url" type="text" placeholder="http://127.0.0.1:8888"
-                    prop:value=move || draft.get().search.base_url
-                    on:input=move |ev| draft.update(|s| s.search.base_url = event_target_value(&ev))
-                />
-                <p class="hint">
-                    {move || {
-                        let caps = ctx.capabilities.get();
-                        if let Some(c) = caps {
-                            if c.search { format!("search ready ({})", c.search_provider) }
-                            else { format!("search not configured — {}", c.search_hint) }
-                        } else { String::new() }
-                    }}
-                </p>
-            </div>
+            <SearchSetup draft />
         </section>
     }
 }
 
+fn saved_search_status(ctx: AppCtx) -> (String, bool) {
+    let Some(saved) = ctx.settings.get() else {
+        return ("Loading search settings…".into(), false);
+    };
+    let (enabled, url) = search_key(&saved);
+    let mock = ctx
+        .capabilities
+        .with(|c| c.as_ref().is_some_and(|c| c.mock_llm));
+    if !enabled {
+        return (
+            "Web research is disabled. Enable it in Settings and save.".into(),
+            false,
+        );
+    }
+    if !mock && url.is_empty() {
+        return (
+            "Search is not configured. Save a JSON-enabled SearXNG URL.".into(),
+            false,
+        );
+    }
+    match ctx.search_check.get() {
+        SearchCheck::Untested => (
+            if mock {
+                "Mock search configured; not tested."
+            } else {
+                "SearXNG configured; not tested."
+            }
+            .into(),
+            false,
+        ),
+        SearchCheck::Testing => ("Testing the saved search provider…".into(), false),
+        SearchCheck::Finished {
+            message,
+            has_results,
+        } => (message, has_results),
+    }
+}
+
 #[component]
-fn AgentsPanel(draft: RwSignal<S>) -> impl IntoView {
+pub(crate) fn ResearchStatus(unsupported: Signal<bool>) -> impl IntoView {
+    let ctx = use_context::<AppCtx>().expect("ctx provided");
     view! {
-        <section class="panel">
-            <h3>"Agents, budgets & appearance"</h3>
-            <div class="field-row">
-                <div class="field">
-                    <label for="max-concurrent">"Concurrent sub-agents"</label>
-                    <input id="max-concurrent" type="number" min="1" max="16"
-                        prop:value=move || format!("{}", draft.get().agents.max_concurrent)
-                        on:input=move |ev| {
-                            if let Ok(v) = event_target_value(&ev).parse::<usize>() {
-                                draft.update(|s| s.agents.max_concurrent = v);
-                            }
-                        }/>
-                    <p class="hint">{format!("Default 6; ceiling {}.", vortex_types::AgentSettings::MAX_LIMIT_CEILING)}</p>
-                </div>
-                <div class="field">
-                    <label for="max-iterations">"Max iterations per run"</label>
-                    <input id="max-iterations" type="number" min="1" max="64"
-                        prop:value=move || format!("{}", draft.get().agents.max_iterations)
-                        on:input=move |ev| {
-                            if let Ok(v) = event_target_value(&ev).parse::<u32>() {
-                                draft.update(|s| s.agents.max_iterations = v);
-                            }
-                        }/>
-                </div>
+        <div class="research-status">
+            <span>{move || saved_search_status(ctx).0}</span>
+            <Show when=move || !saved_search_status(ctx).1>
+                <button type="button" class="btn" on:click=move |_| {
+                    ctx.tab.set(Tab::Settings);
+                    request_animation_frame(move || {
+                        use wasm_bindgen::JsCast;
+                        if let Some(input) = document().get_element_by_id("search-url")
+                            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+                        {
+                            let _ = input.focus();
+                        }
+                    });
+                }>"Search settings"</button>
+            </Show>
+            <Show when=move || unsupported.get()>
+                <span>"This model does not support tool calling. Choose a tool-capable model above to use search."</span>
+            </Show>
+        </div>
+    }
+}
+
+#[component]
+fn SearchSetup(draft: RwSignal<S>) -> impl IntoView {
+    let ctx = use_context::<AppCtx>().expect("ctx provided");
+    let changed = move || {
+        draft.with(|d| {
+            ctx.settings
+                .with(|saved| saved.as_ref().map(search_key) != Some(search_key(d)))
+        })
+    };
+    view! {
+        <div class="field">
+            <label for="search-url">"Search provider (SearXNG URL)"</label>
+            <input id="search-url" type="text" placeholder="http://127.0.0.1:8888"
+                prop:value=move || draft.get().search.base_url
+                on:input=move |ev| draft.update(|s| s.search.base_url = event_target_value(&ev))
+            />
+            <div class="search-actions">
+                <button type="button" class="btn"
+                    disabled=move || changed() || matches!(ctx.search_check.get(), SearchCheck::Testing)
+                    on:click=move |_| test_search(ctx)>"Test search"</button>
+                <p class="hint" role="status">{move || if changed() {
+                    "Save your search changes before testing.".into()
+                } else {
+                    saved_search_status(ctx).0
+                }}</p>
             </div>
-            <div class="field-row">
-                <div class="field">
-                    <label for="run-timeout">"Run timeout (seconds)"</label>
-                    <input id="run-timeout" type="number" min="30" max="3600"
-                        prop:value=move || format!("{}", draft.get().agents.run_timeout_secs)
-                        on:input=move |ev| {
-                            if let Ok(v) = event_target_value(&ev).parse::<u64>() {
-                                draft.update(|s| s.agents.run_timeout_secs = v);
-                            }
-                        }/>
+            <p class="hint">"Tests the saved provider with a sample query, without calling a model."</p>
+        </div>
+    }
+}
+
+fn test_search(ctx: AppCtx) {
+    if matches!(ctx.search_check.get_untracked(), SearchCheck::Testing) {
+        return;
+    }
+    let revision = ctx.search_revision.get_untracked();
+    ctx.search_check.set(SearchCheck::Testing);
+    spawn_local(async move {
+        let outcome = api::test_search().await;
+        if revision != ctx.search_revision.get_untracked() {
+            return;
+        }
+        let (message, has_results) = match outcome {
+            Ok(result) => {
+                let provider = if result.mock {
+                    "Mock search"
+                } else {
+                    "SearXNG"
+                };
+                match result.status {
+                    SearchTestStatus::Ok => (format!("{provider}: connected ({num} sample {noun}).",
+                        num = result.result_count, noun = if result.result_count == 1 { "result" } else { "results" }), true),
+                    SearchTestStatus::Empty => (format!("{provider}: connected, but the sample search returned no results. Check the provider's upstream search engines."), false),
+                    SearchTestStatus::Disabled => ("Web research is disabled. Enable it in Settings and save.".into(), false),
+                    SearchTestStatus::NotConfigured => ("Search is not configured. Save a JSON-enabled SearXNG URL.".into(), false),
+                    SearchTestStatus::Error => (format!("{provider}: {}", result.detail.as_deref().unwrap_or("Search test failed. Check the provider and try again.")), false),
+                }
+            }
+            Err(error) => (format!("Could not test search: {error}"), false),
+        };
+        ctx.search_check.set(SearchCheck::Finished {
+            message,
+            has_results,
+        });
+    });
+}
+
+#[component]
+fn AdvancedPanel(draft: RwSignal<S>) -> impl IntoView {
+    view! {
+        <details class="panel advanced">
+            <summary>"Advanced" <span class="panel-note">"agent limits, budgets & delegation"</span></summary>
+            <div class="advanced-body">
+                <div class="field-row">
+                    <div class="field">
+                        <label for="max-concurrent">"Concurrent sub-agents"</label>
+                        <input id="max-concurrent" type="number" min="1" max="16"
+                            prop:value=move || format!("{}", draft.get().agents.max_concurrent)
+                            on:input=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<usize>() {
+                                    draft.update(|s| s.agents.max_concurrent = v);
+                                }
+                            }/>
+                        <p class="hint">{format!("Default 6; ceiling {}.", vortex_types::AgentSettings::MAX_LIMIT_CEILING)}</p>
+                    </div>
+                    <div class="field">
+                        <label for="max-iterations">"Max iterations per run"</label>
+                        <input id="max-iterations" type="number" min="1" max="64"
+                            prop:value=move || format!("{}", draft.get().agents.max_iterations)
+                            on:input=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<u32>() {
+                                    draft.update(|s| s.agents.max_iterations = v);
+                                }
+                            }/>
+                    </div>
                 </div>
-                <div class="field">
-                    <label for="token-budget">"Token budget per run"</label>
-                    <input id="token-budget" type="number" min="1000" max="10000000" step="1000"
-                        prop:value=move || format!("{}", draft.get().agents.max_total_tokens)
-                        on:input=move |ev| {
-                            if let Ok(v) = event_target_value(&ev).parse::<u64>() {
-                                draft.update(|s| s.agents.max_total_tokens = v);
-                            }
-                        }/>
-                    <p class="hint">"Shared by all model calls in one run; the engine also bounds each call's requested output allowance by what remains of this budget. Cumulative usage is not a conversation lifetime limit."</p>
+                <div class="field-row">
+                    <div class="field">
+                        <label for="run-timeout">"Run timeout (seconds)"</label>
+                        <input id="run-timeout" type="number" min="30" max="3600"
+                            prop:value=move || format!("{}", draft.get().agents.run_timeout_secs)
+                            on:input=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<u64>() {
+                                    draft.update(|s| s.agents.run_timeout_secs = v);
+                                }
+                            }/>
+                    </div>
+                    <div class="field">
+                        <label for="token-budget">"Token budget per run"</label>
+                        <input id="token-budget" type="number" min="1000" max="10000000" step="1000"
+                            prop:value=move || format!("{}", draft.get().agents.max_total_tokens)
+                            on:input=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<u64>() {
+                                    draft.update(|s| s.agents.max_total_tokens = v);
+                                }
+                            }/>
+                        <p class="hint">"Shared by all model calls in one run; each call's output allowance is bounded by what remains."</p>
+                    </div>
                 </div>
+                {toggle("Recursive delegation", "allow sub-agents to spawn sub-agents (counted in the same limit)",
+                    move || draft.get().agents.recursive,
+                    move |v| draft.update(|s| s.agents.recursive = v))}
             </div>
-            {toggle("Recursive delegation", "allow sub-agents to spawn sub-agents (counted in the same limit)",
-                move || draft.get().agents.recursive,
-                move |v| draft.update(|s| s.agents.recursive = v))}
-            <div class="field">
-                <label for="theme">"Theme"</label>
-                <select id="theme"
-                    prop:value=move || match draft.get().theme {
-                        vortex_types::Theme::Dark => "dark".to_string(),
-                        vortex_types::Theme::Light => "light".to_string(),
-                    }
-                    on:change=move |ev| {
-                        let t = if event_target_value(&ev) == "light" {
-                            vortex_types::Theme::Light
-                        } else {
-                            vortex_types::Theme::Dark
-                        };
-                        draft.update(|s| s.theme = t);
-                    }>
-                    <option value="dark">"Dark"</option>
-                    <option value="light">"Light"</option>
-                </select>
-            </div>
-        </section>
+        </details>
     }
 }
 

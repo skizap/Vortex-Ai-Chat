@@ -5,6 +5,7 @@
 pub mod api;
 pub mod chat;
 pub mod diagnostics;
+pub mod jobs;
 pub mod markdown;
 mod model_picker;
 mod session_usage;
@@ -30,7 +31,7 @@ pub fn App() -> impl IntoView {
         match api::settings().await {
             Ok(s) => {
                 crate::state::apply_theme(s.theme);
-                ctx_boot.settings.set(Some(s));
+                ctx_boot.replace_settings(s);
             }
             Err(e) => ctx_boot
                 .error_banner
@@ -89,11 +90,68 @@ pub fn App() -> impl IntoView {
         session_usage::reload(ctx);
     });
 
+    let narrow = RwSignal::new(false);
+    let update_narrow = move || {
+        let matches = window()
+            .match_media("(max-width: 768px)")
+            .ok()
+            .flatten()
+            .is_some_and(|query| query.matches());
+        narrow.set(matches);
+        if !matches && ctx.sidebar_open.get_untracked() {
+            ctx.sidebar_open.set(false);
+        }
+    };
+    update_narrow();
+    let resize = window_event_listener(leptos::ev::resize, move |_| update_narrow());
+    on_cleanup(move || resize.remove());
+    let drawer_open = move || narrow.get() && ctx.sidebar_open.get();
+    let menu_button = NodeRef::<leptos::html::Button>::new();
+    Effect::new(move |previous| {
+        let open = drawer_open();
+        if previous != Some(open) {
+            request_animation_frame(move || {
+                if open && untrack(drawer_open) {
+                    use wasm_bindgen::JsCast;
+                    if let Some(button) = document()
+                        .get_element_by_id("new-conversation")
+                        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+                    {
+                        let _ = button.focus();
+                    }
+                } else if previous == Some(true) && narrow.get_untracked() && !untrack(drawer_open)
+                {
+                    if let Some(button) = menu_button.get_untracked() {
+                        let _ = button.focus();
+                    }
+                }
+            });
+        }
+        open
+    });
+    let escape_listener =
+        window_event_listener(leptos::ev::keydown, move |ev: web_sys::KeyboardEvent| {
+            if ev.key() == "Escape" && untrack(drawer_open) && !ev.default_prevented() {
+                ev.prevent_default();
+                ctx.sidebar_open.set(false);
+            }
+        });
+    on_cleanup(move || escape_listener.remove());
+
     view! {
         <div class="app">
             <Sidebar />
-            <main class="main">
+            <Show when=drawer_open>
+                <div class="sidebar-backdrop" on:click=move |_| ctx.sidebar_open.set(false)></div>
+            </Show>
+            <main class="main" inert=drawer_open>
                 <header class="topbar">
+                    <button class="icon-btn menu-btn" node_ref=menu_button
+                        aria-label="Toggle conversations sidebar"
+                        aria-expanded=drawer_open
+                        aria-controls="conversation-sidebar"
+                        title="Conversations"
+                        on:click=move |_| ctx.sidebar_open.update(|open| *open = !*open)>"☰"</button>
                     <div class="tabs" role="tablist">
                         <button class=tab_class(ctx, Tab::Chat)
                             on:click=move |_| ctx.tab.set(Tab::Chat)>"Chat"</button>
@@ -104,12 +162,19 @@ pub fn App() -> impl IntoView {
                                 if pending > 0 { format!("Tasks ({pending})") } else { "Tasks".to_string() }
                             }}
                         </button>
+                        <button class=tab_class(ctx, Tab::Jobs)
+                            on:click=move |_| ctx.tab.set(Tab::Jobs)>
+                            {move || {
+                                let parked = ctx.jobs_inbox.get().len();
+                                if parked > 0 { format!("Jobs ({parked})") } else { "Jobs".to_string() }
+                            }}
+                        </button>
                         <button class=tab_class(ctx, Tab::Settings)
                             on:click=move |_| ctx.tab.set(Tab::Settings)>"Settings"</button>
                     </div>
                     <div class="mode-select" title="Tools available to the assistant for the next message">
                         <label for="mode">"Mode"</label>
-                        <select id="mode" on:change=move |ev| {
+                        <select id="mode" aria-label="Mode" on:change=move |ev| {
                             let v = event_target_value(&ev);
                             if let Ok(m) = serde_json::from_value::<vortex_types::Mode>(
                                 serde_json::Value::String(v),
@@ -124,6 +189,7 @@ pub fn App() -> impl IntoView {
                                     <option value="research" selected={m == vortex_types::Mode::Research}>"Research"</option>
                                     <option value="coding" selected={m == vortex_types::Mode::Coding}>"Coding"</option>
                                     <option value="browser" selected={m == vortex_types::Mode::Browser}>"Browser"</option>
+                                    <option value="agent" selected={m == vortex_types::Mode::Agent}>"Agent"</option>
                                 }
                             }}
                         </select>
@@ -139,6 +205,7 @@ pub fn App() -> impl IntoView {
                     {move || match ctx.tab.get() {
                         Tab::Chat => view! { <chat::ChatView /> }.into_any(),
                         Tab::Tasks => view! { <tasks::TasksView /> }.into_any(),
+                        Tab::Jobs => view! { <jobs::JobsView /> }.into_any(),
                         Tab::Settings => view! { <settings_ui::SettingsView /> }.into_any(),
                     }}
                 </div>
@@ -178,7 +245,7 @@ fn ThemeToggle() -> impl IntoView {
                     let ctx = ctx;
                     spawn_local(async move {
                         if let Ok(saved) = api::save_settings(&s).await {
-                            ctx.settings.set(Some(saved));
+                            ctx.replace_settings(saved);
                         }
                     });
                 }

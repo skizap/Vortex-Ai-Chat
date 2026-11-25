@@ -238,7 +238,12 @@ enum — the SSE event catalog, see §9), `PlanStep`. `settings.rs`: `Settings`
 and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
 = 16`. `dto.rs`: REST payloads (`ConversationSummary`, `StoredMessage`,
 `RunInfo`, `ToolCallRecord`, `ApprovalInfo`, `PreviewInfo`, `Capabilities`).
-`lib.rs`: `Mode` (chat/research/coding/browser).
+`lib.rs`: `Mode` (chat/research/coding/browser/agent). `jobs.rs`: the durable
+autonomous-work contract — `Routine`/`RoutineVersion`/`RoutineStatus`,
+`Job`/`JobStatus` (draft/active/paused/circuit_broken), `ScheduleSpec`,
+`Occurrence`/`OccurrenceStatus`, `JobBudgets`, `RunOrigin`
+(interactive/job), `ApprovalPolicy` (timeout/park), `ParkedApproval`,
+`JobEvent` (SSE payload).
 
 ### vortex-core (`crates/vortex-core/src/`)
 
@@ -263,6 +268,19 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   means "file did not exist"; cursor-paginated listing returning
   `CheckpointInfo` metadata, content only via `get_checkpoint`). All values
   bound via `rusqlite::params!` (no SQL injection surface).
+- `store_jobs.rs` — routines/jobs/occurrences: `create_routine` lands draft v1
+  atomically; `add_routine_version` appends an immutable version (status never
+  changes; pinned jobs keep running what they pinned); `activate_routine` /
+  job activation are the human-only transition path; `create_job` also creates
+  the job's dedicated conversation (`Job: <name>`) in one transaction;
+  `insert_occurrence` returns `Ok(None)` on the UNIQUE(job_id, scheduled_for)
+  conflict (the double-fire guard); startup sweep
+  `mark_occurrences_interrupted_on_startup` mirrors the runs sweep;
+  `occurrence_had_expired_approval` drives the parked-expired catch-up branch.
+- `job_seeds.rs` — `seed_draft_routines`: the three shipped starter templates
+  (morning research digest / repository health check / workspace inbox triage),
+  seeded once at startup **only into an empty routines table**, always as
+  drafts at v1; never overwrites or activates.
 
 ### vortex-llm (`crates/vortex-llm/src/`)
 
@@ -294,16 +312,26 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   event) is reported via `take_overflow()` and fails the stream as
   `MalformedStream` instead of being silently dropped (C24 fixed).
 - `mock.rs` — `MockLlm` with scripted `MockTurn`s (`text`, `tool_call`,
-  `failure`); streams word-by-word with a 5 ms default delay; used by the
-  76-test offline suite (failure scripting: `KNOWN_ISSUES.md` C23, fixed).
+  `failure`); streams word-by-word with a 5 ms default delay (configurable
+  via `with_delay` for cancellation tests); used by the offline test suites
+  (failure scripting: `KNOWN_ISSUES.md` C23, fixed).
 
 ### vortex-agents (`crates/vortex-agents/src/`)
 
-- `engine.rs` — the run loop (§11). `allowed_for_mode` builds per-run tool
-  allow-lists: Chat = none; Research = search + delegate; Coding = files +
-  commands + previews + delegate; Browser = browser + fetch + delegate
+- `engine.rs` — the run loop (§11). `allowed_for_mode(mode, settings,
+  browser_ok, origin)` builds per-run tool allow-lists: Chat = meta only;
+  Research = search + delegate; Coding = files + commands + previews +
+  delegate; Browser = browser + fetch + delegate; Agent = the union of
+  research/coding/browser plus the authoring tools (`save_routine`,
+  `list_routines`, `propose_schedule`) **only when the origin is not a job**
   (each further gated by settings/profile/availability). `start_chat_run`
-  keeps the last 40 history turns. `spawn_subagent`: child cancel token,
+  keeps the last 40 history turns. Job admission: `start_job_run` (origin Job,
+  `ParkUntilDecided`, job budgets applied to the settings snapshot, job system
+  prompt + the job conversation's bounded history) and `spawn_continuation`
+  (seeded transcript verbatim, model inherited from the prior run row,
+  budgets/workspace from the durable job row); `classify_last_step` marks an
+  unconfirmed consequential (or unknown-tool) step `NeedsReview`, everything
+  else `Safe`. `spawn_subagent`: child cancel token,
   depth cap 3, recursive delegation opt-in, allow-list is the *intersection*
   of the parent's list and the request. Event forwarders are **drained, not
   aborted**, at completion (queued tool events/deltas are delivered and
@@ -341,9 +369,33 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
   timeout/cancel/shutdown (orphan-freedom verified by pgrep tests).
 - `approvals.rs` — `ApprovalManager`: persist → publish `ApprovalRequested`
   → await oneshot resolvable **only** by `decide()` (called from the HTTP
-  API); timeout `max(5 s)` auto-denies and records `Expired`. Tools see only
-  the `ApprovalGate` trait — sub-agent self-approval is structurally
-  impossible.
+  API). Per-request `ApprovalPolicy`: interactive `TimeoutSecs` auto-denies
+  after `max(5 s)` and records `Expired`; job `ParkUntilDecided` waits
+  indefinitely (run status `waiting_approval` in hub + DB), resolves on a
+  human decision, and expires promptly when the run is cancelled (shutdown).
+  Single-owner rule: exactly one of `decide` / timeout / cancel owns the DB
+  write, so a late decision can never overwrite an expired row or vice versa.
+  Tools see only the `ApprovalGate` trait — sub-agent self-approval is
+  structurally impossible.
+- `clock.rs` — pure schedule math (no I/O): 5-field cron validation (the
+  `cron` crate parses 6/7 fields with seconds first, so a validated 5-field
+  expression is prefixed `"0 "`), injectable `Clock` trait (`SystemClock` in
+  production, fakes in tests), `next_tick` (strictly-after), `missed_ticks`
+  (ascending, capped at the most recent 512), overlap decisions. DST contract:
+  nonexistent local times skip; ambiguous times run once at the earliest
+  instant; all comparisons on absolute instants. See §9 for the cron caveats.
+- `supervisor.rs` — the job lifecycle state machine (§11): tick loop (1 s)
+  driven by the persisted `next_run_at`, occurrence admission (job gate,
+  single-flight, daily cap), startup `catch_up` (interrupted-occurrence
+  decision tree + missed-tick policy), budgets/breaker bookkeeping, steer-note
+  consumption, park forwarding, and a seq-stamped job-event log (1024 entries,
+  hub-pattern replay/gap semantics). Started exactly once in `main.rs`.
+- `tools_routines.rs` — `save_routine` (draft v1 only), `list_routines`
+  (read-only), `propose_schedule` (draft job pinned to the routine's current
+  version). All `Risk::Low`; no parameter list declares status/activation
+  fields and `ToolDef::filter` strips unknown keys, so injected arguments
+  cannot smuggle an activation. Interactive Agent runs only — stripped from
+  job-origin runs at admission.
 - `scheduler.rs` — global sub-agent gate: counter + `Notify` (50 ms poll
   fallback); `SlotGuard` releases on drop (cancellation- and panic-safe);
   limit default 6, min 1, ceiling 16, runtime-adjustable; the coordinator
@@ -406,11 +458,19 @@ and sub-structs (§6), `PermissionProfile`, `AgentSettings::MAX_LIMIT_CEILING
 ### vortex-server (`crates/vortex-server/src/`)
 
 - `main.rs` — startup order: paths → config → logging (policy: never log
-  request headers/bodies) → DB + interrupted-run marking → settings → LLM
-  provider selection (mock vs OpenRouter; starts without a key but warns) →
-  hub/scheduler/browser/previews/search/approvals → engine → LAN token
-  handling → router → graceful shutdown (cancel all runs, stop all
+  request headers/bodies) → DB + interrupted-run marking (+ expiry of their
+  pending approvals) → interrupted-occurrence sweep → draft routine template
+  seeding (log-only on failure) → settings → LLM provider selection (mock vs
+  OpenRouter; starts without a key but warns) →
+  hub/scheduler/browser/previews/search/approvals → engine → supervisor
+  created and `run()` spawned **exactly once** (catch-up, then 1 s ticks) →
+  LAN token handling → router → graceful shutdown (cancel the supervisor
+  FIRST so no orphan ticks admit new work, then cancel all runs, stop all
   previews, close browser).
+- `routes_jobs.rs` — routines/jobs/occurrences REST + the jobs SSE channel +
+  the parked-approval inbox (§9). Activation is a distinct human endpoint;
+  manual runs insert a `scheduled` occurrence that the supervisor's due-query
+  admits; `resolve-review` continues or dismisses a flagged occurrence.
 - `guard.rs` — middleware on every route: Host allow-list
   (`127.0.0.1`/`localhost`/`::1`) unless LAN mode (DNS-rebinding defense);
   Origin check on non-GET/HEAD/OPTIONS writes (loopback origins only;
@@ -563,6 +623,107 @@ Event catalog (`RunEvent`, serde `tag = "type"`, snake_case;
 | `status_changed` | run_id, status, detail? | run status transition |
 | `run_finished` | run_id, status, error? | terminal |
 
+### Jobs & routines API
+
+Durable autonomous work: versioned **routines** (instruction templates),
+**jobs** (a pinned routine version + schedule + guardrails), and
+**occurrences** (one execution of a job). Handlers live in
+`crates/vortex-server/src/routes_jobs.rs`; the lifecycle state machine is
+`vortex-agents/src/supervisor.rs` (started exactly once in `main.rs`, tick
+loop every 1 s, job gate of 2 concurrent job roots independent of the
+sub-agent scheduler). All routes sit inside the same guard layer; errors are
+uniform `{"error": "…"}` with actionable 400s.
+
+**Safety model (server-enforced, never by prompt):** routines created via
+`POST /api/routines` (including agent-drafted ones) always land as `draft`;
+only the human activate endpoints flip status. Jobs pin an exact routine
+version — editing a routine never changes what a pinned job runs. Job-origin
+runs never receive routine/job-authoring tools, and their consequential
+actions park until a human decides (no auto-deny timeout).
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/routines` | `Routine[]` (most recently updated first) |
+| `POST /api/routines` | `{name, instructions, description?, mode?, model?}` → `Routine` (always draft, v1 written atomically; `mode` defaults to `"agent"`, validated by serde) |
+| `GET /api/routines/{id}` | `{routine, versions}` (versions newest first); 404 when missing |
+| `POST /api/routines/{id}/activate` | human-only draft → active; 404 missing, 409 when not draft |
+| `POST /api/routines/{id}/archive` | draft\|active → archived; 409 when already archived |
+| `POST /api/routines/{id}/versions` | `{instructions, mode?, model?}` → `RoutineVersion` (bumps `current_version`; status unchanged) |
+| `GET /api/jobs` | `Job[]` (oldest first) |
+| `POST /api/jobs` | two shapes, both create an **active** job + dedicated conversation (`Job: <name>`): **wizard** `{name, instructions, mode?, model?, schedule, workspace?, budgets?, overlap?}` also creates routine v1 ACTIVE; **pin** `{name, routine_id, routine_version, schedule, workspace?, budgets?, overlap?}` pins an existing version (404 when routine/version missing; routine status untouched). `schedule` is required but may be `null` (manual-only). Invalid cron/tz → 400 with the clock's message |
+| `GET /api/jobs/{id}` | `{job, occurrences}` (latest 50); 404 when missing |
+| `PATCH /api/jobs/{id}` | partial `{name?, schedule?, overlap?, budgets?, workspace?}` → `Job`. Absent fields keep current values; `schedule: null` clears; budgets merge field-by-field. `next_run_at` is recomputed by the supervisor on its next tick |
+| `POST /api/jobs/{id}/activate` | draft → active; activates a still-draft pinned routine FIRST; 409 when job not draft |
+| `POST /api/jobs/{id}/pause` | active → paused; 409 otherwise |
+| `POST /api/jobs/{id}/resume` | paused\|circuit_broken → active + resets `consecutive_failures`; 409 otherwise |
+| `POST /api/jobs/{id}/run` | manual occurrence at the current instant (UTC RFC 3339 millis) → `Occurrence`; admitted by the supervisor's due-query within ~1 s; 409 when job not active or this instant already fired (double-fire guard) |
+| `POST /api/jobs/{id}/steer` | `{note: string\|null}` — one-shot note applied to the next occurrence/continuation (consumed once); `null` clears |
+| `DELETE /api/jobs/{id}` | deletes job + occurrences + dedicated conversation |
+| `GET /api/jobs/{id}/occurrences?limit=N` | `Occurrence[]` newest first; default 50, cap 200; 400 on non-positive/non-numeric limit |
+| `GET /api/jobs/events` | SSE of `JobEvent` (see below) |
+| `GET /api/jobs/inbox` | `ParkedApproval[]` — pending approvals of parked (`waiting_approval`) job occurrences, with `job_id`/`job_name`/`occurrence_id` context. Decide through the **existing** `POST /api/approvals/{id}/decide` |
+| `POST /api/occurrences/{id}/resolve-review` | `{action: "continue"\|"dismiss"}`; 404 missing, 409 when not flagged `needs_human_review`. `continue` clears the reason (keeps Interrupted) and spawns the supervisor's catch-up so the continuation decision tree re-admits promptly; `dismiss` fails the occurrence ("dismissed by human") and never increments the circuit breaker. Both clear the review flag |
+
+Schedules are standard **5-field cron** (minute hour day-of-month month
+day-of-week), validated by `vortex-agents/src/clock.rs`; v1 timezones are
+server-local only (`tz: "local"` or empty — anything else is a 400).
+`missed_policy` is `run_once_if_missed` (default: one catch-up occurrence for
+the most recent missed tick) or `skip`; `overlap` is `skip` (default) or
+`queue_one`. Budget defaults: 12 turns, 120 000 tokens, 24 occurrences/day,
+600 s per occurrence; the breaker pauses a job after 3 consecutive
+failed/parked-expired occurrences (human resume resets the counter).
+
+**Cron caveats (read before writing schedules):**
+
+- 6/7-field expressions (seconds/years) are rejected — the `cron` crate
+  parses those natively, so Vortex validates the 5-field shape first and
+  prefixes `"0 "` internally.
+- When **both** day-of-month and day-of-week are restricted, the `cron` crate
+  **ANDs** them (vixie cron ORs). `0 9 13 * FRI` fires only on Friday the
+  13th, not on every 13th AND every Friday.
+- The crate's year range is **1970–2100**; past 2100 `next_tick` returns
+  `Ok(None)` (the expression can never fire again) and `next_run_at` clears.
+- Missed-tick enumeration is capped at the **most recent 512** ticks, so a
+  long downtime cannot produce an unbounded catch-up list (and the policy
+  fires at most one occurrence anyway).
+- DST: nonexistent local times (spring forward) are skipped; ambiguous times
+  (fall back) fire exactly once, at the earliest instant.
+- Firing is driven by the persisted `next_run_at` (the previously computed
+  next fire time): `next_tick` is strictly-after, so a brand-new active job
+  seeds `next_run_at` on its first observed tick and fires from the next one.
+  A clock jump backward never re-fires an already-fired tick — the
+  UNIQUE(job_id, scheduled_for) constraint is the double-fire guard.
+
+**Seed templates.** On first startup (empty routines table only) the server
+seeds three DRAFT templates — *Morning research digest* (Research),
+*Repository health check* (Coding), *Workspace inbox triage* (Agent) — via
+`vortex-core/src/job_seeds.rs`. They never run until a human activates them
+and pins them to a job; an existing routine library is never touched.
+
+**Jobs SSE channel.** `GET /api/jobs/events` mirrors the run-event stream
+exactly (one channel for all jobs, no run-id path): seq-stamped `id:` fields,
+`Last-Event-ID` header and/or `?since=<seq>` cursor (larger wins), replay of
+the retained log (1024 entries) before the live tail with per-connection
+dedup, a named `replay_gap` event when the cursor predates the retained
+window (data = oldest retained seq; resync from `GET /api/jobs`), future
+cursors clamped, 15 s keep-alive pings. Event catalog (`JobEvent`, serde
+`tag = "type"`, snake_case): `job_updated`, `routine_updated`,
+`occurrence_updated`, `approval_parked`, `job_circuit_broken`. Events are
+emitted by the **supervisor** (occurrence transitions, `next_run_at`
+maintenance, breaker trips, parked approvals); REST mutations do not publish
+to the channel — clients refetch after mutations. (`routine_updated` is
+declared in the DTO but never emitted by the supervisor today; routine
+changes are visible via refetch.)
+
+**Honest limitations.** Jobs fire only while Vortex is running (in-process
+tokio loop; no OS timers). At startup, live occurrences are marked
+`interrupted` (mirroring the runs sweep) and the supervisor's catch-up
+decides continuation per policy: safe step boundaries continue from the
+persisted transcript + plan; an unconfirmed consequential step is flagged
+`needs_human_review` and never auto-re-executed; parked approvals that
+expired on restart count toward the breaker. Nothing consequential is ever
+replayed automatically.
+
 ## 10. Data model
 
 SQLite at `<data_dir>/vortex.db` (WAL, `synchronous=NORMAL`,
@@ -571,13 +732,17 @@ SQLite at `<data_dir>/vortex.db` (WAL, `synchronous=NORMAL`,
 
 | Table | Columns (PK bold) | Notes |
 | --- | --- | --- |
-| `conversations` | **id**, title, mode, workspace, created_at, updated_at | mode: chat/research/coding/browser |
+| `conversations` | **id**, title, mode, workspace, created_at, updated_at | mode: chat/research/coding/browser/agent; jobs own a dedicated conversation (`Job: <name>`) |
 | `messages` | **id** (autoinc), conversation_id, role, content, tool_calls (JSON, default `[]`), created_at | indexed by conversation |
 | `settings` | **key**, value | single row `key='settings'`, JSON blob |
 | `runs` | **id**, conversation_id?, parent_run_id?, agent, task, model, status, error?, usage_json?, plan_json, depth, created_at, updated_at | indexed by conversation + parent |
 | `tool_calls` | **id**, run_id, tool, args_json, ok, summary, created_at | upsert: first-write wins for args |
 | `approvals` | **id**, run_id, agent, title, payload, status, created_at, decided_at? | status: pending/approved/denied/expired; list capped at 100 |
 | `checkpoints` | **id** (autoinc), conversation_id, run_id, path, original?, created_at | file content before modification; `NULL original` = file did not exist; non-UTF-8 files are deliberately not snapshotted (warn+skip); cursor-paginated listing; `run_id="restore"` marks the pre-restore snapshots written by the restore route |
+| `routines` | **id**, name, description, status, current_version, created_at, updated_at | status: draft/active/archived; created as draft v1; activation is human-only |
+| `routine_versions` | **routine_id**, **version**, instructions, mode, model?, created_at | immutable versions; jobs pin (routine_id, version) |
+| `jobs` | **id**, name, routine_id, routine_version, status, cron?, tz, missed_policy, overlap_policy, workspace?, conversation_id, budgets_json, steer_note?, consecutive_failures, next_run_at?, created_at, updated_at | status: draft/active/paused/circuit_broken; `cron NULL` = manual-only; timestamps UTC RFC 3339 millis |
+| `job_occurrences` | **id**, job_id, scheduled_for, status, run_id?, reason?, needs_human_review, created_at, updated_at | **UNIQUE(job_id, scheduled_for)** — the double-fire guard; status: scheduled/running/waiting_approval/succeeded/failed/interrupted/skipped |
 
 Run lifecycle: `queued` (waiting for a scheduler slot) → `running` →
 (`waiting_approval` ⇄ `running`)* → `completed` | `failed` | `cancelled`.
@@ -625,24 +790,103 @@ Per run (`engine.rs`, see §7):
   answer and (for root runs) is persisted to the conversation. Partial text
   from failed/cancelled runs is *not* persisted as a message.
 
+### Jobs: architecture & occurrence lifecycle
+
+The autonomous path layers on the same run machinery — nothing is re-executed
+mid-loop, and every capability decision stays server-side:
+
+```
+store_jobs.rs (durable SQLite: routines/jobs/occurrences)
+   ▲                                    │
+   │ transitions                        │ due queries / job rows
+clock.rs (pure cron math,               ▼
+ injectable Clock)  ──▶  supervisor.rs (tick loop, 1 s; started ONCE)
+                           │  admission: job gate → single-flight → daily cap
+                           ▼
+                         engine.rs (start_job_run / spawn_continuation)
+                           │  origin=Job, ParkUntilDecided, job budgets,
+                           │  authoring tools stripped, job workspace pinned
+                           ▼
+                         run loop (§11) → hub events → supervisor forwards
+                           │  parks/breaker/outcomes back to the store
+                           ▼
+                         routes_jobs.rs (REST + SSE) → Jobs tab (WASM UI)
+```
+
+- **Occurrence lifecycle**: `scheduled` (inserted for a tick — live fire,
+  catch-up, or manual run) → `running` (engine admitted a run) →
+  (`waiting_approval` ⇄ `running`)* → `succeeded` | `failed` | `skipped`.
+  A process death leaves `running`/`waiting_approval` rows; the startup sweep
+  marks them `interrupted` (mirroring the runs sweep) and the supervisor's
+  catch-up decides what happens next. `skipped` covers overlap collisions,
+  the daily cap, and non-active jobs; skipped rows never count toward the
+  daily cap.
+- **Continuation decision tree** (catch-up, per unprocessed `interrupted`
+  occurrence with a run attached):
+  1. job not active → deferred (`interrupted`, reason recorded);
+  2. the run had an approval that **expired on restart** → parked-expired:
+     counts toward the breaker, never continued (a human must re-decide);
+  3. `classify_last_step` on the persisted tool-call history: an unconfirmed
+     (`summary = "running"`) consequential step — or an unconfirmed call to a
+     tool the registry no longer knows — → `NeedsReview`: the occurrence is
+     flagged `needs_human_review` and a human resolves it via
+     `POST /api/occurrences/{id}/resolve-review` (`continue` re-admits through
+     this same tree; `dismiss` fails it without touching the breaker);
+  4. otherwise `Safe` → a **continuation run** is spawned, seeded from the
+     persisted transcript (bounded 40-message window) + prior plan + a
+     continuation instruction that forbids redoing completed steps. The
+     continuation inherits the prior run's resolved model and the job's
+     durable budgets/workspace. Nothing is replayed mid-loop.
+- **Job gate vs sub-agent cap**: job roots consume a dedicated counting
+  semaphore (default **2**, clamped 1–16) — independent of the sub-agent
+  scheduler, so jobs never starve interactive use and vice versa. Job roots
+  do NOT consume sub-agent slots; nested delegates from a job run still share
+  the global sub-agent cap (default 6). Continuations consume a job-gate slot.
+- **Single-flight & overlap**: an occurrence never overlaps itself. With
+  `overlap: skip` (default) a colliding tick is skipped; with `queue_one` one
+  colliding occurrence stays `scheduled` and is admitted when the live one
+  drains (a third collision skips).
+- **Budgets & breaker**: per-occurrence turn/token/wall-clock caps reuse the
+  engine budget plumbing (`max_iterations`, `max_total_tokens`,
+  `run_timeout_secs` with a 30 s floor); the per-job daily cap counts today's
+  non-skipped occurrences (local midnight window). 3 consecutive
+  failed/parked-expired occurrences trip `circuit_broken`; user cancellation
+  and human dismissal never count; a successful occurrence or a human resume
+  resets the counter.
+- **Steer notes**: `POST /api/jobs/{id}/steer` persists a one-shot note that
+  the supervisor appends to the pinned instructions of the **next**
+  occurrence or continuation, then clears it (consumed once). Mid-run message
+  injection into a live loop is out of scope in v1 — cancel, approval
+  decisions, and steer notes are the control surface.
+- **Restart honesty**: live runs are marked `interrupted` and their pending
+  approvals expired at startup; live occurrences likewise. Catch-up never
+  re-executes an unconfirmed consequential step. The failure-injection matrix
+  proving all of the above lives in
+  `crates/vortex-server/src/job_hardening_tests.rs` (offline: tempdir DB,
+  scripted LLM, fake clock, manual ticks).
+
 ## 12. Testing
 
 ```bash
-cargo test        # 105 tests, fully offline (+1 #[ignore]d live test)
+cargo test        # 414 tests, fully offline (+2 #[ignore]d live smokes)
 ```
 
 | Suite | Count | Covers |
 | --- | --- | --- |
-| `vortex-agents` unit tests | 44 | workspace confinement (`..`, absolute-outside, symlink escape/inside, dangling-symlink rejection), registry gating, scheduler limits/release-on-drop, hub seq/replay/overflow/ancestor-namespace semantics, safe_http IP classification (incl. IPv4-mapped IPv6), SSRF IP pinning (simulated DNS rebinding, reject-if-any, pin-picked-address, end-to-end pinned connect against an unresolvable `.invalid` host, allow-private localhost fetch), HTML strip size-cap UTF-8 safety, `fetch_url` text-cap UTF-8 safety, dev-server port detection (listener-ownership accept/reject, single-new-listener fallback, `/proc/net/tcp` parsing), checkpoint recording honesty (non-UTF-8 skip, absent-vs-text), schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership, preview child-process lifecycle regression (survives attach, dies on stop), delegate title truncation (UTF-8-safe) |
-| `vortex-agents/tests/engine.rs` | 8 | end-to-end runs against `MockLlm`: tool round-trips, sub-agent concurrency (exactly 6 under limit 6), permission inheritance (child can't widen), cancellation propagating to sub-agents **and aborting the provider task**, token budget enforced before the next call, tool events drained before `RunFinished` |
-| `vortex-core` unit tests | 26 | config parsing (TOML, LAN entry, `patch_lan_token` comment preservation), XDG/override path resolution (pure fn), conversation/message/settings roundtrips, corrupt-settings backup, cascade delete (run tree + tool calls + approvals + checkpoints), LIKE escaping, startup interrupted-run/approval expiry, run status updates, tool calls, approvals lifecycle, checkpoint roundtrips (incl. restore-snapshot linkage) and cursor pagination |
-| `vortex-llm` unit + `tests/openrouter.rs` | 7 + 13 | SSE parser (chunk splits, CRLF, multi-line `data:` joining, blank-line dispatch, `finish()` flush, overflow reporting); retry classification (5xx only); OpenRouter client against a local mock HTTP server: streaming text, tool-call delta accumulation, auth error without retry, 429 retry-then-success, 503 retry, 400 without retry, no retry after partial stream delivery, out-of-range tool-call index, missing key, malformed stream, missing `[DONE]`, model-not-found without retry |
-| `vortex-llm/tests/live_openrouter.rs` | (1, `#[ignore]`d) | opt-in LIVE smoke against the real OpenRouter API — costs credits, never runs in CI or plain `cargo test` (see below) |
-| `vortex-server` unit tests | 7 | constant-time LAN token comparison; SSE route over a local axum server: replay+live-tail ordering with per-connection dedup, `?since=` windowing, `Last-Event-ID` header and max-cursor semantics, `replay_gap` on an evicted window vs. future-cursor clamping, cursor parsing; checkpoint restore workspace-confinement helper |
+| `vortex-agents` unit tests | 110 | workspace confinement (`..`, absolute-outside, symlink escape/inside, dangling-symlink rejection), registry gating, scheduler limits/release-on-drop, hub seq/replay/overflow/ancestor-namespace semantics, safe_http IP classification (incl. IPv4-mapped IPv6), SSRF IP pinning (simulated DNS rebinding, reject-if-any, pin-picked-address, end-to-end pinned connect against an unresolvable `.invalid` host, allow-private localhost fetch), HTML strip size-cap UTF-8 safety, `fetch_url` text-cap UTF-8 safety, dev-server port detection (listener-ownership accept/reject, single-new-listener fallback, `/proc/net/tcp` parsing), checkpoint recording honesty (non-UTF-8 skip, absent-vs-text), schema validation, command forbidden/sensitive patterns, process-group orphan checks (pgrep), file_state ownership, preview child-process lifecycle regression (survives attach, dies on stop), delegate title truncation (UTF-8-safe); clock math (DST spring/fall, month/year/leap boundaries, missed-tick cap, overlap truth table); supervisor unit semantics (gate clamp, event-log replay/gap, daily-cap math, steer/continuation instructions); routine authoring tools (draft-only, injection-arg stripping, toolset regression incl. job-origin stripping); Agent/job prompt honesty pins |
+| `vortex-agents/tests/engine.rs` | 11 | end-to-end runs against `MockLlm`: tool round-trips, sub-agent concurrency (exactly 6 under limit 6), permission inheritance (child can't widen), cancellation propagating to sub-agents **and aborting the provider task**, token budget enforced before the next call, tool events drained before `RunFinished` |
+| `vortex-agents/tests/autonomy.rs` | 12 | origin-aware admission: interactive behavior unchanged, job runs park indefinitely and resume on decide, continuation never re-executes an unconfirmed consequential step (human-review flag), shutdown expires parked approvals (virtual time) |
+| `vortex-agents/tests/supervisor.rs` | 14 | full lifecycle with fake clock + mock LLM: schedule→fire→run→succeed, restart→interrupted→continuation per policy, missed ticks→run-once, 3 failures→circuit_broken + event, budget exceeded→failed with reason, never two live occurrences of one job |
+| `vortex-agents/tests/{diagnostics,media_context,pdf_replay}.rs` | 9 + 9 + 1 | opt-in diagnostics event boundaries; multimodal hydration/context rules; PDF replay persistence |
+| `vortex-core` unit tests | 79 | config parsing (TOML, LAN entry, `patch_lan_token` comment preservation), XDG/override path resolution (pure fn), conversation/message/settings roundtrips, corrupt-settings backup, cascade delete (run tree + tool calls + approvals + checkpoints), LIKE escaping, startup interrupted-run/approval expiry, run status updates, tool calls, approvals lifecycle, checkpoint roundtrips (incl. restore-snapshot linkage) and cursor pagination; jobs store (double-fire guard incl. concurrent inserts, version pin survives edits, startup occurrence sweep, parked-approvals join, daily-cap query); seed templates (fresh/idempotent/non-empty-untouched/draft-only) |
+| `vortex-llm` unit + `tests/openrouter.rs` + `tests/openrouter_catalog.rs` | 18 + 22 + 3 | SSE parser (chunk splits, CRLF, multi-line `data:` joining, blank-line dispatch, `finish()` flush, overflow reporting); retry classification (5xx only); OpenRouter client against a local mock HTTP server: streaming text, tool-call delta accumulation, auth error without retry, 429 retry-then-success, 503 retry, 400 without retry, no retry after partial stream delivery, out-of-range tool-call index, missing key, malformed stream, missing `[DONE]`, model-not-found without retry; catalog parsing/freshness |
+| `vortex-llm/tests/live_openrouter.rs` | (2, `#[ignore]`d) | opt-in LIVE smoke against the real OpenRouter API — costs credits, never runs in CI or plain `cargo test` (see below) |
+| `vortex-server` unit tests | 97 | constant-time LAN token comparison; SSE route over a local axum server: replay+live-tail ordering with per-connection dedup, `?since=` windowing, `Last-Event-ID` header and max-cursor semantics, `replay_gap` on an evicted window vs. future-cursor clamping, cursor parsing; checkpoint restore workspace-confinement helper; saved-search probe path (`search_probe_tests`); jobs REST/SSE surface (`job_routes_tests`: guard, routine lifecycle, wizard+pin, activation ordering, pause/resume/steer/patch/delete, manual run + 409 double-fire, inbox via real gate park, resolve-review, SSE replay/live/cursors/gap, run-loop cancel exit); **failure-injection matrix** (`job_hardening_tests`: restart at every occurrence state, clock jumps forward/backward, concurrent double-fire, injection self-propagation red-team, budget exhaustion + breaker + resume, parked-then-shutdown with zero consequential executions, M1 HTTP slice end-to-end, daily cap + single-flight, steer notes consumed once) |
+| `vortex-types` unit tests | 29 | shared DTO serde contracts (incl. jobs DTOs) |
 
-`vortex-types` has no tests of its own (serde-only). `vortex-ui` is outside
-`default-members`, so `cargo test` never compiles it; lint it with
-`cargo clippy -p vortex-ui --target wasm32-unknown-unknown`.
+`vortex-ui` is outside `default-members`, so `cargo test` never compiles it;
+lint it with `cargo clippy -p vortex-ui --target wasm32-unknown-unknown` and
+run its component tests with `cargo test -p vortex-ui`.
 
 **Live provider test (P14).** Everything else is offline by design; real
 OpenRouter behavior is verified only when *you* run the ignored smoke test
@@ -693,7 +937,12 @@ and [`SECURITY.md`](SECURITY.md)):
   DNS-rebinding TOCTOU window (P1, fixed).
 - The workspace is **not** a sandbox: commands run with your user rights;
   there is no container/namespace isolation (by design, stated plainly in
-  `SECURITY.md`).
+  `SECURITY.md`). Job workspaces (including the per-job scratch dirs) get the
+  same confinement — and the same limitation.
+- Jobs fire **only while Vortex is running** (in-process loop, no OS timers);
+  schedules use the server's local timezone only in v1; mid-run steering is
+  out of scope (steer note + cancel + approvals cover control). See §9 cron
+  caveats (dom+dow AND semantics, 1970–2100 year range, 512 missed-tick cap).
 - LAN mode: token-gated but no TLS; the WASM UI cannot send the token, so
   LAN mode is API-only in practice.
 - CI workflow (`.github/workflows/ci.yml`) and `LICENSE` (MIT) now exist,

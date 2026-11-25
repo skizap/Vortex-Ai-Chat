@@ -320,6 +320,65 @@ CREATE TABLE IF NOT EXISTS file_annotations (
     annotations_json TEXT NOT NULL,
     created_at       TEXT NOT NULL
 );
+
+-- Autonomous agent jobs (Phase 0 freeze). New tables only; existing tables
+-- are untouched, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
+
+CREATE TABLE IF NOT EXISTS routines (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    current_version INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS routine_versions (
+    routine_id   TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    instructions TEXT NOT NULL,
+    mode         TEXT NOT NULL DEFAULT 'agent',
+    model        TEXT,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (routine_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id                   TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    routine_id           TEXT NOT NULL,
+    routine_version      INTEGER NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'draft',
+    cron                 TEXT,
+    tz                   TEXT NOT NULL DEFAULT 'local',
+    missed_policy        TEXT NOT NULL DEFAULT 'run_once_if_missed',
+    overlap_policy       TEXT NOT NULL DEFAULT 'skip',
+    workspace            TEXT,
+    conversation_id      TEXT NOT NULL,
+    budgets_json         TEXT NOT NULL DEFAULT '{}',
+    steer_note           TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_run_at          TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+CREATE TABLE IF NOT EXISTS job_occurrences (
+    id                 TEXT PRIMARY KEY,
+    job_id             TEXT NOT NULL,
+    scheduled_for      TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    run_id             TEXT,
+    reason             TEXT,
+    needs_human_review INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    UNIQUE (job_id, scheduled_for)
+);
+CREATE INDEX IF NOT EXISTS idx_job_occurrences_job ON job_occurrences(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_occurrences_status ON job_occurrences(status);
 "#;
 
 /// Mark runs that were live when the process died as honestly interrupted,

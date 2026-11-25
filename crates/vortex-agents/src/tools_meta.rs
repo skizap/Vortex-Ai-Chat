@@ -105,7 +105,10 @@ impl Tool for RequestApprovalTool {
     ) -> Result<ToolResult, ToolError> {
         let action = args["action"].as_str().expect("validated");
         let payload = args["payload"].as_str().expect("validated");
-        let approved = ctx.approvals.request(&ctx.run_id, action, payload).await?;
+        let approved = ctx
+            .approvals
+            .request(&ctx.run_id, action, payload, ctx.approval_policy)
+            .await?;
         if approved {
             Ok(ToolResult {
                 text: "approved by the user; you may proceed".into(),

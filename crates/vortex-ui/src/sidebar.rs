@@ -100,11 +100,13 @@ pub fn Sidebar() -> impl IntoView {
     });
 
     view! {
-        <aside class="sidebar">
+        <aside id="conversation-sidebar" aria-label="Conversations"
+            class=move || if ctx.sidebar_open.get() { "sidebar open" } else { "sidebar" }>
             <div class="sidebar-head">
                 <h1 class="brand">"Vortex"</h1>
-                <button class="btn primary"
+                <button id="new-conversation" class="btn primary"
                     on:click=move |_| {
+                        ctx.sidebar_open.set(false);
                         spawn_local(async move {
                             let mode = ctx.mode.get_untracked();
                             match api::create_conversation("New chat", mode).await {
@@ -127,7 +129,7 @@ pub fn Sidebar() -> impl IntoView {
                     "+ New chat"
                 </button>
             </div>
-            <input class="search"
+            <input id="conversation-search" class="search" aria-label="Search conversations"
                 type="search"
                 placeholder="Search conversations…"
                 prop:value=move || ctx.search.get()
@@ -359,6 +361,7 @@ fn ConvButton(conv_id: String, title: Signal<String>, mode: &'static str) -> imp
     view! {
         <button class="conv-open" title=move || title.get()
             on:click=move |_| {
+                ctx.sidebar_open.set(false);
                 if ctx.current.get_untracked().as_deref() == Some(conv_id.as_str()) {
                     return;
                 }
@@ -499,7 +502,9 @@ fn WorkspacePicker() -> impl IntoView {
             />
             <Show when=move || {
                 ctx.settings.get().and_then(|s| s.workspace.clone()).is_none()
-                    && (ctx.mode.get() == vortex_types::Mode::Coding || ctx.mode.get() == vortex_types::Mode::Browser)
+                    && (ctx.mode.get() == vortex_types::Mode::Coding
+                        || ctx.mode.get() == vortex_types::Mode::Browser
+                        || ctx.mode.get() == vortex_types::Mode::Agent)
             }>
                 <p class="hint">"File tools need a workspace root."</p>
             </Show>

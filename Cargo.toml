@@ -49,6 +49,13 @@ thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Job schedule parsing (Phase 0 freeze). MSRV verified against the 1.89.0
+# pin; if a bump breaks it, fall back per the plan (SA2 hand-rolled parser).
+cron = "0.17"
+# Test-only: deterministic DST fixtures for the clock module (CI runs UTC,
+# so host-local DST tests would be meaningless). Production v1 schedules
+# use the server's local timezone only.
+chrono-tz = "0.10"
 rand = "0.9"
 regex = "1"
 walkdir = "2"

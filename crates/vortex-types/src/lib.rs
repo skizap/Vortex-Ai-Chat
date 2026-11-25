@@ -7,6 +7,7 @@
 pub mod chat;
 pub mod dto;
 pub mod events;
+pub mod jobs;
 pub mod settings;
 
 pub use chat::{
@@ -21,8 +22,14 @@ pub use dto::{
     ToolCallRecord, VideoJobInfo, VideoJobStatus,
 };
 pub use events::{PlanStep, RunEvent, RunStatus, StepStatus};
+pub use jobs::{
+    ApprovalPolicy, Job, JobBudgets, JobEvent, JobStatus, MissedPolicy, NewJob, NewRoutine,
+    Occurrence, OccurrenceStatus, OverlapPolicy, ParkedApproval, Routine, RoutineStatus,
+    RoutineVersion, RunOrigin, ScheduleSpec,
+};
 pub use settings::{
-    AgentSettings, MediaSettings, PermissionProfile, SearchSettings, Settings, Theme, ToolSettings,
+    AgentSettings, MediaSettings, PermissionProfile, SearchSettings, SearchTestErrorKind,
+    SearchTestResult, SearchTestStatus, Settings, Theme, ToolSettings,
 };
 
 /// Interaction modes shown in the UI. Each mode changes which tools the
@@ -36,6 +43,10 @@ pub enum Mode {
     Research,
     Coding,
     Browser,
+    /// Autonomous multi-step work: union of the research/coding/browser
+    /// toolsets (subject to toggles/capabilities) plus routine/job authoring
+    /// tools for interactive runs. Job-origin runs never get authoring tools.
+    Agent,
 }
 
 impl Mode {
@@ -45,6 +56,7 @@ impl Mode {
             Mode::Research => "research",
             Mode::Coding => "coding",
             Mode::Browser => "browser",
+            Mode::Agent => "agent",
         }
     }
 }

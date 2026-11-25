@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+cron = { workspace = true }
 regex = { workspace = true }
 walkdir = { workspace = true }
 similar = { workspace = true }
@@ -32,6 +33,10 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 [dev-dependencies]
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+chrono-tz = { workspace = true }
+# Test-only: virtual-time assertions (start_paused/advance) in tests/autonomy.rs.
+# Production builds never enable test-util.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only: enables vortex-core's gate override hooks so integration tests
 # can force VORTEX_DIAGNOSTICS on/off deterministically. Production builds of
 # vortex-agents (and everything else) never enable this feature.

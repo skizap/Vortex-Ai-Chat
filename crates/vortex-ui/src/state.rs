@@ -2,14 +2,27 @@
 
 use leptos::prelude::*;
 use vortex_types::{
-    ApprovalInfo, Capabilities, ConversationSummary, PlanStep, RunStatus, Settings, StoredMessage,
+    ApprovalInfo, Capabilities, ConversationSummary, Job, ParkedApproval, PlanStep, Routine,
+    RunStatus, Settings, StoredMessage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Chat,
     Tasks,
+    Jobs,
     Settings,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SearchCheck {
+    Untested,
+    Testing,
+    Finished { message: String, has_results: bool },
+}
+
+pub(crate) fn search_key(settings: &Settings) -> (bool, &str) {
+    (settings.tools.search, settings.search.base_url.trim())
 }
 
 /// A live tool call as displayed in the task panel.
@@ -56,11 +69,15 @@ pub enum UploadState {
 #[derive(Debug, Clone, Copy)]
 pub struct AppCtx {
     pub tab: RwSignal<Tab>,
+    /// Mobile off-canvas sidebar drawer state (ignored by desktop layout).
+    pub sidebar_open: RwSignal<bool>,
     pub conversations: RwSignal<Vec<ConversationSummary>>,
     pub current: RwSignal<Option<String>>,
     pub messages: RwSignal<Vec<StoredMessage>>,
     pub capabilities: RwSignal<Option<Capabilities>>,
     pub settings: RwSignal<Option<Settings>>,
+    pub(crate) search_check: RwSignal<SearchCheck>,
+    pub(crate) search_revision: RwSignal<u64>,
     pub search: RwSignal<String>,
     pub mode: RwSignal<vortex_types::Mode>,
     pub toast: RwSignal<Option<String>>,
@@ -76,6 +93,16 @@ pub struct AppCtx {
     pub tool_calls: RwSignal<Vec<ToolCallDisplay>>,
     pub agents: RwSignal<Vec<AgentDisplay>>,
     pub approvals: RwSignal<Vec<ApprovalInfo>>,
+    // Jobs tab state (durable routines / scheduled jobs / parked approvals).
+    pub jobs: RwSignal<Vec<Job>>,
+    pub routines: RwSignal<Vec<Routine>>,
+    pub jobs_inbox: RwSignal<Vec<ParkedApproval>>,
+    pub selected_job: RwSignal<Option<String>>,
+    /// False until the first successful job-list fetch (honest empty states).
+    pub jobs_loaded: RwSignal<bool>,
+    /// Staleness guard for jobs-tab list fetches (mirrors `search_revision`):
+    /// bumping it discards in-flight list results from a previous tab visit.
+    pub jobs_revision: RwSignal<u64>,
     pub error_banner: RwSignal<Option<String>>,
     /// Files staged in the composer (uploading / ready / failed).
     pub pending_attachments: RwSignal<Vec<UploadChip>>,
@@ -89,14 +116,35 @@ pub struct AppCtx {
 }
 
 impl AppCtx {
+    pub(crate) fn replace_settings(self, saved: Settings) {
+        if self
+            .settings
+            .with_untracked(|old| old.as_ref().map(search_key) != Some(search_key(&saved)))
+        {
+            self.search_revision.update(|revision| *revision += 1);
+            self.search_check.set(SearchCheck::Untested);
+        }
+        self.settings.set(Some(saved));
+    }
+
+    /// Invalidate in-flight jobs-tab list fetches: results captured against
+    /// an older revision are discarded when they arrive (same staleness
+    /// pattern as `search_revision` in `replace_settings`).
+    pub(crate) fn bump_jobs_revision(self) {
+        self.jobs_revision.update(|revision| *revision += 1);
+    }
+
     pub fn new() -> Self {
         let ctx = Self {
             tab: RwSignal::new(Tab::Chat),
+            sidebar_open: RwSignal::new(false),
             conversations: RwSignal::new(Vec::new()),
             current: RwSignal::new(None),
             messages: RwSignal::new(Vec::new()),
             capabilities: RwSignal::new(None),
             settings: RwSignal::new(None),
+            search_check: RwSignal::new(SearchCheck::Untested),
+            search_revision: RwSignal::new(0),
             search: RwSignal::new(String::new()),
             mode: RwSignal::new(vortex_types::Mode::Chat),
             toast: RwSignal::new(None),
@@ -108,6 +156,12 @@ impl AppCtx {
             tool_calls: RwSignal::new(Vec::new()),
             agents: RwSignal::new(Vec::new()),
             approvals: RwSignal::new(Vec::new()),
+            jobs: RwSignal::new(Vec::new()),
+            routines: RwSignal::new(Vec::new()),
+            jobs_inbox: RwSignal::new(Vec::new()),
+            selected_job: RwSignal::new(None),
+            jobs_loaded: RwSignal::new(false),
+            jobs_revision: RwSignal::new(0),
             error_banner: RwSignal::new(None),
             pending_attachments: RwSignal::new(Vec::new()),
             parked_attachments: RwSignal::new(std::collections::HashMap::new()),

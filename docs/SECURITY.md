@@ -56,6 +56,61 @@ Some actions are unconditional:
   external action; only a human can approve, and the exact payload is shown
   first.
 
+## Jobs & routines (autonomous work)
+
+Unattended runs raise the stakes: a prompt injection that can schedule itself
+becomes a persistent threat, and a crash must never replay a half-executed
+consequential action. The defenses are server-enforced, never prompt-based
+(proven by the offline failure-injection matrix in
+`crates/vortex-server/src/job_hardening_tests.rs`):
+
+- **Injection self-propagation is blocked.** Agent authoring tools
+  (`save_routine`, `propose_schedule`) always land **drafts**: no parameter
+  list declares status/activation fields, and the schema filter strips
+  injected keys (`status`, `activate`, …) before execution. Activation is a
+  distinct **human-only** server endpoint (`POST /api/routines/{id}/activate`,
+  `POST /api/jobs/{id}/activate`); no model-reachable code path performs an
+  activation transition. Job-origin runs — and their delegates, which inherit
+  the origin — never receive authoring tools at all (allow-list stripped at
+  admission; attempted calls are refused by the registry, and the tools are
+  absent from the provider schemas). A non-existent tool such as
+  `activate_routine` is refused outright.
+- **Approvals stay human-only, with park & notify.** Job runs use
+  `ParkUntilDecided`: consequential actions park in `waiting_approval`
+  indefinitely (no auto-deny timeout) and surface in the inbox
+  (`GET /api/jobs/inbox`); the only resolution path is the existing
+  `POST /api/approvals/{id}/decide`. A single-owner protocol guarantees
+  exactly one of decide/timeout/cancel writes the outcome, so a late decision
+  can never overwrite an expired approval or vice versa. Shutdown cancels
+  parked runs and expires their approvals; on restart, parked-expired
+  occurrences count toward the circuit breaker and are **never**
+  auto-continued — a human must re-decide.
+- **Double execution is guarded.** `UNIQUE(job_id, scheduled_for)` makes
+  concurrent inserts (catch-up + live tick, manual + scheduled) resolve to
+  exactly one occurrence; single-flight per job means an occurrence never
+  overlaps itself; the supervisor is started exactly once. Clock jumps
+  backward never re-fire an already-fired tick.
+- **Workspace confinement applies per job.** Every job declares a workspace
+  (default: a per-job scratch dir `<data dir>/jobs/<job id>/workspace`); the
+  same canonicalized-root confinement, `..`/symlink-escape rejection, write
+  mutex with cross-run ownership, and checkpoints apply to job runs exactly
+  as to interactive runs.
+- **Budgets and the circuit breaker bound cost runaway.** Per-occurrence
+  turn/token/wall-clock caps, a per-job daily occurrence cap, and a breaker
+  that pauses a job after 3 consecutive failed/parked-expired occurrences
+  (human resume resets the counter). User cancellation and human dismissal of
+  a review never count toward the breaker.
+- **Interrupted-run honesty is preserved.** Startup sweeps mark live runs and
+  occurrences `interrupted` and expire their pending approvals. Continuation
+  happens only at step boundaries, seeded from the persisted transcript +
+  plan; an unconfirmed consequential step (a tool-call row still `running`,
+  or an unknown tool) is flagged `needs_human_review` and never auto-rerun —
+  a human continues or dismisses it via `resolve-review`. Nothing
+  consequential is ever replayed automatically.
+- **Network posture is unchanged for job runs**: the same loopback-only
+  server, request guard, and SSRF/IP-pinning defenses apply to every
+  model-chosen URL a job fetches.
+
 ## Workspace & processes
 
 - File tools are refused until a workspace root is selected; paths are then
@@ -69,7 +124,10 @@ Some actions are unconditional:
 - A selected working directory is **not** a sandbox: commands run with your
   normal user rights inside the workspace. Isolation beyond process-group
   hygiene (containers, namespaces) is not implemented; this is stated plainly
-  rather than implied.
+  rather than implied. **Job workspaces are no different** — a job's scratch
+  dir confines file tools, but any command a job runs (when command execution
+  is enabled and approved) still runs with your user rights. There is no OS
+  sandboxing around jobs in v1.
 
 ## Browser automation
 
@@ -88,7 +146,11 @@ please open a private issue; do not publish against instances you do not own.
 ## Known limitations (honest list)
 
 - No OS sandboxing around spawned commands/previews beyond process-group
-  hygiene (see above).
+  hygiene (see above) — including job-origin runs.
+- Jobs fire only while Vortex is running (in-process scheduler, no OS
+  timers); schedules use the server's local timezone only in v1. A parked
+  job approval waits for a human indefinitely — until then, that occurrence
+  makes no progress (by design).
 - Live OpenRouter endpoints were exercised against a protocol-faithful local
   mock; behavior differences of real providers (e.g., unusual SSE framing)
   may surface and would be surfaced as clear errors, not silent failures.

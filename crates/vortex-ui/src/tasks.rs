@@ -184,12 +184,26 @@ fn AgentCard(agent: AgentDisplay) -> impl IntoView {
             <p class="agent-task">{agent.task.clone()}</p>
             <p class="agent-meta">{format!("model: {}", agent.model)}</p>
             {agent.usage.map(|u| view! {
-                <p class="agent-meta">
-                    {format!("tokens: {} (prompt {} / completion {})", u.total_tokens, u.prompt_tokens, u.completion_tokens)}
+                <p class="agent-meta"
+                    title=format!("{} input · {} output · {} total", u.prompt_tokens, u.completion_tokens, u.total_tokens)>
+                    {format!("{} tokens", grouped(u.total_tokens))}
                 </p>
             })}
         </div>
     }
+}
+
+/// Thousands-separated count for compact token labels.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[component]

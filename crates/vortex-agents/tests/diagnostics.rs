@@ -300,9 +300,12 @@ async fn provider_error_forwards_queued_deltas_before_failure() {
             messages: vec![ChatMessage::user("hi")],
             model: "test-model".into(),
             settings: Settings::default(),
+            search: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             is_root: true,
             needs_slot: false,
+            origin: vortex_types::RunOrigin::Interactive,
+            approval_policy: vortex_types::ApprovalPolicy::TimeoutSecs(300),
         })
         .await;
     assert!(matches!(result, Err(RunError::Failed(_))));
@@ -610,9 +613,12 @@ async fn provider_and_run_failures_emit_fixed_categories_only() {
             messages: vec![ChatMessage::user("hi")],
             model: "test-model".into(),
             settings: Settings::default(),
+            search: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             is_root: true,
             needs_slot: false,
+            origin: vortex_types::RunOrigin::Interactive,
+            approval_policy: vortex_types::ApprovalPolicy::TimeoutSecs(300),
         })
         .await;
     drop(_sub);
@@ -692,9 +698,12 @@ async fn provider_task_panic_is_recorded_without_payload() {
             messages: vec![ChatMessage::user("hi")],
             model: "test-model".into(),
             settings: Settings::default(),
+            search: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             is_root: true,
             needs_slot: false,
+            origin: vortex_types::RunOrigin::Interactive,
+            approval_policy: vortex_types::ApprovalPolicy::TimeoutSecs(300),
         })
         .await;
     drop(_sub);

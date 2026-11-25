@@ -140,8 +140,10 @@ pub fn render_markdown(md: &str) -> String {
                 }
             }
             Event::End(TagEnd::Link) => out.push_str("</a>"),
-            Event::Start(Tag::Table(_)) => out.push_str("<table>"),
-            Event::End(TagEnd::Table) => out.push_str("</table>"),
+            Event::Start(Tag::Table(_)) => out.push_str(
+                "<div class=\"table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Markdown table\"><table>",
+            ),
+            Event::End(TagEnd::Table) => out.push_str("</table></div>"),
             Event::Start(Tag::TableHead) => out.push_str("<thead><tr>"),
             Event::End(TagEnd::TableHead) => out.push_str("</tr></thead>"),
             Event::Start(Tag::TableRow) => out.push_str("<tr>"),
@@ -204,7 +206,7 @@ fn highlighted_code(lang: &str, code: &str) -> String {
         .themes
         .get(THEME)
         .unwrap_or_else(|| ts.themes.values().next().expect("themes exist"));
-    let mut html = String::from("<pre class=\"code-block\"><code>");
+    let mut html = String::from("<pre class=\"code-block\" tabindex=\"0\"><code>");
     match syntect::html::highlighted_html_for_string(code, ss, syntax, theme) {
         Ok(highlighted) => {
             // Strip syntect's own <pre>/<code> wrapper; we provide ours.

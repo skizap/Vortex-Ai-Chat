@@ -788,6 +788,14 @@ mod route_tests {
         let _ = engine_slot.set(engine.clone());
         let mut config = vortex_core::AppConfig::default();
         config.llm.provider = "mock".into();
+        let supervisor = vortex_agents::supervisor::Supervisor::new(
+            db.clone(),
+            engine.clone(),
+            hub.clone(),
+            Arc::new(vortex_agents::clock::SystemClock),
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
         let state = Arc::new(AppState {
             db: db.clone(),
             engine,
@@ -802,6 +810,7 @@ mod route_tests {
                 lan_token: Arc::from(token.unwrap_or_default()),
             },
             diagnostics: crate::diagnostics::DiagnosticsState::new(false),
+            supervisor,
         });
         let app = crate::build_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

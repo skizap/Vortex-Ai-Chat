@@ -10,14 +10,22 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use vortex_core::diag;
 use vortex_core::{AttachmentStore, Db};
-use vortex_types::{RunEvent, Settings};
+use vortex_types::{ApprovalPolicy, RunEvent, RunOrigin, Settings};
 
 /// Human-in-the-loop approval gate. The concrete implementation lives in the
 /// orchestrator; tools only see this trait, so a sub-agent can never
 /// self-approve: decisions only originate from the server API (the user).
+/// `policy` selects the wait behavior per run: interactive runs keep the
+/// historical auto-deny timeout; job-origin runs park until a human decides.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
-    async fn request(&self, run_id: &str, title: &str, payload: &str) -> Result<bool, ToolError>;
+    async fn request(
+        &self,
+        run_id: &str,
+        title: &str,
+        payload: &str,
+        policy: ApprovalPolicy,
+    ) -> Result<bool, ToolError>;
 }
 
 /// Everything a tool may touch, scoped to one run. Credentials never appear
@@ -46,6 +54,13 @@ pub struct ToolContext {
     pub search: Option<Arc<dyn crate::search::SearchProvider>>,
     pub browser: Option<Arc<crate::browser::BrowserManager>>,
     pub previews: Arc<crate::preview::PreviewRegistry>,
+    /// Interactive vs job-origin (inherited by delegates). Authoring tools
+    /// are stripped from job origins at admission; the registry enforces the
+    /// allow-list regardless.
+    pub origin: RunOrigin,
+    /// Approval wait behavior for this run; the gate call site passes it
+    /// through (SA3 wires the per-request policy).
+    pub approval_policy: ApprovalPolicy,
 }
 
 impl ToolContext {
@@ -213,7 +228,11 @@ impl ToolRegistry {
         if tool.risk() == Risk::Consequential {
             let payload = serde_json::to_string_pretty(&filtered).unwrap_or_default();
             let title = format!("Approve {}: {}", def.name, def.description);
-            match ctx.approvals.request(&ctx.run_id, &title, &payload).await {
+            match ctx
+                .approvals
+                .request(&ctx.run_id, &title, &payload, ctx.approval_policy)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     diag::event(
@@ -266,6 +285,7 @@ impl ApprovalGate for DenyGate {
         _run_id: &str,
         _title: &str,
         _payload: &str,
+        _policy: ApprovalPolicy,
     ) -> Result<bool, ToolError> {
         Ok(false)
     }
@@ -281,6 +301,7 @@ impl ApprovalGate for AutoApproveGate {
         _run_id: &str,
         _title: &str,
         _payload: &str,
+        _policy: ApprovalPolicy,
     ) -> Result<bool, ToolError> {
         Ok(true)
     }
@@ -294,6 +315,7 @@ pub fn test_context(
     let (tx, rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
     let model = settings.model.clone();
+    let approval_policy = ApprovalPolicy::TimeoutSecs(settings.agents.approval_timeout_secs);
     let ctx = ToolContext {
         run_id: "test-run".into(),
         root_run_id: "test-run".into(),
@@ -313,6 +335,8 @@ pub fn test_context(
         search: None,
         browser: None,
         previews: Arc::new(crate::preview::PreviewRegistry::new()),
+        origin: RunOrigin::Interactive,
+        approval_policy,
     };
     (ctx, rx, cancel)
 }

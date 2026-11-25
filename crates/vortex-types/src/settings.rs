@@ -55,6 +55,66 @@ impl SearchSettings {
     }
 }
 
+/// Outcome of the Settings "Test search" probe
+/// (`POST /api/settings/search/test`). The probe is server-side only: a
+/// fixed benign query through the same provider and JSON path `web_search`
+/// uses, never a caller-provided URL or query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTestStatus {
+    /// No search provider is configured (saved URL is empty, non-mock mode).
+    NotConfigured,
+    /// Web tools are turned off in Settings (Tools).
+    Disabled,
+    /// Probe connected and returned at least one result.
+    Ok,
+    /// Probe connected but the provider returned zero results.
+    Empty,
+    /// Probe failed; see `error_kind` and `detail`.
+    Error,
+}
+
+/// Sanitized failure category for a search probe. Fixed enum: the server
+/// never passes raw transport/provider error text through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTestErrorKind {
+    /// Unreachable, DNS failure, or timeout.
+    Connection,
+    /// Provider returned a non-success HTTP status (see `http_status`).
+    HttpStatus,
+    /// Body was not parseable SearXNG JSON (e.g. JSON output disabled).
+    InvalidResponse,
+    /// Any other provider-level failure.
+    Provider,
+}
+
+/// Structured result of `POST /api/settings/search/test`. Always returned
+/// with HTTP 200; `status` carries the outcome. The server keeps no probe
+/// state; clients discard stale in-flight results against their own saved
+/// configuration revision (the URL itself is never echoed back — it could
+/// carry credentials).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchTestResult {
+    pub status: SearchTestStatus,
+    /// Provider that was (or would be) probed: "searxng", "mock", or "".
+    pub provider: String,
+    /// True when the probe used the offline mock provider; UIs must label
+    /// mock results as mock.
+    pub mock: bool,
+    /// Number of results the probe returned.
+    pub result_count: usize,
+    /// HTTP status reported by the provider, when `error_kind` is
+    /// `http_status`.
+    pub http_status: Option<u16>,
+    pub error_kind: Option<SearchTestErrorKind>,
+    /// Actionable, sanitized human-readable detail. Never contains secrets,
+    /// credentials, or raw provider error dumps.
+    pub detail: Option<String>,
+    /// Unix seconds when the probe completed (server clock).
+    pub tested_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolSettings {
@@ -217,6 +277,46 @@ mod tests {
         assert_eq!(s.media.image_model, "google/gemini-2.5-flash-image");
         assert_eq!(s.media.video_model, "google/veo-3.1-lite");
         assert_eq!(s.media.pdf_engine, "cloudflare-ai");
+    }
+
+    #[test]
+    fn search_test_result_wire_shape() {
+        // The UI parses snake_case status/kind labels; pin the wire shape.
+        let r = SearchTestResult {
+            status: SearchTestStatus::Error,
+            provider: "searxng".into(),
+            mock: false,
+            result_count: 0,
+            http_status: Some(403),
+            error_kind: Some(SearchTestErrorKind::HttpStatus),
+            detail: Some("provider said no".into()),
+            tested_at: 1_795_000_000,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error_kind"], "http_status");
+        assert_eq!(json["http_status"], 403);
+        // The configured URL is never echoed (it could carry credentials).
+        assert!(json.get("base_url").is_none());
+        let back: SearchTestResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back, r);
+        for (status, label) in [
+            (SearchTestStatus::NotConfigured, "not_configured"),
+            (SearchTestStatus::Disabled, "disabled"),
+            (SearchTestStatus::Ok, "ok"),
+            (SearchTestStatus::Empty, "empty"),
+        ] {
+            let json = serde_json::to_value(status).unwrap();
+            assert_eq!(json, label);
+        }
+        for (kind, label) in [
+            (SearchTestErrorKind::Connection, "connection"),
+            (SearchTestErrorKind::InvalidResponse, "invalid_response"),
+            (SearchTestErrorKind::Provider, "provider"),
+        ] {
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(json, label);
+        }
     }
 
     #[test]

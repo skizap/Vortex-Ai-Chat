@@ -29,7 +29,7 @@ pub async fn create_conversation(
         .and_then(|m| serde_json::from_value::<Mode>(m.clone()).ok())
         .unwrap_or_default();
     let settings = state.engine.current_settings().await;
-    let workspace = if mode == Mode::Coding || mode == Mode::Browser {
+    let workspace = if mode == Mode::Coding || mode == Mode::Browser || mode == Mode::Agent {
         settings.workspace.clone()
     } else {
         None

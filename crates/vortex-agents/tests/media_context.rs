@@ -290,9 +290,12 @@ fn run_spec(h: &Harness, conversation: Option<String>, messages: Vec<ChatMessage
         messages,
         model: h.settings.model.clone(),
         settings: h.settings.clone(),
+        search: None,
         cancel: CancellationToken::new(),
         is_root: true,
         needs_slot: false,
+        origin: vortex_types::RunOrigin::Interactive,
+        approval_policy: vortex_types::ApprovalPolicy::TimeoutSecs(300),
     }
 }
 

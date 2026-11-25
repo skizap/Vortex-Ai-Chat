@@ -1,0 +1,26 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "provider": {
+    "alibaba-token-plan": {
+      "models": {
+        "qwen4-max": {
+          "name": "Qwen4 Max",
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": true,
+          "attachment": true,
+          "interleaved": { "field": "reasoning_content" },
+          "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 1000000,
+            "input": 983616,
+            "output": 262144
+          }
+        }
+      }
+    }
+  }
+}

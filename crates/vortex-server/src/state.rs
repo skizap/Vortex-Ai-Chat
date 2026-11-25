@@ -2,9 +2,32 @@
 
 use crate::guard::GuardSettings;
 use std::sync::Arc;
+use vortex_agents::search::SearchProvider;
 use vortex_agents::{Engine, Hub, PreviewRegistry};
 use vortex_core::{AppConfig, AttachmentStore, Db};
-use vortex_types::Capabilities;
+use vortex_types::{Capabilities, Settings};
+
+/// Build the search provider for the given saved settings. Single source of
+/// truth for the selection policy, shared by startup and settings saves so a
+/// changed/removed URL applies to subsequent runs without a restart:
+/// mock-LLM mode always selects the clearly-labeled offline mock provider,
+/// an explicit `provider = "mock"` does the same, a configured SearXNG URL
+/// builds the real adapter, and anything else honestly yields `None`
+/// (research tools then report the missing setup).
+pub fn build_search_provider(
+    settings: &Settings,
+    is_mock_llm: bool,
+) -> Option<Arc<dyn SearchProvider>> {
+    if is_mock_llm || settings.search.provider == "mock" {
+        Some(Arc::new(vortex_agents::search::MockSearchProvider))
+    } else if settings.search.is_configured() {
+        Some(Arc::new(vortex_agents::search::SearxngProvider::new(
+            settings.search.base_url.trim(),
+        )))
+    } else {
+        None
+    }
+}
 
 pub struct AppState {
     pub db: Db,
@@ -19,6 +42,10 @@ pub struct AppState {
     pub guard: GuardSettings,
     /// Session-scoped diagnostics (env-only opt-in; never persisted).
     pub diagnostics: crate::diagnostics::DiagnosticsState,
+    /// Job lifecycle supervisor: created and started EXACTLY ONCE in main
+    /// (tick loop + startup catch-up); routes use it for manual-tick tests,
+    /// catch-up after review resolution, and the job-event SSE channel.
+    pub supervisor: Arc<vortex_agents::supervisor::Supervisor>,
 }
 
 impl AppState {
@@ -33,8 +60,7 @@ impl AppState {
         let search_hint = if search_configured {
             String::new()
         } else {
-            "Set a SearXNG instance URL in Settings → Search (see README.md 'Search setup')."
-                .to_string()
+            SEARCH_SETUP_HINT.to_string()
         };
         let browser_ok = self.engine.browser.is_available();
         Capabilities {
@@ -59,6 +85,10 @@ impl AppState {
         }
     }
 }
+
+/// Fixed next-step text for unconfigured search (capabilities + probe).
+pub const SEARCH_SETUP_HINT: &str =
+    "Set a SearXNG instance URL in Settings → Search (see README.md 'Search setup').";
 
 /// Uniform JSON error body: `{"error": "..."}`. Never contains secrets.
 pub fn err_json(

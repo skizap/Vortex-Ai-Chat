@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml/badge.svg)](https://github.com/skizap/Vortex-Ai-Chat/actions/workflows/ci.yml)
 
-A local-first, privacy-respecting AI assistant for Linux — chat, internet research with citations, workspace coding, controlled website previews, and isolated browser automation, with a coordinator that can delegate to **up to six concurrent sub-agents**. The entire application — backend, agent orchestration, tools, storage, and the browser UI — is written in **Rust** (the UI compiles to WebAssembly).
+A local-first, privacy-respecting AI assistant for Linux — chat, internet research with citations, workspace coding, controlled website previews, isolated browser automation, and durable scheduled jobs, with a coordinator that can delegate to **up to six concurrent sub-agents**. The entire application — backend, agent orchestration, tools, storage, and the browser UI — is written in **Rust** (the UI compiles to WebAssembly).
 
 > Linux only (tested baseline: Linux Mint 22.3 / Ubuntu 24.04, x86_64). Windows/macOS are out of scope.
 
@@ -13,15 +13,17 @@ A local-first, privacy-respecting AI assistant for Linux — chat, internet rese
 - **Coding** — file tools confined to a user-selected workspace, exact-match edits with unified diffs and automatic checkpoints, optional approval-gated command execution (no shell), loopback-only website previews.
 - **File checkpoints & recovery** — every agent write/edit/delete snapshots the previous content; the Tasks panel lists them per conversation (paginated) and one confirmed click restores a file — the current content is snapshotted first, so restores are reversible too.
 - **Browser** — isolated Chromium instance (separate profile, never yours) driven over the DevTools Protocol from Rust; login/CAPTCHA handoff to the human.
+- **Agent mode** — plan-first autonomous runs combining the research, coding, and browser toolsets (subject to your tool toggles), with routine/job authoring tools that can only ever create **drafts** — a human activates them.
+- **Jobs & routines** — durable, versioned instruction templates (routines) pinned to cron-scheduled or manual jobs with per-job workspaces, budgets, and a circuit breaker; each job keeps its own conversation transcript. **Schedules fire only while Vortex is running** (no OS timers in v1).
 - **Multi-agent** — the coordinator delegates self-contained subtasks to sub-agents; **6 run concurrently by default** (configurable 1–16, enforced server-side by a scheduler, not by prompts), nested agents share the same cap, and results are tracked in the Tasks panel.
-- **Approvals** — consequential actions (deletions, sensitive commands, purchases, publishing, …) always pause for explicit human approval; sub-agents cannot self-approve.
+- **Approvals** — consequential actions (deletions, sensitive commands, purchases, publishing, …) always pause for explicit human approval; sub-agents cannot self-approve. Job runs **park and notify** (approval inbox) instead of timing out.
 
 ## Requirements (tested baseline: Linux Mint 22.3 / Ubuntu 24.04)
 
 - Rust **1.89.0** (pinned by `rust-toolchain.toml`; rustup installs it automatically)
 - C compiler (cc) — for the bundled SQLite
 - `libsqlite3-dev`, `pkg-config`, `build-essential` — `sudo apt install build-essential pkg-config libsqlite3-dev` (Debian/Ubuntu)
-- **Optional:** Chromium for browser tools (`sudo apt install chromium`), a SearXNG instance for research
+- **Optional:** Chromium for browser tools (`sudo apt install chromium`), a SearXNG instance for research (a local one can be started with Docker — see [Search setup](#search-setup-research-mode))
 - **Optional, UI builds only:** `cargo install trunk --version 0.21.14 --locked` (Trunk 0.22+ needs a newer Rust than the pinned 1.89.0) and a matching `cargo install wasm-bindgen-cli --version <version in Cargo.lock>` (currently 0.2.129). Not required to run a release binary that already embeds the UI.
 
 No Python and no Node.js are used or required by the assistant itself.
@@ -104,16 +106,51 @@ Environment overrides: `VORTEX_HOST`, `VORTEX_PORT`,
 
 ## Search setup (research mode)
 
-OpenRouter does **not** search the web; Vortex integrates search itself.
-Point Settings → Search at a SearXNG instance you control, e.g.:
+OpenRouter does **not** search the web; Vortex integrates search itself via a
+SearXNG instance you control. `deploy/searxng/` ships an opt-in Compose setup
+(pinned official image, JSON output enabled, published on loopback only).
+
+**Prerequisites:** Docker daemon access for your user (`docker compose
+version` works), and port `127.0.0.1:8888` free.
 
 ```bash
-docker run --rm -p 127.0.0.1:8888:8080 searxng/searxng
-# then enable JSON output: settings.yml → search.formats: [html, json]
+# from the repository root; create the untracked secret file once
+(umask 077; printf 'SEARXNG_SECRET=%s\n' "$(openssl rand -hex 32)" > deploy/searxng/.env)
+
+# start
+docker compose --env-file deploy/searxng/.env -f deploy/searxng/compose.yaml up -d
+
+# test: must return JSON with real result URLs
+curl -s 'http://127.0.0.1:8888/search?q=rust+programming+language&format=json' | head -c 400
+
+# stop (config is a bind mount; nothing else persists, no volumes to delete)
+docker compose --env-file deploy/searxng/.env -f deploy/searxng/compose.yaml down
 ```
 
-and set `http://127.0.0.1:8888` in Settings → Search. When no provider is
-configured, research tools say so honestly instead of pretending.
+In Vortex, open **Settings → Tools & permissions**, enable **Web research**,
+enter `http://127.0.0.1:8888` as the **SearXNG URL**, and save. Click **Test search**
+to check the saved provider without calling a model. For a sourced answer,
+select **Research** mode and use a model that supports tool calling.
+
+Common failures:
+
+- **HTTP 403 on `format=json`** — JSON output is disabled on the instance.
+  The shipped `deploy/searxng/config/settings.yml` sets
+  `search.formats: [html, json]`; for other instances add it to their
+  `settings.yml` and restart them.
+- **Connection refused** — the container is not running or is published on a
+  different port. Use the Compose command above with `ps` or `logs searxng`
+  instead of `up -d`.
+- **`SEARXNG_SECRET` error on `up`** — you skipped the `.env` step above.
+- **Connected but zero results / engines timing out** — upstream search
+  engines rate-limit or block some networks. Check
+  `unresponsive_engines` in the JSON response and the container logs;
+  retry later or enable different engines in `settings.yml`. This is an
+  upstream/network problem, not a Vortex one.
+
+Security notes: the instance is private and single-user (rate limiter off) and
+must stay loopback-published — do not change the port mapping to expose it to
+the LAN. The Compose setup never sees Vortex's `.env` or OpenRouter key.
 
 ## Sub-agents (six concurrent by default)
 
@@ -123,6 +160,41 @@ run timeout, iteration/token budgets, and optional recursive delegation
 semaphore — the 7th sub-agent waits in the queue; nested agents count against
 the same global limit; the coordinator itself never consumes a slot.
 Sub-agents inherit at most the coordinator's tool set and cannot widen it.
+
+## Jobs & routines (autonomous work)
+
+The **Jobs** tab schedules durable, unattended work. A **routine** is a
+versioned instruction template; a **job** pins one routine version plus a cron
+schedule (or manual-only), a workspace, and guardrails. Each execution is an
+**occurrence** with its own run, transcript, and outcome.
+
+- **Schedules fire only while Vortex is running.** The scheduler is an
+  in-process loop, not an OS timer — there is no systemd/cron integration in
+  v1. Missed ticks are handled at startup by a per-job policy:
+  `run_once_if_missed` (default, one catch-up run for the most recent missed
+  tick) or `skip`.
+- **Per-job workspace.** A job either declares a workspace or gets a scratch
+  directory at `<data dir>/jobs/<job id>/workspace`. The same confinement,
+  write mutex, and checkpoints as interactive coding apply. This is **not** an
+  OS sandbox (see `docs/SECURITY.md`).
+- **Conservative budgets + circuit breaker.** Each occurrence is capped by
+  turns, tokens, and wall-clock time; each job has a daily occurrence cap and
+  single-flight (an occurrence never overlaps itself). After **3 consecutive
+  failed/parked-expired occurrences** the job is auto-paused (`circuit_broken`)
+  until a human resumes it. All caps are visible and editable per job.
+- **Park & notify approvals.** Consequential actions in a job run park
+  indefinitely in `waiting_approval` and surface in the approval **inbox**
+  (Jobs tab) for a human decision — they never auto-deny on a timeout and never
+  self-approve.
+- **Draft-only agent authoring, human activation.** Agents can draft routines
+  and propose schedules, but everything lands as a **draft**; only a human
+  endpoint activates it. Job-origin runs never receive authoring tools, so a
+  prompt injection cannot schedule itself. Three starter templates (research
+  digest, repository health check, inbox triage) are seeded as drafts on first
+  run.
+
+See `docs/DEVELOPER_GUIDE.md` §9 (Jobs & routines API) and §11 (lifecycle) and
+`docs/SECURITY.md` (jobs threat model) for the full contract.
 
 ## Architecture & security
 
@@ -143,7 +215,7 @@ threat model, permission model, and known limitations.
 ## Development
 
 ```bash
-cargo test                       # 105 tests (all offline: mocks + local servers; +1 #[ignore]d live-provider smoke)
+cargo test                       # 414 tests (all offline: mocks + local test servers; +2 #[ignore]d live-provider smokes)
 cargo fmt --all -- --check
 cargo clippy --all-targets       # clean
 scripts/build-ui.sh              # WASM UI only (debug server reads ui-dist/ from disk)
